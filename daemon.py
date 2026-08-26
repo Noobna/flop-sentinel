@@ -10,7 +10,6 @@ Features:
 from __future__ import annotations
 
 import argparse
-import base64
 import datetime
 import json
 import logging
@@ -18,19 +17,8 @@ import os
 import random
 import sys
 import time
-import unicodedata
-import urllib.error
 import urllib.parse
-import urllib.request
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
-
-KEY_FILE = "flop_agent_identity.json"
-LOG_FILE = "agent_activity.log"
-STATE_FILE = "agent_state.json"
-B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
-USER_AGENT = "curl/8.0 (Autonomous-AI-Agent/3.0; Technocore-Global)"
 
 from sentinel_core import (
     KEY_FILE,
@@ -38,6 +26,7 @@ from sentinel_core import (
     USER_AGENT,
     canonical_sweep,
     get_next_nonce,
+    seed_room_nonce,
     http_get,
     is_valid_did,
     load_json_safe,
@@ -47,6 +36,7 @@ from sentinel_core import (
 )
 from sentinel import analyze_message
 
+LOG_FILE = "agent_activity.log"
 # Core default rooms to always maintain presence in
 CORE_ROOMS = ["lobby", "technocore", "meta"]
 
@@ -140,12 +130,13 @@ def discover_active_rooms() -> list[str]:
             data = json.loads(body)
             for r in data.get("rooms", []):
                 room_name = r.get("room", "")
-                # Skip private rooms (p-), mailboxes (mb-), or empty names
+                # Skip private (p-), mailbox (mb-), gated (d-), and ephemeral (e-) rooms
                 if (
                     room_name
                     and not room_name.startswith("p-")
                     and not room_name.startswith("mb-")
-                    and not room_name.startswith("d-")  # skip gated rooms unless owned
+                    and not room_name.startswith("d-")
+                    and not room_name.startswith("e-")
                     and room_name not in discovered
                 ):
                     discovered.append(room_name)
@@ -175,6 +166,11 @@ def poll_room(room: str, since_seq: int = 0) -> tuple[list[dict], int]:
 def run_global_daemon(heartbeat_interval_mins: int = 25):
     priv, did = load_or_create_identity()
     state = load_state()
+
+    # Seed in-memory monotonic nonces from persisted room sequence state (Issue L-2)
+    for r_name, seq in state.get("room_seen_seqs", {}).items():
+        if isinstance(seq, int) and seq > 0:
+            seed_room_nonce(r_name, seq)
 
     logger.info("=" * 60)
     logger.info("  Technocore Multi-Room & Global Chat Daemon Started")

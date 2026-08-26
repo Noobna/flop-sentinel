@@ -28,7 +28,7 @@ def run_full_suite():
     result = runner.run(suite)
     print("=" * 65)
     if result.wasSuccessful():
-        print("  [SUCCESS] ALL 18 TESTS PASSED (100% VERIFIED)")
+        print(f"  [SUCCESS] ALL {result.testsRun} TESTS PASSED (100% VERIFIED)")
     else:
         print(f"  [FAILURE] FAILURES: {len(result.failures)} | ERRORS: {len(result.errors)}")
     print("=" * 65)

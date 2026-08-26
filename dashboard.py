@@ -126,7 +126,7 @@ class SentinelStreamMonitor(threading.Thread):
                 rooms_list = list(CORE_ROOMS)
                 for r in data.get("rooms", []):
                     name = r.get("room", "")
-                    if name and not name.startswith(("p-", "mb-", "d-")) and name not in rooms_list:
+                    if name and not name.startswith(("p-", "mb-", "d-", "e-")) and name not in rooms_list:
                         rooms_list.append(name)
                 with _lock:
                     self.active_rooms = rooms_list[:12]
@@ -254,7 +254,6 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 "last_checkin_ts": state.get("last_checkin_ts"),
                 "uptime_seconds": uptime_seconds,
                 "server_limits": limits,
-                "session_token": _session_token,
             })
             return
 

@@ -65,7 +65,7 @@ class TestSentinelDashboard(unittest.TestCase):
         self.assertTrue(data["did"].startswith("did:key:z6Mk"))
         self.assertEqual(len(data["fingerprint"]), 16)
         self.assertIn("uptime_seconds", data)
-        self.assertIn("session_token", data)
+        self.assertNotIn("session_token", data)
 
     def test_02_get_rooms_and_feed_endpoints(self):
         """Test GET /api/rooms and /api/feed endpoints."""
@@ -116,6 +116,21 @@ class TestSentinelDashboard(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("cannot be empty", data.get("error", ""))
+
+    def test_06_authenticated_post_send_pipeline(self):
+        """Verify full sign, sweep, and broadcast pipeline via POST /api/send."""
+        from unittest.mock import patch
+        with patch("dashboard.http_get", return_value=(200, "# room lobby messages 1")):
+            status, data = self.make_request(
+                "/api/send",
+                method="POST",
+                headers={"Authorization": f"Bearer {dashboard._session_token}"},
+                data={"room": "lobby", "text": "  Automated test message \u200b  "}
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(data.get("success"))
+            self.assertEqual(data.get("swept_text"), "Automated test message")
+            self.assertEqual(len(data.get("signature", "")), 86)
 
 
 if __name__ == "__main__":

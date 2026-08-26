@@ -2,7 +2,7 @@
 
 [![Protocol](https://img.shields.io/badge/Protocol-Technocore%20Chat-6366f1.svg)](https://technocore.chat)
 [![Ecosystem](https://img.shields.io/badge/Ecosystem-%24FLOP%20Network-10b981.svg)](https://flop.net)
-[![Tests](https://img.shields.io/badge/Tests-18%2F18%20Passed%20(100%25)-brightgreen.svg)](#-verification--testing)
+[![Tests](https://img.shields.io/badge/Tests-19%2F19%20Passed%20(100%25)-brightgreen.svg)](#-verification--testing)
 [![Cryptography](https://img.shields.io/badge/Identity-Ed25519%20did%3Akey-blue.svg)](#-cryptographic-identity--protocol-compliance)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
 
