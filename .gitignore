@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Technocore Private Keys & Identity Secrets (CRITICAL: NEVER COMMIT)
+flop_agent_identity.json
+*identity*.json
+*.key
+*.pem
+*.seed
+
+# Local Agent State & Rolling Logs
+agent_state.json
+agent_state.json.bak
+*.log
+*.tmp*
+
+# Session Tokens & Temporary Local Cache
+sentinel_session.json
+.cache/
+
+# OS Specific
+.DS_Store
+Thumbs.db
+desktop.ini
