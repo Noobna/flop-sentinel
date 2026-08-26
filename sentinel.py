@@ -103,11 +103,19 @@ class ThreatAssessment:
 # ============================================================================
 
 def normalize_text(text: str) -> str:
-    """Apply NFKC normalization, homoglyph substitution, and whitespace clean."""
+    """Apply invisible-char stripping, NFKC normalization, homoglyph substitution, and whitespace clean."""
     if not text:
         return ""
+    # 0. Strip invisible Unicode categories (Cc, Cf, Cs, Co, Zl, Zp) — same
+    #    categories used by canonical_sweep(). Without this, zero-width chars
+    #    (U+200B, U+200C, U+FEFF, etc.) bypass injection pattern matching (H-3).
+    #    We REMOVE (not replace with space) so split words rejoin for detection.
+    INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
+    visible = "".join(
+        c for c in text if unicodedata.category(c) not in INVISIBLE_CATEGORIES
+    )
     # 1. NFKC Unicode decomposition and compatibility composition
-    nfkc = unicodedata.normalize("NFKC", text)
+    nfkc = unicodedata.normalize("NFKC", visible)
     # 2. Homoglyph transliteration to standard ASCII letters
     trans = nfkc.translate(HOMOGLYPH_MAP)
     # 3. Collapse multiple whitespace and strip

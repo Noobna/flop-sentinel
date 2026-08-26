@@ -34,16 +34,13 @@ KEY_FILE = "flop_agent_identity.json"
 STATE_FILE = "agent_state.json"
 B58_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
-USER_AGENT = "curl/8.0 (Technocore-Sentinel/1.0; Windows; Ed25519)"
+USER_AGENT = "Technocore-Sentinel/1.0 (Python; Ed25519)"
 PREFIX = "did:key:z6Mk"
 MULTIBASE_CHARS = 48
-SIG_CHARS = 86
 MAX_TEXT_CHARS = 4096
 
 # Regex for strict validation
 DID_REGEX = re.compile(rf"^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{{{MULTIBASE_CHARS - 4}}}$")
-SIG_REGEX = re.compile(rf"^[A-Za-z0-9_-]{{{SIG_CHARS}}}$")
-NONCE_REGEX = re.compile(r"^[0-9]{1,19}$")
 
 _io_lock = threading.RLock()
 _nonce_lock = threading.RLock()
@@ -221,6 +218,18 @@ def load_or_create_identity(key_file: str = KEY_FILE) -> Tuple[ed25519.Ed25519Pr
             priv = ed25519.Ed25519PrivateKey.from_private_bytes(
                 bytes.fromhex(data["private_key_hex"])
             )
+            # M-3: Verify DID matches loaded key — refuse on corruption
+            raw_pub = priv.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            expected_did = "did:key:z" + b58_encode(b"\xed\x01" + raw_pub)
+            if expected_did != data["did"]:
+                raise RuntimeError(
+                    f"Identity file {key_file} is corrupted: stored DID does not match "
+                    f"private key. Expected {expected_did[:20]}..., got {data['did'][:20]}... "
+                    f"— delete the file to regenerate."
+                )
             return priv, data["did"]
 
     # Generate new keypair
@@ -262,7 +271,7 @@ def verify_signed_message(did: str, room: str, nonce: str, text: str, sig_str: s
         sig_bytes = base64.urlsafe_b64decode(sig_str + ("=" * pad_len))
         pub_key.verify(sig_bytes, payload)
         return True
-    except (InvalidSignature, ValueError, Exception):
+    except (InvalidSignature, ValueError):
         return False
 
 
@@ -270,11 +279,18 @@ def verify_signed_message(did: str, room: str, nonce: str, text: str, sig_str: s
 # 6. Hardened HTTP Client
 # ============================================================================
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent automatic redirect following — signed URLs should not be replayed (L-3)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # Suppress redirect, treat as final response
+
+_opener = urllib.request.build_opener(_NoRedirectHandler)
+
 def http_get(url: str, timeout: int = 25) -> Tuple[int, str]:
-    """Execute hardened GET request with Technocore headers and response handling."""
+    """Execute hardened GET request with Technocore headers. No redirect following."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             return resp.status, body
     except urllib.error.HTTPError as e:

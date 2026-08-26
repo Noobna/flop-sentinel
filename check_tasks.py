@@ -1,13 +1,28 @@
+import hashlib
 import json
+import os
 import urllib.request
 
-DID = "did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6"
-FP = "b63157abe5a8667d"
+KEY_FILE = "flop_agent_identity.json"
+
+
+def _load_identity():
+    """Load DID and fingerprint from identity file."""
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "r") as f:
+            data = json.load(f)
+        did = data.get("did", "")
+        fp = hashlib.sha256(did.encode()).hexdigest()[:16]
+        return did, fp
+    return "", ""
+
+
+DID, FP = _load_identity()
 
 
 def get_json(url):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Technocore-Sentinel/1.0 (Python; Ed25519)"})
         with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read().decode())
     except Exception as e:

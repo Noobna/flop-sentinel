@@ -24,6 +24,7 @@ class TestSentinelDashboard(unittest.TestCase):
     def setUpClass(cls):
         """Start a test server instance on a designated test port."""
         cls.test_port = 5555
+        dashboard._active_port = cls.test_port  # Host header validation (H-2)
         cls.server = ThreadingHTTPServer((HOST, cls.test_port), SentinelRequestHandler)
         cls.server_thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.server_thread.start()
@@ -38,7 +39,10 @@ class TestSentinelDashboard(unittest.TestCase):
     def make_request(self, path: str, method: str = "GET", headers: dict = None, data: dict = None):
         url = f"http://{HOST}:{self.test_port}{path}"
         body_bytes = json.dumps(data).encode("utf-8") if data else None
-        req_headers = {"User-Agent": "DashboardTest/1.0"}
+        req_headers = {
+            "User-Agent": "DashboardTest/1.0",
+            "Host": f"{HOST}:{self.test_port}",  # H-2: pass Host validation
+        }
         if headers:
             req_headers.update(headers)
         if body_bytes:
@@ -131,6 +135,29 @@ class TestSentinelDashboard(unittest.TestCase):
             self.assertTrue(data.get("success"))
             self.assertEqual(data.get("swept_text"), "Automated test message")
             self.assertEqual(len(data.get("signature", "")), 86)
+
+    def test_07_dns_rebinding_host_header_rejected(self):
+        """Regression: requests with wrong Host header must be rejected (H-2)."""
+        url = f"http://{HOST}:{self.test_port}/api/status"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "DashboardTest/1.0",
+            "Host": "evil.example:5555",  # DNS rebinding attempt
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                self.fail("Should have rejected request with wrong Host header")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 403)
+
+    def test_08_room_name_path_traversal_blocked(self):
+        """Regression: path traversal in room name must be rejected (M-1)."""
+        status, data = self.make_request(
+            "/api/send",
+            method="POST",
+            headers={"Authorization": f"Bearer {dashboard._session_token}"},
+            data={"room": "../kv/evil", "text": "attack"}
+        )
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":

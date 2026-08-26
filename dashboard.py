@@ -46,7 +46,9 @@ from sentinel import analyze_message, evaluate_room_health
 # Server configuration
 HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
+_active_port = DEFAULT_PORT  # Updated by start_server() for Host header validation
 CORE_ROOMS = ["lobby", "technocore", "meta", "inference-agents", "validators"]
+ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")  # M-1: validate room names
 
 # Logging configuration
 logging.basicConfig(
@@ -192,7 +194,6 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Access-Control-Allow-Origin", "null")  # Deny cross-origin
         self.end_headers()
         self.wfile.write(body)
 
@@ -221,16 +222,30 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         # Constant-time comparison
         return secrets.compare_digest(token, _session_token)
 
+    def check_host(self) -> bool:
+        """Reject requests whose Host header doesn't match 127.0.0.1:<port> or localhost:<port>.
+        Prevents DNS rebinding attacks (H-2)."""
+        host = self.headers.get("Host", "")
+        allowed = {
+            f"127.0.0.1:{_active_port}",
+            f"localhost:{_active_port}",
+            "127.0.0.1",  # default port 80 omits port in Host
+            "localhost",
+        }
+        if host not in allowed:
+            self.send_error(403, "Forbidden: invalid Host header")
+            return False
+        return True
+
     def do_OPTIONS(self):
-        """Handle preflight requests strictly."""
+        """Handle preflight requests — deny cross-origin (no ACAO = default deny)."""
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Access-Control-Allow-Origin", "null")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Sentinel-Token")
         self.end_headers()
 
     def do_GET(self):
         """Route GET requests."""
+        if not self.check_host():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -288,7 +303,14 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         # 3. API: Room Message Feed
         elif path == "/api/feed":
             room = query.get("room", ["lobby"])[0]
-            since_seq = int(query.get("since", [0])[0])
+            if not ROOM_NAME_RE.match(room):
+                self.send_json({"error": "Invalid room name"}, status=400)
+                return
+            try:
+                since_seq = int(query.get("since", [0])[0])
+            except (ValueError, TypeError):
+                self.send_json({"error": "Invalid 'since' parameter — must be integer"}, status=400)
+                return
             with _lock:
                 q = _room_streams.get(room, collections.deque())
                 messages = [m for m in q if m["seq"] > since_seq]
@@ -312,6 +334,8 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Route POST requests (requires session token auth)."""
+        if not self.check_host():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
@@ -333,6 +357,10 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/send":
             room = body.get("room", "lobby").strip()
             text = body.get("text", "").strip()
+
+            if not ROOM_NAME_RE.match(room):
+                self.send_json({"error": "Invalid room name. Use lowercase letters, digits, and hyphens (1-64 chars)."}, status=400)
+                return
             
             if not text:
                 self.send_json({"error": "Message text cannot be empty"}, status=400)
@@ -743,13 +771,13 @@ def render_dashboard_html() -> str:
 
                 let flagHtml = '';
                 if (m.flags && m.flags.length > 0) {{
-                    flagHtml = `<div class="threat-alert">⚠️ ${{m.flags.join(' | ')}}</div>`;
+                    flagHtml = `<div class="threat-alert">⚠️ ${{escapeHtml(m.flags.join(' | '))}}</div>`;
                 }}
 
                 item.innerHTML = `
                     <div class="msg-top">
-                        <span class="msg-sender">${{m.sender_badge || m.from}}</span>
-                        <span class="msg-time">[seq ${{m.seq}}] ${{m.ts}}</span>
+                        <span class="msg-sender">${{escapeHtml(m.sender_badge || m.from || '')}}</span>
+                        <span class="msg-time">[seq ${{escapeHtml(String(m.seq))}}] ${{escapeHtml(m.ts || '')}}</span>
                     </div>
                     <div class="msg-text">${{escapeHtml(m.text)}}</div>
                     ${{flagHtml}}
@@ -826,7 +854,8 @@ def render_dashboard_html() -> str:
 
 def start_server(port: int = DEFAULT_PORT):
     """Start threaded Sentinel server and background stream monitor."""
-    global _is_running
+    global _is_running, _active_port
+    _active_port = port
     priv, did = load_or_create_identity()
     fp = hashlib.sha256(did.encode()).hexdigest()[:16]
 
@@ -836,7 +865,7 @@ def start_server(port: int = DEFAULT_PORT):
     print(f"  Agent DID:        {did}")
     print(f"  Fingerprint:      {fp}")
     print(f"  Local Web UI:     http://{HOST}:{port}")
-    print(f"  Session Token:    {_session_token}")
+    print(f"  Session Token:    [redacted — embedded in dashboard HTML]")
     print("=" * 65)
     print("[+] Protected with Bearer Token & Local Origin Lockdown.")
     print(f"[+] Launching on http://{HOST}:{port} ...\n")

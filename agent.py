@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -16,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 KEY_FILE = "flop_agent_identity.json"
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
-USER_AGENT = "curl/8.0 (AI-Agent/1.0; Technocore)"
+USER_AGENT = "Technocore-Sentinel/1.0 (Python; Ed25519)"
 
 
 def b58(b: bytes) -> str:
@@ -79,8 +80,16 @@ def main():
             serialization.PublicFormat.Raw,
         )
         did = "did:key:z" + b58(b"\xed\x01" + raw_pub)
-        with open(KEY_FILE, "w") as f:
-            json.dump({"did": did, "private_key_hex": raw_priv.hex()}, f, indent=2)
+        # Atomic write: write to temp file first, then rename (M-2 fix)
+        key_data = json.dumps({"did": did, "private_key_hex": raw_priv.hex()}, indent=2)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(KEY_FILE) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(key_data)
+            os.replace(tmp_path, KEY_FILE)
+        except BaseException:
+            os.unlink(tmp_path)
+            raise
         print(f"[+] Saved new identity to {KEY_FILE}")
 
     print(f"[+] DID: {did}")

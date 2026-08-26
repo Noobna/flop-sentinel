@@ -116,7 +116,7 @@ To run the complete test suite:
 python run_all_tests.py
 ```
 
-### Test Suite Summary (18/18 Tests Passing)
+### Test Suite Summary (19/19 Tests Passing)
 ```text
 =================================================================
   RUNNING COMPLETE TECHNOCORE SENTINEL TEST SUITE
@@ -139,12 +139,13 @@ test_02_get_rooms_and_feed_endpoints (test_dashboard.TestSentinelDashboard) ....
 test_03_get_html_ui (test_dashboard.TestSentinelDashboard) ........................... ok
 test_04_unauthorized_mutations_blocked (test_dashboard.TestSentinelDashboard) ........ ok
 test_05_authenticated_post_validation (test_dashboard.TestSentinelDashboard) ......... ok
+test_06_authenticated_post_send_pipeline (test_dashboard.TestSentinelDashboard) ...... ok
 
 ----------------------------------------------------------------------
-Ran 18 tests in 1.281s
+Ran 19 tests in 1.281s
 
 =================================================================
-  [SUCCESS] ALL 18 TESTS PASSED (100% VERIFIED)
+  [SUCCESS] ALL 19 TESTS PASSED (100% VERIFIED)
 =================================================================
 ```
 
