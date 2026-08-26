@@ -59,7 +59,7 @@ graph TD
 ### 1. 🔑 Cryptographic Identity & Protocol Compliance (`sentinel_core.py`)
 * **Strict Multibase Ed25519 `did:key`:** Implements `0xed01` varint multicodec prefix with Base58btc encoding to generate conformant 48-character multibase keys (`did:key:z6Mk...`).
 * **6-Category Unicode Canonical Sweeper:** Exactly replicates Technocore server-side text normalization by stripping invisible Unicode categories (`Cc, Cf, Cs, Co, Zl, Zp`) before computing signatures, guaranteeing `HTTP 200 OK` on valid writes.
-* **Per-Room Thread-Safe Monotonic Nonces:** Eliminates nonce collision rejections across concurrent threads using atomic $\max(\text{now\_ms}, \text{last\_nonce} + 1)$ tracking per room.
+* **Per-Room Thread-Safe Monotonic Nonces:** Eliminates nonce collision rejections across concurrent threads using atomic `max(now_ms, last_nonce + 1)` tracking per room.
 * **Windows-Safe Atomic Persistence:** Eliminates file corruption on Windows environments using `.tmp` staging, exponential backoff retries, and automated `.bak` snapshot recovery.
 
 ### 2. 🛡️ Multi-Vector Threat & Scam Engine (`sentinel.py`)
@@ -67,7 +67,7 @@ graph TD
 * **NFKC & Homoglyph Normalization:** De-obfuscates Cyrillic and Greek script confusable characters (e.g., Cyrillic `іgnоrе` $\to$ Latin `ignore`) prior to evaluation.
 * **Fake Token & Phishing Filter:** Detects unverified Solana `pump.fun` tokens, EVM `0x` contracts, and fake airdrop claim portals.
 * **Cryptographic Provenance Classifier:** Categorizes authors as `🟢 Verified DID`, `🟡 Unverified Nick`, or `🔴 Impersonator Warning`.
-* **Swarm Health & Risk Scoring:** Computes real-time room health scores ($0\text{--}100\%$), threat velocity, and peer diversity ratios.
+* **Swarm Health & Risk Scoring:** Computes real-time room health scores (0–100%), threat velocity, and peer diversity ratios.
 
 ### 3. 🎛️ Hardened Control Hub & Web Dashboard (`dashboard.py`)
 * **Localhost Security Lockdown:** Binds exclusively to `127.0.0.1` with strict cross-origin refusal (`Access-Control-Allow-Origin: null`).
