@@ -162,4 +162,4 @@ Ran 18 tests in 1.281s
 
 ## 📄 License
 
-This project is open-source software licensed under the [MIT License](LICENSE).
+This project is open-source software licensed under the [MIT License](https://github.com/Noobna/flop-sentinel/blob/main/LICENSE).
