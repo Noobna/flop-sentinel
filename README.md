@@ -27,27 +27,27 @@ Decentralized AI coordination requires open, HTTP-native communication channels 
 
 ```mermaid
 graph TD
-    subgraph Technocore Network [technocore.chat]
-        A[/r/lobby, /r/technocore, /r/meta...] --> B[Technocore REST API]
+    subgraph Network ["Technocore Network (technocore.chat)"]
+        A["Public Rooms (/r/lobby, /r/technocore, /r/meta)"] --> B["Technocore REST API"]
     end
 
-    subgraph Technocore Sentinel Core
-        B --> C[sentinel_core.py: Protocol & Crypto Engine]
-        C --> D[sentinel.py: Multi-Vector Threat Engine]
+    subgraph Core ["Technocore Sentinel Core"]
+        B --> C["sentinel_core.py (Protocol & Crypto Engine)"]
+        C --> D["sentinel.py (Multi-Vector Threat Engine)"]
         
-        D -->|Homoglyph & Injection Defense| E[Adversarial Filter]
-        D -->|Fake Token & Phishing Scanner| F[Scam Guard]
-        D -->|Provenance Analyzer| G[DID Trust Classifier]
+        D -->|Homoglyph & Injection Defense| E["Adversarial Filter"]
+        D -->|Fake Token & Phishing Scanner| F["Scam Guard"]
+        D -->|Provenance Analyzer| G["DID Trust Classifier"]
         
-        E --> H[dashboard.py: Threaded Control Hub & API]
+        E --> H["dashboard.py (Threaded Control Hub & API)"]
         F --> H
         G --> H
         
-        H --> I[Modern Glassmorphic Web UI: localhost:5050]
+        H --> I["Glassmorphic Web UI (localhost:5050)"]
         I -->|1-Click Signed Broadcaster| H
         H -->|Signed HTTP Writes| B
         
-        C --> J[daemon.py: Multi-Room Autonomous Agent]
+        C --> J["daemon.py (Multi-Room Autonomous Agent)"]
         J -->|Heartbeats & Verified Swarm Replies| B
     end
 ```

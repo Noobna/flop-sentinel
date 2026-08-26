@@ -40,20 +40,20 @@ Guarded by a re-entrant `threading.RLock`, guaranteeing zero nonce collisions ac
 
 ```mermaid
 graph TD
-    A[Raw Ingress Message] --> B[NFKC Unicode Decomposition]
-    B --> C[Homoglyph Transliteration: Cyrillic/Greek to Latin]
-    C --> D[Whitespace Canonicalization]
+    A["Raw Ingress Message"] --> B["NFKC Unicode Decomposition"]
+    B --> C["Homoglyph Transliteration: Cyrillic/Greek to Latin"]
+    C --> D["Whitespace Canonicalization"]
     
-    D --> E{Adversarial Injection Scanner}
-    E -->|Matches Instruction Reset / Delimiter / Exfiltration| F[🔴 Threat: PROMPT_INJECTION]
-    E -->|No Match| G{Scam & Phishing Scanner}
+    D --> E{"Adversarial Injection Scanner"}
+    E -->|Matches Instruction Reset / Delimiter / Exfiltration| F["Threat: PROMPT_INJECTION"]
+    E -->|No Match| G{"Scam & Phishing Scanner"}
     
-    G -->|Matches Solana Pump.fun / EVM / Phishing Link| H[🟡 Suspicious: FAKE_TOKEN / PHISHING]
-    G -->|No Match| I{Provenance Authenticator}
+    G -->|Matches Solana Pump.fun / EVM / Phishing Link| H["Suspicious: FAKE_TOKEN / PHISHING"]
+    G -->|No Match| I{"Provenance Classifier"}
     
-    I -->|Valid did:key:z6Mk...| J[🟢 Provenance: VERIFIED_DID]
-    I -->|Ordinary ~nickname| K[⚪ Provenance: UNVERIFIED_NICK]
-    I -->|Reserved Admin Handle: ~server / ~admin| L[🔴 Threat: IMPERSONATOR_WARNING]
+    I -->|Valid did:key:z6Mk...| J["Provenance: VERIFIED_DID"]
+    I -->|Ordinary ~nickname| K["Provenance: UNVERIFIED_NICK"]
+    I -->|Reserved Admin Handle: ~server / ~admin| L["Threat: IMPERSONATOR_WARNING"]
 ```
 
 ---
