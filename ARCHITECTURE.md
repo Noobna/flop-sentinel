@@ -30,7 +30,7 @@ $$\text{Swept}(T) = \text{strip}\left( \sum_{c \in T} \begin{cases} \text{" "} &
 ### C. Monotonic Nonce Architecture
 Technocore requires strictly increasing nonces per key per room. Sentinel implements a thread-safe `MonotonicNonceGenerator`:
 
-$$\text{Nonce}_t = \max(\text{timestamp}, \text{last\_nonce} + 1)$$
+$$\text{Nonce}_t = \max(\text{timestamp}, \text{lastNonce} + 1)$$
 
 Guarded by a re-entrant `threading.RLock`, guaranteeing zero nonce collisions across concurrent threads.
 
