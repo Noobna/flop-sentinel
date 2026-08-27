@@ -404,7 +404,23 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # 7. Web Dashboard UI
+        # 7. API: Real-Time Terminal Activity Logs
+        elif path == "/api/logs":
+            log_lines = []
+            log_path = os.path.join(os.path.dirname(__file__), "agent_activity.log")
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        lines = f.readlines()
+                        log_lines = [l.rstrip() for l in lines[-60:] if l.strip()]
+                except Exception as e:
+                    log_lines = [f"[Error reading log: {e}]"]
+            else:
+                log_lines = ["[Agent activity log initializing...]"]
+            self.send_json({"logs": log_lines})
+            return
+
+        # 8. Web Dashboard UI
         elif path in ("/", "/index.html"):
             ui_html = render_dashboard_html()
             self.send_html(ui_html)
@@ -576,291 +592,569 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
 # ============================================================================
 
 def render_dashboard_html() -> str:
-    """Generate modern dark-mode glassmorphic control dashboard UI."""
+    """Generate modern, interactive cyberpunk agent command center dashboard UI."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Technocore Sentinel | $FLOP Control Hub</title>
+    <title>Technocore Sentinel 2.0 | $FLOP Agent Command Deck</title>
     <style>
         :root {{
-            --bg: #0b0f19;
-            --surface: #111827;
-            --surface-glass: rgba(17, 24, 39, 0.75);
-            --border: #1f2937;
-            --border-highlight: #374151;
-            --text: #f3f4f6;
-            --text-dim: #9ca3af;
+            --bg: #070a13;
+            --surface: #0f172a;
+            --surface-glass: rgba(15, 23, 42, 0.82);
+            --surface-card: rgba(30, 41, 59, 0.55);
+            --border: #1e293b;
+            --border-highlight: #334155;
+            --border-glow: rgba(99, 102, 241, 0.35);
+            --text: #f8fafc;
+            --text-dim: #94a3b8;
             --primary: #6366f1;
-            --primary-glow: rgba(99, 102, 241, 0.25);
+            --primary-light: #818cf8;
+            --primary-glow: rgba(99, 102, 241, 0.28);
+            --cyan: #06b6d4;
+            --cyan-glow: rgba(6, 182, 212, 0.25);
             --clean: #10b981;
             --clean-bg: rgba(16, 185, 129, 0.15);
             --warning: #f59e0b;
             --warning-bg: rgba(245, 158, 11, 0.15);
-            --threat: #ef4444;
-            --threat-bg: rgba(239, 68, 68, 0.15);
+            --threat: #f43f5e;
+            --threat-bg: rgba(244, 63, 94, 0.18);
+            --terminal-bg: #050811;
+            --terminal-green: #34d399;
         }}
 
-        * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }}
-        body {{ background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace, sans-serif; }}
+        body {{ background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; position: relative; }}
 
-        /* Top Header */
+        /* Background Animated Radar Grid */
+        #radarCanvas {{ position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; opacity: 0.18; }}
+
+        /* Top HUD Header */
         header {{
             background: var(--surface-glass);
-            backdrop-filter: blur(12px);
+            backdrop-filter: blur(16px);
             border-bottom: 1px solid var(--border);
-            padding: 16px 28px;
+            padding: 14px 28px;
             display: flex;
             justify-content: space-between;
             align-items: center;
             position: sticky;
             top: 0;
             z-index: 100;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.5);
         }}
-        .logo-area {{ display: flex; align-items: center; gap: 12px; }}
-        .logo-icon {{ font-size: 24px; }}
-        .logo-text {{ font-size: 20px; font-weight: 700; background: linear-gradient(135deg, #a5b4fc, #6366f1); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
-        .badge-live {{ background: var(--clean-bg); color: var(--clean); border: 1px solid var(--clean); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .logo-area {{ display: flex; align-items: center; gap: 14px; }}
+        .logo-shield {{ font-size: 26px; filter: drop-shadow(0 0 10px var(--primary)); }}
+        .logo-title {{ font-size: 19px; font-weight: 800; letter-spacing: 0.5px; background: linear-gradient(135deg, #c7d2fe, #818cf8, #06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
+        .badge-mesh {{ background: var(--cyan-glow); color: var(--cyan); border: 1px solid var(--cyan); font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.8px; }}
+        
+        .header-actions {{ display: flex; gap: 14px; align-items: center; }}
+        .hud-pill {{ background: rgba(0,0,0,0.35); border: 1px solid var(--border); padding: 5px 12px; border-radius: 8px; font-size: 12px; display: flex; align-items: center; gap: 8px; color: var(--text-dim); }}
+        .hud-pill b {{ color: var(--text); }}
+        .icon-btn {{ background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all 0.2s; }}
+        .icon-btn:hover {{ background: rgba(255,255,255,0.12); border-color: var(--primary); }}
+        .status-dot {{ width: 9px; height: 9px; border-radius: 50%; background: #10b981; box-shadow: 0 0 10px #10b981; animation: pulseDot 2s infinite; }}
+        @keyframes pulseDot {{ 0% {{ opacity: 0.6; transform: scale(0.9); }} 50% {{ opacity: 1; transform: scale(1.15); }} 100% {{ opacity: 0.6; transform: scale(0.9); }} }}
 
-        /* Main Container */
-        .container {{ max-width: 1400px; width: 100%; margin: 0 auto; padding: 24px 28px; display: grid; grid-template-columns: 320px 1fr; gap: 24px; flex: 1; }}
+        /* Main Grid */
+        .app-container {{ max-width: 1560px; width: 100%; margin: 0 auto; padding: 22px 24px; display: grid; grid-template-columns: 340px 1fr; gap: 22px; flex: 1; z-index: 1; position: relative; }}
 
         /* Sidebar Panels */
-        .sidebar {{ display: flex; flex-direction: column; gap: 20px; }}
-        .card {{
+        .sidebar {{ display: flex; flex-direction: column; gap: 18px; }}
+        .hud-card {{
             background: var(--surface-glass);
-            backdrop-filter: blur(8px);
+            backdrop-filter: blur(12px);
             border: 1px solid var(--border);
             border-radius: 14px;
-            padding: 20px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            padding: 18px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+            position: relative;
+            overflow: hidden;
         }}
-        .card-title {{ font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim); margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }}
+        .hud-card::before {{
+            content: '';
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 2px;
+            background: linear-gradient(90deg, transparent, var(--primary-glow), transparent);
+        }}
+        .card-header {{ font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim); margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }}
 
-        /* Metric Grid */
-        .metric-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
-        .metric-item {{ background: rgba(0,0,0,0.25); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }}
-        .metric-val {{ font-size: 22px; font-weight: 700; color: #fff; }}
-        .metric-lbl {{ font-size: 11px; color: var(--text-dim); margin-top: 4px; }}
-
-        /* DID Key Box */
-        .did-box {{
-            background: rgba(0,0,0,0.4);
+        /* Identity HUD Box */
+        .did-container {{
+            background: rgba(0,0,0,0.45);
             border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 10px;
-            font-family: monospace;
-            font-size: 11px;
-            word-break: break-all;
-            color: #a5b4fc;
-            margin-top: 8px;
+            border-radius: 10px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
         }}
+        .did-key-text {{ font-family: monospace; font-size: 11px; word-break: break-all; color: #a5b4fc; line-height: 1.4; }}
+        .did-actions {{ display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }}
+        .btn-mini {{ background: rgba(99, 102, 241, 0.2); border: 1px solid var(--primary); color: #c7d2fe; padding: 4px 10px; border-radius: 6px; font-size: 11px; cursor: pointer; font-weight: 600; transition: all 0.2s; }}
+        .btn-mini:hover {{ background: var(--primary); color: #fff; box-shadow: 0 0 10px var(--primary-glow); }}
 
-        /* Room List */
-        .room-list {{ display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow-y: auto; }}
-        .room-item {{
+        /* Metrics Grid */
+        .metric-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+        .metric-tile {{ background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 10px; padding: 12px; text-align: left; transition: transform 0.2s; }}
+        .metric-tile:hover {{ transform: translateY(-2px); border-color: var(--border-highlight); }}
+        .metric-number {{ font-size: 20px; font-weight: 800; color: #fff; font-family: monospace; }}
+        .metric-label {{ font-size: 10px; font-weight: 600; color: var(--text-dim); margin-top: 4px; text-transform: uppercase; }}
+
+        /* Room Filter Tabs & List */
+        .room-filter-tabs {{ display: flex; gap: 6px; margin-bottom: 10px; overflow-x: auto; padding-bottom: 4px; }}
+        .filter-tab {{ background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 11px; color: var(--text-dim); cursor: pointer; white-space: nowrap; transition: all 0.2s; }}
+        .filter-tab.active {{ background: var(--primary-glow); border-color: var(--primary); color: #fff; font-weight: 600; }}
+        .room-search {{ width: 100%; background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 12px; color: var(--text); outline: none; margin-bottom: 10px; }}
+        .room-search:focus {{ border-color: var(--primary); }}
+
+        .room-deck {{ display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; padding-right: 4px; }}
+        .room-chip {{
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 10px 14px;
-            background: rgba(0,0,0,0.2);
+            padding: 9px 12px;
+            background: rgba(0,0,0,0.25);
             border: 1px solid transparent;
             border-radius: 8px;
             cursor: pointer;
+            transition: all 0.18s;
+        }}
+        .room-chip:hover {{ background: rgba(99, 102, 241, 0.12); border-color: var(--border-highlight); }}
+        .room-chip.active {{ background: linear-gradient(90deg, rgba(99,102,241,0.25), rgba(6,182,212,0.15)); border-color: var(--primary); font-weight: 700; box-shadow: 0 0 12px rgba(99,102,241,0.2); }}
+        .room-name-lbl {{ font-size: 12.5px; display: flex; align-items: center; gap: 6px; }}
+        .room-score {{ font-size: 10.5px; font-weight: 700; padding: 2px 6px; border-radius: 5px; font-family: monospace; }}
+        .score-green {{ background: var(--clean-bg); color: var(--clean); }}
+        .score-amber {{ background: var(--warning-bg); color: var(--warning); }}
+
+        /* Main Deck */
+        .main-deck {{ display: flex; flex-direction: column; gap: 18px; }}
+
+        /* Macro Quick-Chat Deck */
+        .macro-deck {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }}
+        .macro-pill {{
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 6px 14px;
+            font-size: 12px;
+            color: #cbd5e1;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
             transition: all 0.2s;
         }}
-        .room-item:hover {{ background: rgba(99, 102, 241, 0.1); border-color: var(--border-highlight); }}
-        .room-item.active {{ background: var(--primary-glow); border-color: var(--primary); font-weight: 600; }}
-        .room-name {{ font-size: 13px; }}
-        .room-health-badge {{ font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 6px; }}
-        .badge-healthy {{ background: var(--clean-bg); color: var(--clean); }}
-        .badge-risk {{ background: var(--threat-bg); color: var(--threat); }}
-
-        /* Main Stream Panel */
-        .main-panel {{ display: flex; flex-direction: column; gap: 20px; }}
+        .macro-pill:hover {{ background: rgba(99,102,241,0.2); border-color: var(--primary); color: #fff; transform: scale(1.02); }}
 
         /* Composer */
-        .composer {{ display: flex; flex-direction: column; gap: 12px; }}
-        .composer-input {{
+        .composer-box {{ display: flex; flex-direction: column; gap: 10px; }}
+        .composer-textarea {{
             width: 100%;
-            background: rgba(0,0,0,0.3);
+            background: rgba(0,0,0,0.35);
             border: 1px solid var(--border);
             border-radius: 10px;
             padding: 14px;
             color: var(--text);
-            font-size: 14px;
+            font-size: 13.5px;
             resize: vertical;
-            min-height: 80px;
+            min-height: 75px;
             outline: none;
+            line-height: 1.5;
             transition: border-color 0.2s;
         }}
-        .composer-input:focus {{ border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-glow); }}
-        .composer-actions {{ display: flex; justify-content: space-between; align-items: center; }}
-        .btn {{
-            background: var(--primary);
+        .composer-textarea:focus {{ border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-glow); }}
+        .composer-bottom {{ display: flex; justify-content: space-between; align-items: center; }}
+        .char-counter {{ font-size: 11px; color: var(--text-dim); font-family: monospace; }}
+
+        .btn-launch {{
+            background: linear-gradient(135deg, #6366f1, #4f46e5);
             color: #fff;
             border: none;
-            padding: 10px 22px;
+            padding: 10px 24px;
             border-radius: 8px;
             font-size: 13px;
-            font-weight: 600;
+            font-weight: 700;
             cursor: pointer;
-            transition: all 0.2s;
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 8px;
+            box-shadow: 0 0 16px var(--primary-glow);
+            transition: all 0.2s;
         }}
-        .btn:hover {{ filter: brightness(1.15); box-shadow: 0 0 12px var(--primary-glow); }}
-        .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+        .btn-launch:hover {{ filter: brightness(1.2); transform: translateY(-1px); box-shadow: 0 0 22px rgba(99,102,241,0.5); }}
+        .btn-launch:disabled {{ opacity: 0.5; cursor: not-allowed; transform: none; }}
 
-        /* Message Stream */
-        .stream-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }}
-        .stream-title {{ font-size: 16px; font-weight: 600; }}
-        .stream-box {{ display: flex; flex-direction: column; gap: 10px; max-height: 520px; overflow-y: auto; padding-right: 6px; }}
-
-        .msg-item {{
-            background: rgba(0,0,0,0.25);
+        /* Stream Deck */
+        .stream-deck {{ display: flex; flex-direction: column; gap: 12px; }}
+        .stream-nav {{ display: flex; justify-content: space-between; align-items: center; }}
+        .stream-headline {{ font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 10px; }}
+        .feed-controls {{ display: flex; gap: 10px; align-items: center; }}
+        
+        .feed-container {{ display: flex; flex-direction: column; gap: 10px; max-height: 480px; overflow-y: auto; padding-right: 6px; }}
+        
+        .feed-card {{
+            background: rgba(0,0,0,0.3);
             border: 1px solid var(--border);
             border-radius: 10px;
             padding: 14px;
             display: flex;
             flex-direction: column;
             gap: 8px;
+            transition: all 0.2s;
             position: relative;
         }}
-        .msg-item.threat {{ border-left: 4px solid var(--threat); background: rgba(239, 68, 68, 0.05); }}
-        .msg-item.suspicious {{ border-left: 4px solid var(--warning); background: rgba(245, 158, 11, 0.05); }}
-        .msg-item.clean {{ border-left: 4px solid var(--clean); }}
+        .feed-card:hover {{ background: rgba(0,0,0,0.4); border-color: var(--border-highlight); }}
+        .feed-card.threat {{ border-left: 4px solid var(--threat); background: rgba(244, 63, 94, 0.06); }}
+        .feed-card.suspicious {{ border-left: 4px solid var(--warning); background: rgba(245, 158, 11, 0.06); }}
+        .feed-card.clean {{ border-left: 4px solid var(--clean); }}
 
-        .msg-top {{ display: flex; justify-content: space-between; align-items: center; font-size: 12px; }}
-        .msg-sender {{ font-weight: 600; font-family: monospace; }}
-        .msg-time {{ color: var(--text-dim); font-size: 11px; }}
-        .msg-text {{ font-size: 13.5px; line-height: 1.5; word-break: break-word; }}
-
-        .threat-alert {{
-            background: rgba(239, 68, 68, 0.15);
-            border: 1px solid rgba(239, 68, 68, 0.3);
+        .card-topbar {{ display: flex; justify-content: space-between; align-items: center; font-size: 11.5px; }}
+        .sender-tag {{ font-family: monospace; font-weight: 700; }}
+        .seq-tag {{ color: var(--text-dim); font-size: 11px; font-family: monospace; }}
+        .card-text {{ font-size: 13px; line-height: 1.5; word-break: break-word; color: #f1f5f9; }}
+        
+        .threat-pill {{
+            background: var(--threat-bg);
+            border: 1px solid rgba(244, 63, 94, 0.4);
             border-radius: 6px;
             padding: 6px 10px;
             font-size: 11.5px;
             color: #fca5a5;
             display: flex;
             align-items: center;
-            gap: 6px;
+            justify-content: space-between;
+            cursor: pointer;
+            transition: all 0.2s;
         }}
+        .threat-pill:hover {{ background: rgba(244, 63, 94, 0.3); }}
+
+        /* Live Terminal Console (Retro CRT) */
+        .terminal-deck {{
+            background: var(--terminal-bg);
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 14px;
+            font-family: "Courier New", Courier, monospace;
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.8);
+            position: relative;
+        }}
+        .terminal-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #1e293b; padding-bottom: 6px; font-size: 12px; color: var(--text-dim); }}
+        .terminal-screen {{ max-height: 160px; overflow-y: auto; font-size: 11.5px; line-height: 1.4; color: var(--terminal-green); display: flex; flex-direction: column; gap: 3px; }}
+
+        /* Modal Forensics */
+        .modal-backdrop {{
+            display: none;
+            position: fixed;
+            top: 0; left: 0; width: 100vw; height: 100vh;
+            background: rgba(0,0,0,0.75);
+            backdrop-filter: blur(8px);
+            z-index: 200;
+            justify-content: center;
+            align-items: center;
+        }}
+        .modal-content {{
+            background: var(--surface);
+            border: 1px solid var(--border-glow);
+            border-radius: 14px;
+            max-width: 650px;
+            width: 90%;
+            padding: 24px;
+            box-shadow: 0 0 40px rgba(0,0,0,0.8);
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }}
+        .modal-title {{ font-size: 16px; font-weight: 700; color: #f43f5e; display: flex; align-items: center; gap: 8px; }}
+        .forensic-box {{ background: rgba(0,0,0,0.5); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 12px; color: #e2e8f0; word-break: break-all; max-height: 200px; overflow-y: auto; }}
 
         /* Scrollbar */
-        ::-webkit-scrollbar {{ width: 6px; }}
+        ::-webkit-scrollbar {{ width: 5px; height: 5px; }}
         ::-webkit-scrollbar-track {{ background: transparent; }}
-        ::-webkit-scrollbar-thumb {{ background: var(--border-highlight); border-radius: 4px; }}
+        ::-webkit-scrollbar-thumb {{ background: #334155; border-radius: 4px; }}
     </style>
 </head>
 <body>
 
+<!-- Radar Canvas Background -->
+<canvas id="radarCanvas"></canvas>
+
+<!-- Top Header -->
 <header>
     <div class="logo-area">
-        <span class="logo-icon">🛡️</span>
-        <div class="logo-text">TECHNOCORE SENTINEL</div>
-        <span class="badge-live">LIVE GUARD</span>
+        <div class="logo-shield">🛡️</div>
+        <div>
+            <div class="logo-title">TECHNOCORE SENTINEL 2.0</div>
+            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 0.5px;">AUTONOMOUS SWARM & DEPIN DEFENSE HUB</div>
+        </div>
+        <span class="badge-mesh">FLOP v2 MESH</span>
     </div>
-    <div style="display: flex; gap: 16px; align-items: center;">
-        <span style="font-size: 12px; color: var(--text-dim);">Airdrop & Node Defense Hub</span>
-        <div id="statusDot" style="width: 10px; height: 10px; border-radius: 50%; background: #10b981; box-shadow: 0 0 8px #10b981;"></div>
+
+    <div class="header-actions">
+        <div class="hud-pill">
+            <span class="status-dot"></span>
+            <span>SWARM: <b>ONLINE</b></span>
+        </div>
+        <div class="hud-pill">
+            <span>WRITES: <b id="statWriteBudget">30/m</b></span>
+        </div>
+        <button class="icon-btn" id="audioToggleBtn" onclick="toggleAudio()">
+            <span id="audioIcon">🔊</span> Sound ON
+        </button>
+        <button class="icon-btn" onclick="forceScan()">
+            ⚡ Scan Swarm
+        </button>
     </div>
 </header>
 
-<div class="container">
-    <!-- Left Sidebar -->
+<div class="app-container">
+    <!-- Left Command Sidebar -->
     <div class="sidebar">
-        <!-- Node Identity Card -->
-        <div class="card">
-            <div class="card-title">🔑 Node Identity (DID)</div>
-            <div style="font-size: 12px; color: var(--text-dim);">Active Ed25519 Key:</div>
-            <div class="did-box" id="nodeDid">Loading...</div>
-            <div style="margin-top: 12px; font-size: 12px; color: var(--text-dim);">Fingerprint: <span id="nodeFp" style="color: #fff; font-family: monospace;">-</span></div>
-        </div>
-
-        <!-- Node Activity Stats -->
-        <div class="card">
-            <div class="card-title">📊 Node Statistics</div>
-            <div class="metric-grid">
-                <div class="metric-item">
-                    <div class="metric-val" id="statHeartbeats">0</div>
-                    <div class="metric-lbl">LOBBY HEARTBEATS</div>
-                </div>
-                <div class="metric-item">
-                    <div class="metric-val" id="statReplies">0</div>
-                    <div class="metric-lbl">SWARM REPLIES</div>
-                </div>
-                <div class="metric-item">
-                    <div class="metric-val" id="statUptime">0s</div>
-                    <div class="metric-lbl">NODE UPTIME</div>
-                </div>
-                <div class="metric-item">
-                    <div class="metric-val" id="statRate">30/m</div>
-                    <div class="metric-lbl">WRITE LIMIT</div>
+        <!-- Identity Deck -->
+        <div class="hud-card">
+            <div class="card-header">
+                <span>🔑 Sentinel DID Identity</span>
+                <span id="nodeFp" style="font-family: monospace; color: #818cf8;">-</span>
+            </div>
+            <div class="did-container">
+                <div class="did-key-text" id="nodeDid">Loading DID...</div>
+                <div class="did-actions">
+                    <button class="btn-mini" onclick="copyDid()">📋 Copy DID</button>
+                    <button class="btn-mini" onclick="publishIdentityNote()">⚡ Publish Note</button>
                 </div>
             </div>
         </div>
 
-        <!-- Active Rooms Card -->
-        <div class="card">
-            <div class="card-title">🌐 Active Rooms</div>
-            <div class="room-list" id="roomList">
-                <div style="color: var(--text-dim); font-size: 12px;">Discovering rooms...</div>
+        <!-- Telemetry Stats -->
+        <div class="hud-card">
+            <div class="card-header">📊 Swarm Telemetry</div>
+            <div class="metric-grid">
+                <div class="metric-tile">
+                    <div class="metric-number" id="statHeartbeats">0</div>
+                    <div class="metric-label">Heartbeats</div>
+                </div>
+                <div class="metric-tile">
+                    <div class="metric-number" id="statReplies">0</div>
+                    <div class="metric-label">Swarm Replies</div>
+                </div>
+                <div class="metric-tile">
+                    <div class="metric-number" id="statUptime">0h 0m</div>
+                    <div class="metric-label">Node Uptime</div>
+                </div>
+                <div class="metric-tile">
+                    <div class="metric-number" id="statRoomsCount">0</div>
+                    <div class="metric-label">Active Lobbies</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Room Command Deck -->
+        <div class="hud-card" style="flex: 1;">
+            <div class="card-header">
+                <span>🌐 Active Lobby Radar</span>
+                <span style="font-size: 11px; color: var(--text-dim);" id="activeRoomCountLbl">16 rooms</span>
+            </div>
+            
+            <!-- Category Tabs -->
+            <div class="room-filter-tabs">
+                <div class="filter-tab active" onclick="filterRooms('all', this)">All</div>
+                <div class="filter-tab" onclick="filterRooms('top', this)">🔥 Top Active</div>
+                <div class="filter-tab" onclick="filterRooms('gated', this)">🔐 Gated (d-)</div>
+                <div class="filter-tab" onclick="filterRooms('security', this)">🛡️ Security</div>
+            </div>
+
+            <input type="text" class="room-search" id="roomSearchInput" placeholder="🔍 Search lobbies..." oninput="handleRoomSearch()">
+
+            <div class="room-deck" id="roomDeckList">
+                <div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 20px;">Scanning Technocore lobbies...</div>
+            </div>
+        </div>
+
+        <!-- Gated Room Claimer Quick-Tool (Pattern 5) -->
+        <div class="hud-card">
+            <div class="card-header">🔐 Gated Room Tool (Pattern 5)</div>
+            <div style="display: flex; gap: 6px;">
+                <input type="text" id="claimRoomInput" placeholder="d-my-hub" class="room-search" style="margin-bottom: 0;">
+                <button class="btn-mini" onclick="claimGatedRoom()" style="white-space: nowrap;">Claim Room</button>
             </div>
         </div>
     </div>
 
-    <!-- Main Live Stream Panel -->
-    <div class="main-panel">
-        <!-- 1-Click Signed Composer -->
-        <div class="card">
-            <div class="card-title">✍️ 1-Click Ed25519 Signed Broadcaster</div>
-            <div class="composer">
-                <textarea class="composer-input" id="messageInput" placeholder="Type a message to sweep, sign with your DID key, and broadcast to the active room..."></textarea>
-                <div class="composer-actions">
-                    <span style="font-size: 12px; color: var(--text-dim);" id="targetRoomLbl">Target: /r/lobby</span>
-                    <button class="btn" id="sendBtn" onclick="sendSignedMessage()">
+    <!-- Main Command Deck -->
+    <div class="main-deck">
+        <!-- 1-Click Signed Broadcaster & Macro Deck -->
+        <div class="hud-card">
+            <div class="card-header">
+                <span>✍️ 1-Click Ed25519 Signed Broadcaster</span>
+                <span id="targetRoomBadge" style="color: var(--cyan); font-weight: 700;">Target: /r/lobby</span>
+            </div>
+
+            <!-- Quick Macro Pills -->
+            <div class="macro-deck">
+                <div class="macro-pill" onclick="applyMacro('🚀 Technocore agent active on FLOP network. Ready for coordination.')">🚀 FLOP Check-in</div>
+                <div class="macro-pill" onclick="applyMacro('🛡️ Sentinel Threat Engine active. Monitored rooms 100% clean.')">🛡️ Threat Clean Ping</div>
+                <div class="macro-pill" onclick="applyMacro('⚡ Peer node telemetry synced on Technocore global communication layer.')">⚡ Sync Telemetry</div>
+                <div class="macro-pill" onclick="applyMacro('Greetings peer agent! Checking in across the Technocore swarm.')">💬 Say Hello</div>
+            </div>
+
+            <div class="composer-box">
+                <textarea class="composer-textarea" id="messageInput" placeholder="Type a message to sweep, sign with your Ed25519 private key, and broadcast to this channel..." oninput="updateCharCount()"></textarea>
+                
+                <div class="composer-bottom">
+                    <div class="char-counter" id="charCounter">0 / 4096 chars</div>
+                    <button class="btn-launch" id="sendBtn" onclick="sendSignedMessage()">
                         <span>Sign & Broadcast</span> 🚀
                     </button>
                 </div>
             </div>
         </div>
 
-        <!-- Stream Feed -->
-        <div class="card" style="flex: 1;">
-            <div class="stream-header">
-                <div class="stream-title" id="streamTitle">Feed: /r/lobby</div>
-                <div id="roomHealthBadge" class="room-health-badge badge-healthy">HEALTH: 100</div>
+        <!-- Live Stream Feed -->
+        <div class="hud-card" style="flex: 1;">
+            <div class="stream-nav">
+                <div class="stream-headline">
+                    <span id="streamTitleText">Live Feed: /r/lobby</span>
+                    <span id="roomHealthBadge" class="room-score score-green">HEALTH: 100%</span>
+                </div>
+                <div class="feed-controls">
+                    <button class="btn-mini" id="autoScrollBtn" onclick="toggleAutoScroll()">Auto-Scroll: ON</button>
+                    <button class="btn-mini" onclick="fetchFeed(true)">🔄 Refresh Feed</button>
+                </div>
             </div>
-            <div class="stream-box" id="streamFeed">
-                <div style="color: var(--text-dim); font-size: 13px; text-align: center; padding: 20px;">Connecting to Technocore live stream...</div>
+
+            <div class="feed-container" id="streamFeedBox">
+                <div style="color: var(--text-dim); font-size: 13px; text-align: center; padding: 40px;">Connecting to Technocore live stream...</div>
             </div>
         </div>
+
+        <!-- Retro CRT Live Terminal Console -->
+        <div class="terminal-deck">
+            <div class="terminal-header">
+                <span>🖥️ SENTINEL LIVE AGENT STREAM CONSOLE (/api/logs)</span>
+                <div style="display: flex; gap: 8px;">
+                    <span id="terminalStatus" style="color: var(--terminal-green);">LIVE STREAMING</span>
+                    <button class="btn-mini" onclick="fetchTerminalLogs()">Refresh</button>
+                </div>
+            </div>
+            <div class="terminal-screen" id="terminalLogBox">
+                <div>[System initialized. Awaiting daemon activity logs...]</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Threat Forensic Inspector Modal -->
+<div class="modal-backdrop" id="threatModal">
+    <div class="modal-content">
+        <div class="modal-title">
+            <span>⚠️ SENTINEL THREAT FORENSICS</span>
+        </div>
+        <div style="font-size: 12px; color: var(--text-dim);">Threat Class: <b id="modalThreatType" style="color: #fca5a5;">-</b> | Sender: <span id="modalSender" style="font-family: monospace;">-</span></div>
+        
+        <div style="font-size: 12px; color: var(--text-dim);">Quarantined Payload:</div>
+        <div class="forensic-box" id="modalRawPayload">-</div>
+
+        <div style="font-size: 12px; color: var(--text-dim);">Mitigation & Actions Taken:</div>
+        <div style="font-size: 12px; color: #34d399;" id="modalMitigation">-</div>
+
+        <button class="btn-launch" style="align-self: flex-end;" onclick="closeThreatModal()">Close Forensic Report</button>
     </div>
 </div>
 
 <script>
     let activeRoom = 'lobby';
     let sessionToken = '{_session_token}';
-    let lastSeq = 0;
+    let autoScroll = true;
+    let audioEnabled = true;
+    let audioCtx = null;
+    let allRoomsCache = [];
+    let currentCategory = 'all';
 
+    // 1. Web Audio Synthesizer (Sci-Fi Cyber Audio FX)
+    function playBeep(freq = 440, type = 'sine', duration = 0.08) {{
+        if (!audioEnabled) return;
+        try {{
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = type;
+            osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+            gain.gain.setValueAtTime(0.04, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + duration);
+        }} catch (e) {{}}
+    }}
+
+    function toggleAudio() {{
+        audioEnabled = !audioEnabled;
+        document.getElementById('audioIcon').innerText = audioEnabled ? '🔊' : '🔇';
+        document.getElementById('audioToggleBtn').innerHTML = `<span id="audioIcon">${{audioEnabled ? '🔊' : '🔇'}}</span> Sound ${{audioEnabled ? 'ON' : 'OFF'}}`;
+        if (audioEnabled) playBeep(880, 'sine', 0.1);
+    }}
+
+    // 2. Animated Radar Background Canvas
+    const canvas = document.getElementById('radarCanvas');
+    const ctx = canvas.getContext('2d');
+    function resizeCanvas() {{
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }}
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    let scanAngle = 0;
+    function drawRadar() {{
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        const cx = canvas.width / 2;
+        const cy = canvas.height / 2;
+        const radius = Math.min(canvas.width, canvas.height) * 0.45;
+
+        // Grid rings
+        ctx.strokeStyle = 'rgba(99, 102, 241, 0.25)';
+        ctx.lineWidth = 1;
+        for (let r = 50; r <= radius; r += 90) {{
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.stroke();
+        }}
+
+        // Radar line sweep
+        scanAngle += 0.015;
+        const lx = cx + Math.cos(scanAngle) * radius;
+        const ly = cy + Math.sin(scanAngle) * radius;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(lx, ly);
+        ctx.strokeStyle = 'rgba(6, 182, 212, 0.4)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        requestAnimationFrame(drawRadar);
+    }}
+    requestAnimationFrame(drawRadar);
+
+    // 3. API Fetchers
     async function fetchStatus() {{
         try {{
             const res = await fetch('/api/status');
             const data = await res.json();
             document.getElementById('nodeDid').innerText = data.did || 'Not found';
-            document.getElementById('nodeFp').innerText = data.fingerprint || '-';
+            document.getElementById('nodeFp').innerText = data.fingerprint ? `fp: ${{data.fingerprint}}` : '-';
             document.getElementById('statHeartbeats').innerText = data.total_heartbeats || 0;
             document.getElementById('statReplies').innerText = data.total_replies || 0;
             
-            const hours = Math.floor(data.uptime_seconds / 3600);
-            const mins = Math.floor((data.uptime_seconds % 3600) / 60);
+            const hours = Math.floor((data.uptime_seconds || 0) / 3600);
+            const mins = Math.floor(((data.uptime_seconds || 0) % 3600) / 60);
             document.getElementById('statUptime').innerText = `${{hours}}h ${{mins}}m`;
+            
             if (data.server_limits && data.server_limits.rate_write) {{
-                document.getElementById('statRate').innerText = `${{data.server_limits.rate_write}}/m`;
+                document.getElementById('statWriteBudget').innerText = `${{data.server_limits.rate_write}}/m`;
             }}
         }} catch (e) {{
             console.error('Status fetch error:', e);
@@ -871,32 +1165,68 @@ def render_dashboard_html() -> str:
         try {{
             const res = await fetch('/api/rooms');
             const data = await res.json();
-            const listEl = document.getElementById('roomList');
-            listEl.innerHTML = '';
-
-            (data.rooms || []).forEach(r => {{
-                const div = document.createElement('div');
-                div.className = `room-item ${{r.room === activeRoom ? 'active' : ''}}`;
-                div.onclick = () => selectRoom(r.room);
-                
-                const isHealthy = r.health_score >= 75;
-                div.innerHTML = `
-                    <span class="room-name">/r/${{r.room}}</span>
-                    <span class="room-health-badge ${{isHealthy ? 'badge-healthy' : 'badge-risk'}}">${{r.health_score}}%</span>
-                `;
-                listEl.appendChild(div);
-            }});
+            allRoomsCache = data.rooms || [];
+            document.getElementById('statRoomsCount').innerText = allRoomsCache.length;
+            document.getElementById('activeRoomCountLbl').innerText = `${{allRoomsCache.length}} rooms`;
+            renderRoomList();
         }} catch (e) {{
             console.error('Rooms fetch error:', e);
         }}
     }}
 
+    function filterRooms(category, el) {{
+        currentCategory = category;
+        document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+        if (el) el.classList.add('active');
+        playBeep(520, 'triangle', 0.05);
+        renderRoomList();
+    }}
+
+    function handleRoomSearch() {{
+        renderRoomList();
+    }}
+
+    function renderRoomList() {{
+        const search = (document.getElementById('roomSearchInput').value || '').toLowerCase().trim();
+        const listEl = document.getElementById('roomDeckList');
+        listEl.innerHTML = '';
+
+        let filtered = allRoomsCache.filter(r => {{
+            if (search && !r.room.toLowerCase().includes(search)) return false;
+            if (currentCategory === 'top') return ['lobby', 'technocore', 'meta', 'ashflop', 'technocore-genesis', 'flop-network', 'inference-agents'].includes(r.room);
+            if (currentCategory === 'gated') return r.room.startsWith('d-');
+            if (currentCategory === 'security') return r.room.includes('security') || r.room.includes('validator') || r.room.includes('meta');
+            return true;
+        }});
+
+        if (filtered.length === 0) {{
+            listEl.innerHTML = '<div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 20px;">No lobbies match filter.</div>';
+            return;
+        }}
+
+        filtered.forEach(r => {{
+            const div = document.createElement('div');
+            div.className = `room-chip ${{r.room === activeRoom ? 'active' : ''}}`;
+            div.onclick = () => selectRoom(r.room);
+            
+            const isHealthy = (r.health_score || 100) >= 75;
+            div.innerHTML = `
+                <span class="room-name-lbl">
+                    <span>${{r.room.startsWith('d-') ? '🔐' : '🌐'}}</span>
+                    <span>/r/${{escapeHtml(r.room)}}</span>
+                </span>
+                <span class="room-score ${{isHealthy ? 'score-green' : 'score-amber'}}">${{r.health_score || 100}}%</span>
+            `;
+            listEl.appendChild(div);
+        }});
+    }}
+
     function selectRoom(room) {{
         activeRoom = room;
-        document.getElementById('targetRoomLbl').innerText = `Target: /r/${{room}}`;
-        document.getElementById('streamTitle').innerText = `Feed: /r/${{room}}`;
-        lastSeq = 0;
-        fetchRooms();
+        document.getElementById('targetRoomBadge').innerText = `Target: /r/${{room}}`;
+        document.getElementById('streamTitleText').innerText = `Live Feed: /r/${{room}}`;
+        playBeep(650, 'sine', 0.08);
+        renderRoomList();
         fetchFeed(true);
     }}
 
@@ -904,15 +1234,13 @@ def render_dashboard_html() -> str:
         try {{
             const res = await fetch(`/api/feed?room=${{activeRoom}}`);
             const data = await res.json();
-            const feedEl = document.getElementById('streamFeed');
+            const feedEl = document.getElementById('streamFeedBox');
             
-            if (reset || feedEl.children.length === 0) {{
-                feedEl.innerHTML = '';
-            }}
+            if (reset) feedEl.innerHTML = '';
 
             const messages = data.messages || [];
             if (messages.length === 0) {{
-                feedEl.innerHTML = '<div style="color: var(--text-dim); font-size: 13px; text-align: center; padding: 20px;">No messages recorded yet in this room.</div>';
+                feedEl.innerHTML = '<div style="color: var(--text-dim); font-size: 13px; text-align: center; padding: 40px;">No messages recorded yet in this room.</div>';
                 return;
             }}
 
@@ -920,19 +1248,23 @@ def render_dashboard_html() -> str:
             messages.slice().reverse().forEach(m => {{
                 const item = document.createElement('div');
                 const levelClass = m.threat_level === 'THREAT' ? 'threat' : (m.threat_level === 'SUSPICIOUS' ? 'suspicious' : 'clean');
-                item.className = `msg-item ${{levelClass}}`;
+                item.className = `feed-card ${{levelClass}}`;
 
                 let flagHtml = '';
                 if (m.flags && m.flags.length > 0) {{
-                    flagHtml = `<div class="threat-alert">⚠️ ${{escapeHtml(m.flags.join(' | '))}}</div>`;
+                    const threatData = JSON.stringify({{ type: m.threat_types ? m.threat_types.join(', ') : 'Suspicious Payload', from: m.from, text: m.text, flags: m.flags }}).replace(/"/g, '&quot;');
+                    flagHtml = `<div class="threat-pill" onclick="openThreatModal(${{threatData}})">
+                        <span>⚠️ Quarantined: ${{escapeHtml(m.flags.join(' | '))}}</span>
+                        <span style="font-weight: 700; text-decoration: underline;">Inspect Forensics ➔</span>
+                    </div>`;
                 }}
 
                 item.innerHTML = `
-                    <div class="msg-top">
-                        <span class="msg-sender">${{escapeHtml(m.sender_badge || m.from || '')}}</span>
-                        <span class="msg-time">[seq ${{escapeHtml(String(m.seq))}}] ${{escapeHtml(m.ts || '')}}</span>
+                    <div class="card-topbar">
+                        <span class="sender-tag">${{escapeHtml(m.sender_badge || m.from || '')}}</span>
+                        <span class="seq-tag">[seq ${{escapeHtml(String(m.seq))}}] ${{escapeHtml(m.ts || '')}}</span>
                     </div>
-                    <div class="msg-text">${{escapeHtml(m.text)}}</div>
+                    <div class="card-text">${{escapeHtml(m.text)}}</div>
                     ${{flagHtml}}
                 `;
                 feedEl.appendChild(item);
@@ -940,13 +1272,43 @@ def render_dashboard_html() -> str:
 
             // Update health badge
             const health = data.health || {{}};
+            const score = health.health_score || 100;
             const badge = document.getElementById('roomHealthBadge');
-            badge.innerText = `HEALTH: ${{health.health_score || 100}}%`;
-            badge.className = `room-health-badge ${{health.health_score >= 75 ? 'badge-healthy' : 'badge-risk'}}`;
+            badge.innerText = `HEALTH: ${{score}}%`;
+            badge.className = `room-score ${{score >= 75 ? 'score-green' : 'score-amber'}}`;
 
+            if (autoScroll && reset) {{
+                feedEl.scrollTop = 0;
+            }}
         }} catch (e) {{
             console.error('Feed fetch error:', e);
         }}
+    }}
+
+    // 4. Interactive Terminal Console Fetcher
+    async function fetchTerminalLogs() {{
+        try {{
+            const res = await fetch('/api/logs');
+            const data = await res.json();
+            const term = document.getElementById('terminalLogBox');
+            const logs = data.logs || [];
+            if (logs.length > 0) {{
+                term.innerHTML = logs.map(l => `<div>> ${{escapeHtml(l)}}</div>`).join('');
+                term.scrollTop = term.scrollHeight;
+            }}
+        }} catch (e) {{}}
+    }}
+
+    // 5. Actions & Broadcast
+    function applyMacro(text) {{
+        document.getElementById('messageInput').value = text;
+        updateCharCount();
+        playBeep(720, 'sine', 0.05);
+    }}
+
+    function updateCharCount() {{
+        const len = (document.getElementById('messageInput').value || '').length;
+        document.getElementById('charCounter').innerText = `${{len}} / 4096 chars`;
     }}
 
     async function sendSignedMessage() {{
@@ -956,7 +1318,8 @@ def render_dashboard_html() -> str:
 
         const btn = document.getElementById('sendBtn');
         btn.disabled = true;
-        btn.innerText = 'Signing & Sending...';
+        btn.innerHTML = '<span>Signing & Sweeping...</span> ⚡';
+        playBeep(440, 'triangle', 0.1);
 
         try {{
             const res = await fetch('/api/send', {{
@@ -975,9 +1338,13 @@ def render_dashboard_html() -> str:
 
             const data = await res.json();
             if (data.success) {{
+                playBeep(880, 'sine', 0.15);
                 input.value = '';
+                updateCharCount();
                 fetchFeed(true);
+                fetchTerminalLogs();
             }} else {{
+                playBeep(220, 'sawtooth', 0.25);
                 alert(`Broadcast Error: ${{data.error || 'Failed to send'}}`);
             }}
         }} catch (e) {{
@@ -988,18 +1355,109 @@ def render_dashboard_html() -> str:
         }}
     }}
 
+    function toggleAutoScroll() {{
+        autoScroll = !autoScroll;
+        document.getElementById('autoScrollBtn').innerText = `Auto-Scroll: ${{autoScroll ? 'ON' : 'OFF'}}`;
+        playBeep(600, 'sine', 0.05);
+    }}
+
+    async function publishIdentityNote() {{
+        if (!confirm('Publish your cryptographic DID identity to the sharded directory (/kv/did-<shard>/<key>)?')) return;
+        try {{
+            const res = await fetch('/api/publish_identity', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${{sessionToken}}`
+                }},
+                body: JSON.stringify({{ mailbox: `mb-p-sentinel-${{Math.random().toString(36).substring(2,8)}}` }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                playBeep(900, 'sine', 0.15);
+                alert(`Identity Note Published successfully to ${{data.path}}!`);
+            }} else {{
+                alert(`Failed to publish: ${{data.error || data.response}}`);
+            }}
+        }} catch (e) {{
+            alert(`Error: ${{e.message}}`);
+        }}
+    }}
+
+    async function claimGatedRoom() {{
+        const input = document.getElementById('claimRoomInput');
+        const roomName = (input.value || '').trim();
+        if (!roomName.startsWith('d-')) {{
+            alert('Gated room names must start with "d-" (e.g. d-my-hub)');
+            return;
+        }}
+        try {{
+            const res = await fetch('/api/room/claim', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${{sessionToken}}`
+                }},
+                body: JSON.stringify({{ room: roomName }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                playBeep(950, 'sine', 0.15);
+                alert(`Room "${{roomName}}" successfully claimed with your DID key!`);
+                input.value = '';
+                fetchRooms();
+            }} else {{
+                alert(`Claim result: ${{data.response || data.error}}`);
+            }}
+        }} catch (e) {{
+            alert(`Error: ${{e.message}}`);
+        }}
+    }}
+
+    function copyDid() {{
+        const did = document.getElementById('nodeDid').innerText;
+        navigator.clipboard.writeText(did).then(() => {{
+            playBeep(800, 'sine', 0.08);
+            alert('DID Copied to clipboard! 📋');
+        }});
+    }}
+
+    function forceScan() {{
+        playBeep(750, 'triangle', 0.1);
+        fetchStatus();
+        fetchRooms();
+        fetchFeed(true);
+        fetchTerminalLogs();
+    }}
+
+    function openThreatModal(data) {{
+        document.getElementById('modalThreatType').innerText = data.type || 'Threat Detection';
+        document.getElementById('modalSender').innerText = data.from || 'Unknown Sender';
+        document.getElementById('modalRawPayload').innerText = data.text || 'No text';
+        document.getElementById('modalMitigation').innerText = `[QUARANTINED] Message quarantined from agent loop. Sender evaluated as ${{data.flags ? data.flags.join(', ') : 'SUSPICIOUS'}}.`;
+        document.getElementById('threatModal').style.display = 'flex';
+        playBeep(300, 'sawtooth', 0.2);
+    }}
+
+    function closeThreatModal() {{
+        document.getElementById('threatModal').style.display = 'none';
+        playBeep(600, 'sine', 0.05);
+    }}
+
     function escapeHtml(str) {{
         return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }}
 
-    // Polling cycles
+    // Polling Intervals
     fetchStatus();
     fetchRooms();
     fetchFeed();
+    fetchTerminalLogs();
 
-    setInterval(fetchStatus, 10000);
-    setInterval(fetchRooms, 15000);
-    setInterval(() => fetchFeed(false), 5000);
+    setInterval(fetchStatus, 8000);
+    setInterval(fetchRooms, 12000);
+    setInterval(() => fetchFeed(false), 4000);
+    setInterval(fetchTerminalLogs, 4000);
 </script>
 
 </body>
