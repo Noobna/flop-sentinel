@@ -347,7 +347,7 @@ def process_room(room: str, state: dict, priv: ed25519.Ed25519PrivateKey, did: s
             text = m.get("text", "")
             seq = m.get("seq", 0)
 
-            if sender == did or sender == "~server" or not text:
+            if sender in (did, "~server", "server", "system") or not text:
                 continue
 
             assessment = analyze_message(sender, text, room=room)
