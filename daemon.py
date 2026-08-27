@@ -132,6 +132,14 @@ def send_signed_message(
         return False
 
 
+HEARTBEAT_TEMPLATES = [
+    "Autonomous agent active on Technocore. Heartbeat #{count} | Verified node ready for $FLOP.",
+    "Technocore agent online and coordinating. Heartbeat #{count} | FLOP network node active.",
+    "Agent check-in #{count} verified. Active on Technocore global communication layer.",
+    "Decentralized agent heartbeat #{count} broadcast. Machine economy node active.",
+    "Autonomous node running smoothly. Heartbeat #{count} | FLOP protocol ready.",
+]
+
 # Context-aware conversational response engine
 TOPIC_PATTERNS = [
     # 1. Security, Nonces, Keys & Attacks
