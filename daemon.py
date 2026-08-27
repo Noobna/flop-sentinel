@@ -184,14 +184,51 @@ def poll_room(room: str, since_seq: int = 0) -> tuple[list[dict], int]:
     return [], since_seq
 
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_state_lock = threading.Lock()
+
+def process_room(room: str, state: dict, priv: ed25519.Ed25519PrivateKey, did: str):
+    with _state_lock:
+        since = state.setdefault("room_seen_seqs", {}).get(room, 0)
+    
+    messages, last_seq = poll_room(room, since_seq=since)
+    
+    if messages:
+        with _state_lock:
+            state["room_seen_seqs"][room] = max(last_seq, since)
+
+        for m in messages:
+            sender = m.get("from", "")
+            text = m.get("text", "")
+            seq = m.get("seq", 0)
+
+            if sender == did or sender == "~server" or not text:
+                continue
+
+            assessment = analyze_message(sender, text, room=room)
+            if assessment.level in ("THREAT", "SUSPICIOUS"):
+                logger.warning(f"[SENTINEL BLOCKED] Ignored {assessment.level} in /r/{room} from {sender[:16]}... flags={assessment.flags}")
+                continue
+
+            with _state_lock:
+                can_reply = (time.time() - state.get("last_write_time", 0)) >= 60
+
+            if can_reply:
+                reply_text = generate_contextual_reply(sender, text, room)
+                logger.info(f"[Chat in /r/{room}] Replying to seq={seq} ({sender[:16]}...): \"{reply_text}\"")
+                if send_signed_message(priv, did, reply_text, room=room):
+                    with _state_lock:
+                        state["total_replies"] = state.get("total_replies", 0) + 1
+                        state["last_write_time"] = time.time()
+                        save_state(state)
+                break
+
+
 def run_global_daemon(heartbeat_interval_mins: int = 25):
     priv, did = load_or_create_identity()
     state = load_state()
-
-    # Seed in-memory monotonic nonces from persisted room sequence state (Issue L-2)
-    for r_name, seq in state.get("room_seen_seqs", {}).items():
-        if isinstance(seq, int) and seq > 0:
-            seed_room_nonce(r_name, seq)
 
     logger.info("=" * 60)
     logger.info("  Technocore Multi-Room & Global Chat Daemon Started")
@@ -215,54 +252,29 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
 
         # 2. Main Lobby Heartbeat
         if now - last_heartbeat_time >= heartbeat_interval_mins * 60:
-            state["total_heartbeats"] += 1
-            count = state["total_heartbeats"]
+            with _state_lock:
+                state["total_heartbeats"] = state.get("total_heartbeats", 0) + 1
+                count = state["total_heartbeats"]
             hb_text = random.choice(HEARTBEAT_TEMPLATES).format(count=count)
             logger.info(f"\n--- [Lobby Heartbeat #{count}] ---")
             if send_signed_message(priv, did, hb_text, room="lobby"):
-                state["last_checkin_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                state["last_write_time"] = time.time()
-                last_heartbeat_time = now
-                save_state(state)
+                with _state_lock:
+                    state["last_checkin_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    state["last_write_time"] = time.time()
+                    save_state(state)
             time.sleep(5)
 
-        # 3. Monitor & Chat across Global Rooms
-        room_seen = state.setdefault("room_seen_seqs", {})
-        for room in active_rooms:
-            since = room_seen.get(room, 0)
-            messages, last_seq = poll_room(room, since_seq=since)
+        # 3. Monitor & Chat across Global Rooms concurrently
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(process_room, room, state, priv, did) for room in active_rooms]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"[!] Error processing room: {e}")
 
-            if messages:
-                room_seen[room] = max(last_seq, since)
-                # Check for peer messages to reply to
-                for m in messages:
-                    sender = m.get("from", "")
-                    text = m.get("text", "")
-                    seq = m.get("seq", 0)
-
-                    if sender == did or sender == "~server" or not text:
-                        continue
-
-                    # Sentinel Security Guard: Discard prompt injections, scams, and threats
-                    assessment = analyze_message(sender, text, room=room)
-                    if assessment.level in ("THREAT", "SUSPICIOUS"):
-                        logger.warning(f"[SENTINEL BLOCKED] Ignored {assessment.level} in /r/{room} from {sender[:16]}... flags={assessment.flags}")
-                        continue
-
-                    # Rate limit replies: at least 60 seconds between any write across the network
-                    if time.time() - state.get("last_write_time", 0) >= 60:
-                        reply_text = generate_contextual_reply(sender, text, room)
-                        logger.info(f"[Chat in /r/{room}] Replying to seq={seq} ({sender[:16]}...): \"{reply_text}\"")
-                        if send_signed_message(priv, did, reply_text, room=room):
-                            state["total_replies"] = state.get("total_replies", 0) + 1
-                            state["last_write_time"] = time.time()
-                            save_state(state)
-                        break
-
-            # Brief pause between room polls
-            time.sleep(2)
-
-        save_state(state)
+        with _state_lock:
+            save_state(state)
 
         # Sleep before next polling sweep
         sweep_sleep = random.randint(30, 45)

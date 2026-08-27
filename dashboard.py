@@ -411,6 +411,9 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         # Always drain incoming body first to prevent TCP socket resets on Windows
         try:
             content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > 1_048_576:
+                self.send_json({"error": "Payload Too Large"}, status=413)
+                return
             raw_body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else ""
             body = json.loads(raw_body) if raw_body else {}
         except Exception:
