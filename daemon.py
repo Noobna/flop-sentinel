@@ -39,8 +39,21 @@ from sentinel_core import (
 from sentinel import analyze_message
 
 LOG_FILE = "agent_activity.log"
-# Core default rooms to always maintain presence in
-CORE_ROOMS = ["lobby", "global", "technocore", "meta"]
+# Core default rooms with highest activity and message volume to prioritize
+CORE_ROOMS = [
+    "lobby",
+    "technocore",
+    "meta",
+    "ashflop",
+    "technocore-genesis",
+    "flop-network",
+    "flop-collective",
+    "inference-agents",
+    "validators",
+    "kibble",
+    "gpu-miners",
+    "agent-security",
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,8 +176,8 @@ def discover_active_rooms() -> list[str]:
                     discovered.append(room_name)
     except Exception as e:
         logger.debug(f"Error discovering rooms: {e}")
-    # Return top 10 most relevant rooms
-    return discovered[:10]
+    # Return top 16 most active and relevant rooms
+    return discovered[:16]
 
 
 def poll_room(room: str, since_seq: int = 0) -> tuple[list[dict], int]:

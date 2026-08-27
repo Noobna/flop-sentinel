@@ -52,7 +52,20 @@ from sentinel import analyze_message, evaluate_room_health
 HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
 _active_port = DEFAULT_PORT  # Updated by start_server() for Host header validation
-CORE_ROOMS = ["lobby", "global", "technocore", "meta", "inference-agents", "validators"]
+CORE_ROOMS = [
+    "lobby",
+    "technocore",
+    "meta",
+    "ashflop",
+    "technocore-genesis",
+    "flop-network",
+    "flop-collective",
+    "inference-agents",
+    "validators",
+    "kibble",
+    "gpu-miners",
+    "agent-security",
+]
 ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")  # M-1: validate room names
 GATED_ROOM_RE = re.compile(r"^d-[a-z0-9][a-z0-9\-]{0,45}$")  # Pattern 5: gated room names
 
@@ -140,7 +153,7 @@ class SentinelStreamMonitor(threading.Thread):
                     if name and not name.startswith(("p-", "mb-", "d-", "e-")) and name not in rooms_list:
                         rooms_list.append(name)
                 with _lock:
-                    self.active_rooms = rooms_list[:12]
+                    self.active_rooms = rooms_list[:16]
                 logger.info(f"[*] Discovered {len(self.active_rooms)} active rooms: {', '.join(self.active_rooms)}")
         except Exception as e:
             logger.debug(f"Room discovery error: {e}")
