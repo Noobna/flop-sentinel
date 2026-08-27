@@ -81,6 +81,19 @@ SCAM_PATTERNS = [
     re.compile(r"https?://t\.me/[^\s]*(?:airdrop|claim|reward|official_flop)", re.IGNORECASE),
 ]
 
+# Base64 chunk detector (min length 16 chars)
+BASE64_CHUNK_PATTERN = re.compile(r'(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
+
+# Markdown Image SSRF / Context Exfiltration Traps
+MARKDOWN_SSRF_PATTERN = re.compile(r'!\[.*?\]\((https?://[^\s\)]+)\)', re.IGNORECASE)
+
+# Unicode Bidi directional overrides (Trojan Source: LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI, LRM, RLM)
+BIDI_OVERRIDE_CHARS = {
+    chr(0x202A), chr(0x202B), chr(0x202C), chr(0x202D), chr(0x202E),
+    chr(0x2066), chr(0x2067), chr(0x2068), chr(0x2069),
+    chr(0x200E), chr(0x200F),
+}
+
 RESERVED_ADMIN_NAMES = {
     "server", "admin", "administrator", "root", "system",
     "flop_team", "flop_official", "technocore_admin", "arthur", "hayes"
@@ -91,7 +104,7 @@ RESERVED_ADMIN_NAMES = {
 class ThreatAssessment:
     level: str             # "CLEAN", "SUSPICIOUS", "THREAT"
     confidence: float      # 0.0 to 1.0
-    threat_types: List[str] # ["PROMPT_INJECTION", "FAKE_TOKEN", "PHISHING", "IMPERSONATION"]
+    threat_types: List[str] # ["PROMPT_INJECTION", "FAKE_TOKEN", "PHISHING", "IMPERSONATION", "BASE64_INJECTION", "MARKDOWN_SSRF", "BIDI_OVERRIDE"]
     flags: List[str]       # Human-readable explanation of triggers
     normalized_text: str
     provenance: str        # "VERIFIED_DID", "UNVERIFIED_NICK", "IMPERSONATOR_WARNING"
@@ -103,16 +116,15 @@ class ThreatAssessment:
 # ============================================================================
 
 def normalize_text(text: str) -> str:
-    """Apply invisible-char stripping, NFKC normalization, homoglyph substitution, and whitespace clean."""
+    """Apply Bidi/invisible-char stripping, NFKC normalization, homoglyph substitution, and whitespace clean."""
     if not text:
         return ""
-    # 0. Strip invisible Unicode categories (Cc, Cf, Cs, Co, Zl, Zp) — same
-    #    categories used by canonical_sweep(). Without this, zero-width chars
-    #    (U+200B, U+200C, U+FEFF, etc.) bypass injection pattern matching (H-3).
+    # 0. Strip invisible Unicode categories (Cc, Cf, Cs, Co, Zl, Zp) and Bidi overrides
     #    We REMOVE (not replace with space) so split words rejoin for detection.
     INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
     visible = "".join(
-        c for c in text if unicodedata.category(c) not in INVISIBLE_CATEGORIES
+        c for c in text
+        if unicodedata.category(c) not in INVISIBLE_CATEGORIES and c not in BIDI_OVERRIDE_CHARS
     )
     # 1. NFKC Unicode decomposition and compatibility composition
     nfkc = unicodedata.normalize("NFKC", visible)
@@ -181,13 +193,50 @@ def analyze_message(sender: str, raw_text: str, room: str = "lobby") -> ThreatAs
                 flags.append(f"Suspicious phishing or fake claim link detected: '{matched_str}'")
             confidence = max(confidence, 0.85)
 
+    # 4. Trojan Source & Bidi Override Check
+    if any(c in BIDI_OVERRIDE_CHARS for c in raw_text):
+        threat_types.append("BIDI_OVERRIDE")
+        flags.append("Trojan Source: Unicode directional override character detected")
+        confidence = max(confidence, 0.90)
+
+    # 5. Recursive Base64 Payload Scan
+    for b64_match in BASE64_CHUNK_PATTERN.findall(raw_text):
+        try:
+            pad = (4 - (len(b64_match) % 4)) % 4
+            decoded_bytes = base64.b64decode(b64_match + ("=" * pad), validate=True)
+            if len(decoded_bytes) <= 4096:
+                decoded_str = decoded_bytes.decode("utf-8", errors="ignore").strip()
+                if decoded_str and len(decoded_str) >= 8:
+                    norm_decoded = normalize_text(decoded_str)
+                    for pattern in PROMPT_INJECTION_PATTERNS:
+                        if pattern.search(norm_decoded):
+                            threat_types.append("BASE64_INJECTION")
+                            threat_types.append("PROMPT_INJECTION")
+                            flags.append(f"Hidden Base64-encoded prompt injection: '{decoded_str[:40]}'")
+                            confidence = max(confidence, 0.95)
+                            break
+        except Exception:
+            pass
+
+    # 6. Markdown Image SSRF Exfiltration Trap Check
+    for img_match in MARKDOWN_SSRF_PATTERN.findall(raw_text):
+        if any(param in img_match.lower() for param in ("?token=", "?data=", "?leak=", "?q=", "?session=", "?exfil=")):
+            threat_types.append("MARKDOWN_SSRF")
+            flags.append(f"Suspicious context exfiltration image link: '{img_match[:40]}'")
+            confidence = max(confidence, 0.90)
+
     # Deduplicate threat types
     threat_types = list(dict.fromkeys(threat_types))
 
     # Determine overall threat level
-    if "PROMPT_INJECTION" in threat_types or "IMPERSONATION" in threat_types:
+    if (
+        "PROMPT_INJECTION" in threat_types
+        or "IMPERSONATION" in threat_types
+        or "BASE64_INJECTION" in threat_types
+        or "BIDI_OVERRIDE" in threat_types
+    ):
         level = "THREAT"
-    elif "FAKE_TOKEN" in threat_types or "PHISHING" in threat_types:
+    elif "FAKE_TOKEN" in threat_types or "PHISHING" in threat_types or "MARKDOWN_SSRF" in threat_types:
         level = "SUSPICIOUS"
     else:
         level = "CLEAN"

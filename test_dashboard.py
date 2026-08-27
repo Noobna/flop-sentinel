@@ -159,6 +159,42 @@ class TestSentinelDashboard(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
+    def test_09_events_and_sharded_did_apis(self):
+        """Verify GET /api/events and GET /api/sharded_did endpoints."""
+        # 1. Events API
+        status, data = self.make_request("/api/events")
+        self.assertEqual(status, 200)
+        self.assertIn("events", data)
+        self.assertIsInstance(data["events"], list)
+
+        # 2. Sharded DID API
+        status, data = self.make_request("/api/sharded_did")
+        self.assertEqual(status, 200)
+        self.assertIn("shard", data)
+        self.assertIn("key", data)
+        self.assertIn("path", data)
+        self.assertTrue(data["path"].startswith("/kv/did-"))
+
+    def test_10_authenticated_room_claim_validation(self):
+        """Verify POST /api/room/claim authentication and strict regex validation."""
+        # 1. Unauthenticated claim rejected
+        status, data = self.make_request(
+            "/api/room/claim",
+            method="POST",
+            data={"room": "d-valid-room"}
+        )
+        self.assertEqual(status, 401)
+
+        # 2. Authenticated claim with invalid non-d prefix room rejected
+        status, data = self.make_request(
+            "/api/room/claim",
+            method="POST",
+            headers={"Authorization": f"Bearer {dashboard._session_token}"},
+            data={"room": "lobby"}  # must start with d-
+        )
+        self.assertEqual(status, 400)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

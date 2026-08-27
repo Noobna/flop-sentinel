@@ -173,6 +173,29 @@ class TestSentinelCore(unittest.TestCase):
             if os.path.exists("test_signer_id.json"):
                 os.remove("test_signer_id.json")
 
+    def test_07_sharded_did_path_computation(self):
+        """Test computing official Technocore sharded DID paths."""
+        from sentinel_core import get_sharded_did_path
+        did = "did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6"
+        shard, key, full_path = get_sharded_did_path(did)
+        self.assertEqual(shard, "b6")
+        self.assertEqual(key, "3157abe5a8667d")
+        self.assertEqual(full_path, "/kv/did-b6/3157abe5a8667d")
+
+    def test_08_gated_room_signature_payload(self):
+        """Test gated room parameter validation and allowlist format."""
+        from sentinel_core import claim_gated_room, set_room_allowlist
+        priv, did = load_or_create_identity("test_gated_id.json")
+        try:
+            with self.assertRaises(ValueError):
+                claim_gated_room(priv, did, "invalid!name")
+            with self.assertRaises(ValueError):
+                set_room_allowlist(priv, did, "d-valid-room", ["invalid-did"])
+        finally:
+            if os.path.exists("test_gated_id.json"):
+                os.remove("test_gated_id.json")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

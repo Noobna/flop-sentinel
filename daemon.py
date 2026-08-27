@@ -26,19 +26,21 @@ from sentinel_core import (
     USER_AGENT,
     canonical_sweep,
     get_next_nonce,
-    seed_room_nonce,
+    get_sharded_did_path,
     http_get,
     is_valid_did,
     load_json_safe,
     load_or_create_identity,
+    publish_sharded_did,
     save_json_atomic,
+    seed_room_nonce,
     sign_message,
 )
 from sentinel import analyze_message
 
 LOG_FILE = "agent_activity.log"
 # Core default rooms to always maintain presence in
-CORE_ROOMS = ["lobby", "technocore", "meta"]
+CORE_ROOMS = ["lobby", "global", "technocore", "meta"]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +51,9 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("flop-global-agent")
+
+# Duplicate text prevention cache (Technocore enforces 60s dupe filter)
+_recent_sent_texts: Dict[str, float] = {}
 
 
 def load_state() -> dict:
@@ -69,6 +74,17 @@ def send_signed_message(
     priv: ed25519.Ed25519PrivateKey, did: str, text: str, room: str = "lobby"
 ) -> bool:
     try:
+        # Check 60-second duplicate cache
+        now = time.time()
+        # Clean expired duplicate cache entries (> 65s)
+        for k, v in list(_recent_sent_texts.items()):
+            if now - v > 65:
+                _recent_sent_texts.pop(k, None)
+                
+        if text in _recent_sent_texts and (now - _recent_sent_texts[text] < 60):
+            logger.info(f"[*] Suppressed duplicate message inside 60s window: '{text[:40]}'")
+            return False
+
         nonce = get_next_nonce(room)
         text_clean, sig = sign_message(priv, room, nonce, text)
         url = f"https://technocore.chat/r/{room}/say-signed/{did}/{sig}/{nonce}/{urllib.parse.quote(text_clean)}"
@@ -77,8 +93,13 @@ def send_signed_message(
             try:
                 status, body = http_get(url, timeout=30)
                 if status == 200:
+                    _recent_sent_texts[text] = time.time()
                     logger.info(f"[+] Broadcast SUCCESS in /r/{room}: \"{text_clean}\"")
                     return True
+                elif status == 422:
+                    logger.warning(f"[-] Duplicate refused by Technocore (HTTP 422): \"{text_clean[:40]}\"")
+                    _recent_sent_texts[text] = time.time()
+                    return False
                 elif status == 429:
                     logger.warning(f"[-] Rate limited in /r/{room} (HTTP 429). Waiting 15s...")
                     time.sleep(15)

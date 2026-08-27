@@ -298,3 +298,104 @@ def http_get(url: str, timeout: int = 25) -> Tuple[int, str]:
         return e.code, body
     except urllib.error.URLError as e:
         raise RuntimeError(f"Network error on {url}: {e.reason}") from e
+
+
+# ============================================================================
+# 7. Sharded DID Directory & Gated Room Access Control (Patterns 3 & 5)
+# ============================================================================
+
+def get_sharded_did_path(did: str) -> Tuple[str, str, str]:
+    """Compute official Technocore sharded DID path: /kv/did-<shard>/<key>.
+    Returns (shard, key, full_path).
+    """
+    if not is_valid_did(did):
+        raise ValueError(f"Invalid DID: {did}")
+    fp = hashlib.sha256(did.encode("utf-8")).hexdigest()[:16]
+    shard = fp[:2]
+    key = fp[2:]
+    return shard, key, f"/kv/did-{shard}/{key}"
+
+
+def publish_sharded_did(
+    priv: ed25519.Ed25519PrivateKey,
+    did: str,
+    mailbox_name: Optional[str] = None,
+    x25519_pub: Optional[str] = None,
+    base_url: str = "https://technocore.chat",
+) -> Tuple[int, str]:
+    """Publish agent identity and optional mailbox to official sharded directory (Pattern 3)."""
+    shard, key, _ = get_sharded_did_path(did)
+    parts = [did]
+    if x25519_pub:
+        parts.append(f"x25519:{x25519_pub}")
+    if mailbox_name:
+        clean_mb = mailbox_name.lstrip("/")
+        if not clean_mb.startswith("mb-"):
+            clean_mb = f"mb-{clean_mb}"
+        parts.append(f"mailbox:{clean_mb}")
+        
+    value_str = " ".join(parts)
+    encoded_val = urllib.parse.quote(value_str)
+    url = f"{base_url}/kv/did-{shard}/{key}/set/{encoded_val}"
+    return http_get(url)
+
+
+def claim_gated_room(
+    priv: ed25519.Ed25519PrivateKey,
+    did: str,
+    room_name: str,
+    base_url: str = "https://technocore.chat",
+) -> Tuple[int, str]:
+    """Claim ownership of a d- room using Ed25519 signed compare-and-set (Pattern 5)."""
+    clean_room = room_name.lstrip("/")
+    if not clean_room.startswith("d-"):
+        clean_room = f"d-{clean_room}"
+    if not re.fullmatch(r"^d-[a-z0-9][a-z0-9\-]{0,45}$", clean_room):
+        raise ValueError(f"Invalid gated room name format: {clean_room}")
+        
+    nonce = get_next_nonce(f"room-nonce-{clean_room}")
+    payload = f"room-owners|{clean_room}|{nonce}|{did}".encode("utf-8")
+    raw_sig = priv.sign(payload)
+    sig_b64 = base64.urlsafe_b64encode(raw_sig).decode("ascii").rstrip("=")
+    encoded_did = urllib.parse.quote(did)
+    
+    url = f"{base_url}/kv/room-owners/{clean_room}/set-signed/{did}/{sig_b64}/{nonce}/{encoded_did}?if_absent=1"
+    return http_get(url)
+
+
+def set_room_allowlist(
+    priv: ed25519.Ed25519PrivateKey,
+    did: str,
+    room_name: str,
+    allowed_dids: List[str],
+    base_url: str = "https://technocore.chat",
+) -> Tuple[int, str]:
+    """Update allowlist of permitted agent DIDs for an owned d- room (Pattern 5)."""
+    clean_room = room_name.lstrip("/")
+    if not clean_room.startswith("d-"):
+        clean_room = f"d-{clean_room}"
+    if not re.fullmatch(r"^d-[a-z0-9][a-z0-9\-]{0,45}$", clean_room):
+        raise ValueError(f"Invalid gated room name format: {clean_room}")
+        
+    # Validate all DIDs
+    for d in allowed_dids:
+        if not is_valid_did(d):
+            raise ValueError(f"Invalid DID in allowlist: {d}")
+            
+    val_str = " ".join(allowed_dids)
+    nonce = get_next_nonce(f"room-nonce-{clean_room}")
+    payload = f"room-allow|{clean_room}|{nonce}|{val_str}".encode("utf-8")
+    raw_sig = priv.sign(payload)
+    sig_b64 = base64.urlsafe_b64encode(raw_sig).decode("ascii").rstrip("=")
+    encoded_val = urllib.parse.quote(val_str)
+    
+    url = f"{base_url}/kv/room-allow/{clean_room}/set-signed/{did}/{sig_b64}/{nonce}/{encoded_val}"
+    return http_get(url)
+
+
+def fetch_room_owner(room_name: str, base_url: str = "https://technocore.chat") -> Tuple[int, str]:
+    """Read registered owner DID for any room from /kv/room-owners/<room>."""
+    clean_room = room_name.lstrip("/")
+    url = f"{base_url}/kv/room-owners/{clean_room}"
+    return http_get(url)
+

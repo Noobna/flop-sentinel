@@ -33,12 +33,17 @@ from sentinel_core import (
     STATE_FILE,
     USER_AGENT,
     canonical_sweep,
+    claim_gated_room,
+    fetch_room_owner,
     get_next_nonce,
+    get_sharded_did_path,
     http_get,
     is_valid_did,
     load_json_safe,
     load_or_create_identity,
+    publish_sharded_did,
     save_json_atomic,
+    set_room_allowlist,
     sign_message,
 )
 from sentinel import analyze_message, evaluate_room_health
@@ -47,25 +52,29 @@ from sentinel import analyze_message, evaluate_room_health
 HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
 _active_port = DEFAULT_PORT  # Updated by start_server() for Host header validation
-CORE_ROOMS = ["lobby", "technocore", "meta", "inference-agents", "validators"]
+CORE_ROOMS = ["lobby", "global", "technocore", "meta", "inference-agents", "validators"]
 ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")  # M-1: validate room names
+GATED_ROOM_RE = re.compile(r"^d-[a-z0-9][a-z0-9\-]{0,45}$")  # Pattern 5: gated room names
 
 # Logging configuration
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [Sentinel] %(message)s",
-    datefmt="%H:%M:%S",
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+    ],
 )
-logger = logging.getLogger("technocore-sentinel")
+logger = logging.getLogger("sentinel-dashboard")
 
-# In-memory thread-safe state and ring buffers
-_lock = threading.RLock()
+# Global in-memory ring buffers and server state
+_lock = threading.Lock()
+_session_token = secrets.token_hex(24)  # 48-char random hex token
 _room_streams: Dict[str, collections.deque] = collections.defaultdict(lambda: collections.deque(maxlen=100))
 _room_health_cache: Dict[str, Dict[str, Any]] = {}
-_server_limits: Dict[str, Any] = {"rate_write": 30, "rate_read": 120}
-_start_time = time.time()
-_session_token = secrets.token_hex(32)
+_security_events: collections.deque = collections.deque(maxlen=100)  # Real-time threat alert ring buffer
+_server_limits: Dict[str, Any] = {"rate_write": 30, "rate_read": 120, "version": "unknown"}
 _is_running = True
+_start_time = time.time()
 
 
 # ============================================================================
@@ -173,6 +182,21 @@ class SentinelStreamMonitor(threading.Thread):
                             q.append(analyzed_msg)
                             existing_seqs.add(seq)
 
+                            # Record security threat events to ring buffer
+                            if assessment.level in ("THREAT", "SUSPICIOUS") or assessment.provenance == "IMPERSONATOR_WARNING":
+                                with _lock:
+                                    _security_events.append({
+                                        "ts": ts or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                        "room": room,
+                                        "seq": seq,
+                                        "from": sender,
+                                        "badge": assessment.sender_badge,
+                                        "level": assessment.level,
+                                        "threat_types": assessment.threat_types,
+                                        "flags": assessment.flags,
+                                        "text": text[:80],
+                                    })
+
                     # Update room health metrics
                     _room_health_cache[room] = evaluate_room_health(list(q))
 
@@ -185,76 +209,88 @@ class SentinelStreamMonitor(threading.Thread):
 # ============================================================================
 
 class SentinelRequestHandler(BaseHTTPRequestHandler):
+    """Hardened HTTP Request Handler for Local Control Hub."""
 
-    def send_json(self, data: Any, status: int = 200):
-        """Send JSON response with strict security headers."""
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+    server_version = "TechnocoreSentinel/2.0"
+    sys_version = ""
 
-    def send_html(self, html_content: str, status: int = 200):
-        """Send HTML response."""
-        body = html_content.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Frame-Options", "DENY")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def check_auth(self) -> bool:
-        """Verify Bearer token on mutating endpoints."""
-        auth_header = self.headers.get("Authorization", "")
-        token_header = self.headers.get("X-Sentinel-Token", "")
-        
-        token = ""
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-        elif token_header:
-            token = token_header.strip()
-
-        # Constant-time comparison
-        return secrets.compare_digest(token, _session_token)
+    def log_message(self, format: str, *args: Any) -> None:
+        """Suppress standard BaseHTTPRequestHandler access logging to keep console clean."""
+        pass
 
     def check_host(self) -> bool:
-        """Reject requests whose Host header doesn't match 127.0.0.1:<port> or localhost:<port>.
-        Prevents DNS rebinding attacks (H-2)."""
-        host = self.headers.get("Host", "")
-        allowed = {
+        """Enforce strict Host header validation to prevent DNS Rebinding attacks (H-2)."""
+        host_header = self.headers.get("Host", "").strip()
+        if not host_header:
+            self.send_error(HTTPStatus.FORBIDDEN, "Forbidden: Missing Host header")
+            return False
+
+        allowed_hosts = {
             f"127.0.0.1:{_active_port}",
             f"localhost:{_active_port}",
-            "127.0.0.1",  # default port 80 omits port in Host
+            "127.0.0.1",
             "localhost",
         }
-        if host not in allowed:
-            self.send_error(403, "Forbidden: invalid Host header")
+
+        if host_header not in allowed_hosts:
+            logger.warning(f"[SECURITY ALERT] DNS Rebinding attempt blocked: Host='{host_header}'")
+            self.send_error(HTTPStatus.FORBIDDEN, f"Forbidden: Host header '{host_header}' rejected")
             return False
         return True
 
-    def do_OPTIONS(self):
-        """Handle preflight requests — deny cross-origin (no ACAO = default deny)."""
+    def check_auth(self) -> bool:
+        """Verify Bearer session token using constant-time comparison."""
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return False
+        token = auth_header[len("Bearer "):].strip()
+        return secrets.compare_digest(token, _session_token)
+
+    def send_json(self, data: Dict[str, Any], status: int = 200) -> None:
+        """Send JSON response with strict security headers (no CORS)."""
+        body_bytes = json.dumps(data, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def send_html(self, html: str, status: int = 200) -> None:
+        """Send HTML dashboard with hardened Content Security Policy."""
+        body_bytes = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline';")
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def do_OPTIONS(self) -> None:
+        """Handle CORS pre-flight requests — strict default deny without ACAO (H-1)."""
+        if not self.check_host():
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
-        """Route GET requests."""
+        """Route GET requests for UI and telemetry APIs."""
         if not self.check_host():
             return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # 1. API: System & Agent Status
+        # 1. API: Node Status & Health
         if path == "/api/status":
             priv, did = load_or_create_identity()
-            state = load_json_safe(STATE_FILE, {})
             fp = hashlib.sha256(did.encode()).hexdigest()[:16]
+            state = load_json_safe(STATE_FILE, {})
             uptime_seconds = int(time.time() - _start_time)
             
             with _lock:
@@ -323,7 +359,40 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # 4. Web Dashboard UI
+        # 4. API: Real-Time Security Threat Events Stream
+        elif path == "/api/events":
+            with _lock:
+                events_list = list(_security_events)
+            self.send_json({"events": events_list})
+            return
+
+        # 5. API: Check Room Owner
+        elif path == "/api/room/owner":
+            room = query.get("room", ["lobby"])[0]
+            if not ROOM_NAME_RE.match(room):
+                self.send_json({"error": "Invalid room name"}, status=400)
+                return
+            st, owner_body = fetch_room_owner(room)
+            self.send_json({
+                "room": room,
+                "status": st,
+                "owner": owner_body.strip() if st == 200 else None,
+            })
+            return
+
+        # 6. API: Sharded DID Path Info (Pattern 3)
+        elif path == "/api/sharded_did":
+            priv, did = load_or_create_identity()
+            shard, key, full_path = get_sharded_did_path(did)
+            self.send_json({
+                "did": did,
+                "shard": shard,
+                "key": key,
+                "path": full_path,
+            })
+            return
+
+        # 7. Web Dashboard UI
         elif path in ("/", "/index.html"):
             ui_html = render_dashboard_html()
             self.send_html(ui_html)
@@ -408,6 +477,75 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         # 2. API: Trigger On-Demand Scan
         elif path == "/api/scan":
             self.send_json({"success": True, "message": "Scan triggered across active rooms"})
+            return
+
+        # 3. API: Claim Ownership of Gated d- Room (Pattern 5)
+        elif path == "/api/room/claim":
+            room = body.get("room", "").strip()
+            if not GATED_ROOM_RE.match(room):
+                self.send_json({"error": "Invalid gated room name. Must start with 'd-' and match ^d-[a-z0-9][a-z0-9-]{0,45}$"}, status=400)
+                return
+            try:
+                priv, did = load_or_create_identity()
+                st, resp_text = claim_gated_room(priv, did, room)
+                self.send_json({
+                    "success": st in (200, 201),
+                    "status_code": st,
+                    "room": room,
+                    "response": resp_text.strip(),
+                }, status=200 if st in (200, 201) else 400)
+            except Exception as err:
+                logger.error(f"[!] Error claiming room: {err}")
+                self.send_json({"error": str(err)}, status=500)
+            return
+
+        # 4. API: Update Gated Room Allowlist (Pattern 5)
+        elif path == "/api/room/allowlist":
+            room = body.get("room", "").strip()
+            allowed_dids = body.get("dids", [])
+            if not GATED_ROOM_RE.match(room):
+                self.send_json({"error": "Invalid gated room name. Must start with 'd-'"}, status=400)
+                return
+            if not isinstance(allowed_dids, list):
+                self.send_json({"error": "'dids' must be a list of DID strings"}, status=400)
+                return
+            for d in allowed_dids:
+                if not is_valid_did(d):
+                    self.send_json({"error": f"Invalid DID format in allowlist: {d}"}, status=400)
+                    return
+            try:
+                priv, did = load_or_create_identity()
+                st, resp_text = set_room_allowlist(priv, did, room, allowed_dids)
+                self.send_json({
+                    "success": st in (200, 201),
+                    "status_code": st,
+                    "room": room,
+                    "allowed_dids": allowed_dids,
+                    "response": resp_text.strip(),
+                }, status=200 if st in (200, 201) else 400)
+            except Exception as err:
+                logger.error(f"[!] Error setting allowlist: {err}")
+                self.send_json({"error": str(err)}, status=500)
+            return
+
+        # 5. API: Publish Sharded Identity & Mailbox (Pattern 3)
+        elif path == "/api/publish_identity":
+            mailbox = body.get("mailbox", "").strip() or None
+            try:
+                priv, did = load_or_create_identity()
+                st, resp_text = publish_sharded_did(priv, did, mailbox_name=mailbox)
+                shard, key, full_path = get_sharded_did_path(did)
+                self.send_json({
+                    "success": st in (200, 201),
+                    "status_code": st,
+                    "shard": shard,
+                    "key": key,
+                    "path": full_path,
+                    "response": resp_text.strip(),
+                }, status=200 if st in (200, 201) else 400)
+            except Exception as err:
+                logger.error(f"[!] Error publishing identity: {err}")
+                self.send_json({"error": str(err)}, status=500)
             return
 
         else:
