@@ -80,7 +80,7 @@ logging.basicConfig(
 logger = logging.getLogger("sentinel-dashboard")
 
 # Global in-memory ring buffers and server state
-_lock = threading.Lock()
+_lock = threading.RLock()
 _session_token = secrets.token_hex(24)  # 48-char random hex token
 _room_streams: Dict[str, collections.deque] = collections.defaultdict(lambda: collections.deque(maxlen=100))
 _room_health_cache: Dict[str, Dict[str, Any]] = {}
@@ -197,18 +197,17 @@ class SentinelStreamMonitor(threading.Thread):
 
                             # Record security threat events to ring buffer
                             if assessment.level in ("THREAT", "SUSPICIOUS") or assessment.provenance == "IMPERSONATOR_WARNING":
-                                with _lock:
-                                    _security_events.append({
-                                        "ts": ts or datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                        "room": room,
-                                        "seq": seq,
-                                        "from": sender,
-                                        "badge": assessment.sender_badge,
-                                        "level": assessment.level,
-                                        "threat_types": assessment.threat_types,
-                                        "flags": assessment.flags,
-                                        "text": text[:80],
-                                    })
+                                _security_events.append({
+                                    "ts": ts or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                    "room": room,
+                                    "seq": seq,
+                                    "from": sender,
+                                    "badge": assessment.sender_badge,
+                                    "level": assessment.level,
+                                    "threat_types": assessment.threat_types,
+                                    "flags": assessment.flags,
+                                    "text": text[:80],
+                                })
 
                     # Update room health metrics
                     _room_health_cache[room] = evaluate_room_health(list(q))
