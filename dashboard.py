@@ -53,7 +53,7 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
 _active_port = DEFAULT_PORT  # Updated by start_server() for Host header validation
 CORE_ROOMS = ["lobby", "global", "technocore", "meta", "inference-agents", "validators"]
-ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")  # M-1: validate room names
+ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")  # M-1: validate room names
 GATED_ROOM_RE = re.compile(r"^d-[a-z0-9][a-z0-9\-]{0,45}$")  # Pattern 5: gated room names
 
 # Logging configuration
@@ -955,6 +955,11 @@ def render_dashboard_html() -> str:
                 }},
                 body: JSON.stringify({{ room: activeRoom, text: text }})
             }});
+
+            if (res.status === 401) {{
+                alert('Session Token Mismatch: The Sentinel server was recently restarted. Please refresh this webpage (press F5) to load the new secure session token.');
+                return;
+            }}
 
             const data = await res.json();
             if (data.success) {{

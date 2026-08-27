@@ -262,6 +262,7 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
                     state["last_checkin_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     state["last_write_time"] = time.time()
                     save_state(state)
+                last_heartbeat_time = now
             time.sleep(5)
 
         # 3. Monitor & Chat across Global Rooms concurrently
