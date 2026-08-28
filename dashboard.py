@@ -557,7 +557,7 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 resp_body = "Service Unavailable"
                 for attempt in range(1, 4):
                     try:
-                        status_code, resp_body = http_get(url, timeout=25)
+                        status_code, resp_body = http_get(url, timeout=35)
                         if status_code == 200:
                             break
                         elif status_code in (502, 503, 504) and attempt < 3:
@@ -566,6 +566,16 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                         else:
                             break
                     except Exception as net_err:
+                        # Check if message actually posted despite socket read timeout
+                        try:
+                            v_st, v_body = http_get(f"https://technocore.chat/r/{room}?limit=3", timeout=10)
+                            if v_st == 200 and swept_text in v_body:
+                                status_code = 200
+                                resp_body = v_body
+                                break
+                        except Exception:
+                            pass
+
                         if attempt < 3:
                             time.sleep(1.5 * attempt)
                             continue
