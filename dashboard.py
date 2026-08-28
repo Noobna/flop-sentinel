@@ -646,7 +646,29 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 priv, did = load_or_create_identity()
-                st, resp_text = claim_gated_room(priv, did, room)
+                
+                # Attempt to claim with multiple retries and timeout recovery
+                st, resp_text = 503, "Service Unavailable"
+                for attempt in range(1, 4):
+                    try:
+                        st, resp_text = claim_gated_room(priv, did, room)
+                        break # Success or explicit HTTP error
+                    except Exception as net_err:
+                        # If a timeout occurs, check if the room was successfully claimed anyway!
+                        try:
+                            v_st, v_body = http_get(f"https://technocore.chat/kv/room-owners/{room}", timeout=10)
+                            if v_st == 200 and did in v_body:
+                                st = 200
+                                resp_text = "Room was successfully claimed despite network timeout!"
+                                break
+                        except Exception:
+                            pass
+                        
+                        if attempt < 3:
+                            time.sleep(1.5 * attempt)
+                            continue
+                        raise net_err
+
                 is_success = st in (200, 201) or (st == 409 and did in resp_text)
                 self.send_json({
                     "success": is_success,
