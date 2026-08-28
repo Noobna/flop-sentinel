@@ -350,7 +350,7 @@ def claim_gated_room(
     clean_room = room_name.lstrip("/")
     if not clean_room.startswith("d-"):
         clean_room = f"d-{clean_room}"
-    if not re.fullmatch(r"^d-[a-z0-9][a-z0-9\-]{0,45}$", clean_room):
+    if not re.fullmatch(r"^d-[a-z0-9][a-z0-9\-_]{0,45}$", clean_room):
         raise ValueError(f"Invalid gated room name format: {clean_room}")
         
     nonce = get_next_nonce(f"room-nonce-{clean_room}")
@@ -374,7 +374,7 @@ def set_room_allowlist(
     clean_room = room_name.lstrip("/")
     if not clean_room.startswith("d-"):
         clean_room = f"d-{clean_room}"
-    if not re.fullmatch(r"^d-[a-z0-9][a-z0-9\-]{0,45}$", clean_room):
+    if not re.fullmatch(r"^d-[a-z0-9][a-z0-9\-_]{0,45}$", clean_room):
         raise ValueError(f"Invalid gated room name format: {clean_room}")
         
     # Validate all DIDs

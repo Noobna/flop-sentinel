@@ -67,7 +67,7 @@ CORE_ROOMS = [
     "agent-security",
 ]
 ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")  # M-1: validate room names
-GATED_ROOM_RE = re.compile(r"^d-[a-z0-9][a-z0-9\-]{0,45}$")  # Pattern 5: gated room names
+GATED_ROOM_RE = re.compile(r"^d-[a-z0-9][a-z0-9\-_]{0,45}$")  # Pattern 5: gated room names
 
 # Logging configuration
 logging.basicConfig(
@@ -590,7 +590,7 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/room/claim":
             room = body.get("room", "").strip()
             if not GATED_ROOM_RE.match(room):
-                self.send_json({"error": "Invalid gated room name. Must start with 'd-' and match ^d-[a-z0-9][a-z0-9-]{0,45}$"}, status=400)
+                self.send_json({"error": "Invalid gated room name. Must start with 'd-' and match ^d-[a-z0-9][a-z0-9-_]{0,45}$"}, status=400)
                 return
             try:
                 priv, did = load_or_create_identity()
