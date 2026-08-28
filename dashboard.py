@@ -1193,6 +1193,7 @@ def render_dashboard_html() -> str:
             <button class="hud-btn" id="perspectiveBtn" onclick="cyclePerspective()">🌌 Galaxy Orbit</button>
             <button class="hud-btn" style="border-color: #00f5ff; color: #7df9ff;" onclick="triggerHyperDefenseOverdrive()">⚡ Hyper-Defense</button>
             <button class="hud-btn" id="audioToggle" onclick="toggleAudio()">🔊 Sound ON</button>
+            <button class="hud-btn" id="liteModeBtn" onclick="toggleLiteMode()" style="border-color: #8b5cf6; color: #c4b5fd;">🍃 Lite Mode</button>
             <button class="hud-btn" onclick="toggleDrawer('composerDrawer')">✍️ Broadcast</button>
             <button class="hud-btn" onclick="toggleDrawer('terminalDrawer')">🖥️ Console</button>
             <button class="hud-btn" onclick="toggleDrawer('toolsDrawer')">🔐 Tools</button>
@@ -1238,6 +1239,17 @@ def render_dashboard_html() -> str:
             <button class="hud-btn" style="flex:1; justify-content:center;" onclick="pingLockedNode()">💬 Ping Agent</button>
             <button class="hud-btn" style="flex:1; justify-content:center;" onclick="inspectLockedNodeSignature()">🛡️ Inspect Signature</button>
         </div>
+    </div>
+</div>
+
+<!-- LITE MODE CONTAINER -->
+<div class="simulation-container" id="liteContainer" style="display: none; background: #030806; flex-direction: column; padding: 20px; overflow-y: auto;">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #132a21; padding-bottom: 10px; margin-bottom: 10px;">
+        <div style="font-size: 14px; font-weight: 800; color: #10b981; letter-spacing: 1px;">🟢 SWARM LITE VIEW (BATTERY OPTIMIZED)</div>
+        <div style="font-size: 11px; color: #64748b;">3D Graphics & Physics Disabled</div>
+    </div>
+    <div id="liteNodesGrid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px;">
+        <!-- Filled by JS -->
     </div>
 </div>
 
@@ -1391,6 +1403,70 @@ def render_dashboard_html() -> str:
         audioEnabled = !audioEnabled;
         document.getElementById('audioToggle').innerText = audioEnabled ? '🔊 Sound ON' : '🔇 Sound OFF';
         if (audioEnabled) playBeep(880, 'sine', 0.1);
+    }}
+
+    let isLiteMode = false;
+    function toggleLiteMode() {{
+        isLiteMode = !isLiteMode;
+        const btn = document.getElementById('liteModeBtn');
+        const simC = document.getElementById('simContainer');
+        const liteC = document.getElementById('liteContainer');
+        const streamBox = document.querySelector('.timeline-section');
+        
+        if (isLiteMode) {{
+            btn.style.background = '#8b5cf6';
+            btn.style.color = '#fff';
+            simC.style.display = 'none';
+            if (streamBox) streamBox.style.display = 'none';
+            liteC.style.display = 'flex';
+            if (animFrameId) {{
+                cancelAnimationFrame(animFrameId);
+                animFrameId = null;
+            }}
+            renderLiteGrid();
+        }} else {{
+            btn.style.background = 'transparent';
+            btn.style.color = '#c4b5fd';
+            liteC.style.display = 'none';
+            simC.style.display = 'block';
+            if (streamBox) streamBox.style.display = 'flex';
+            if (!animFrameId && isTabVisible) {{
+                animFrameId = requestAnimationFrame(animate);
+            }}
+        }}
+    }}
+
+    function renderLiteGrid() {{
+        if (!isLiteMode) return;
+        const grid = document.getElementById('liteNodesGrid');
+        grid.innerHTML = '';
+        nodes.forEach(n => {{
+            const card = document.createElement('div');
+            card.style.background = '#061712';
+            card.style.border = `1px solid ${{n.threat === 'THREAT' ? '#ef4444' : '#10b981'}}`;
+            card.style.padding = '12px';
+            card.style.borderRadius = '4px';
+            card.style.display = 'flex';
+            card.style.flexDirection = 'column';
+            card.style.gap = '8px';
+            
+            const head = document.createElement('div');
+            head.style.display = 'flex';
+            head.style.justifyContent = 'space-between';
+            head.style.fontSize = '11px';
+            head.style.color = '#94a3b8';
+            head.innerHTML = `<span>${{n.id}}</span> <span style="color: ${{n.threat === 'THREAT' ? '#ef4444' : '#10b981'}}">${{n.threat}}</span>`;
+            
+            const body = document.createElement('div');
+            body.style.color = '#f8fafc';
+            body.style.fontSize = '12px';
+            body.style.whiteSpace = 'pre-wrap';
+            body.innerText = n.text || '[No message yet]';
+            
+            card.appendChild(head);
+            card.appendChild(body);
+            grid.appendChild(card);
+        }});
     }}
 
     function cyclePerspective() {{
@@ -1738,6 +1814,7 @@ def render_dashboard_html() -> str:
                 existing.text = an.latest_text;
             }}
         }});
+        if (isLiteMode) renderLiteGrid();
     }}
 
     // Speech Bubbles System
