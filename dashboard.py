@@ -623,12 +623,13 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
             try:
                 priv, did = load_or_create_identity()
                 st, resp_text = claim_gated_room(priv, did, room)
+                is_success = st in (200, 201) or (st == 409 and did in resp_text)
                 self.send_json({
-                    "success": st in (200, 201),
-                    "status_code": st,
+                    "success": is_success,
+                    "status_code": 200 if is_success else st,
                     "room": room,
-                    "response": resp_text.strip(),
-                }, status=200 if st in (200, 201) else 400)
+                    "response": "Room is already claimed & owned by your DID!" if (st == 409 and did in resp_text) else resp_text.strip(),
+                }, status=200 if is_success else 400)
             except Exception as err:
                 logger.error(f"[!] Error claiming room: {err}")
                 self.send_json({"error": str(err)}, status=500)

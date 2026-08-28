@@ -288,7 +288,14 @@ _opener = urllib.request.build_opener(_NoRedirectHandler)
 
 def http_get(url: str, timeout: int = 25) -> Tuple[int, str]:
     """Execute hardened GET request with Technocore headers. No redirect following."""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Connection": "close",
+            "Accept": "*/*",
+        },
+    )
     try:
         with _opener.open(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
