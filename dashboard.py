@@ -547,11 +547,27 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 nonce = get_next_nonce(room)
                 swept_text, sig = sign_message(priv, room, nonce, text)
 
-                # Send GET /r/<room>/say-signed/<did>/<sig>/<nonce>/<encoded_text>
+                # Send GET /r/<room>/say-signed/<did>/<sig>/<nonce>/<encoded_text> with auto-retry
                 encoded_text = urllib.parse.quote(swept_text)
                 url = f"https://technocore.chat/r/{room}/say-signed/{did}/{sig}/{nonce}/{encoded_text}"
                 
-                status_code, resp_body = http_get(url, timeout=25)
+                status_code = 503
+                resp_body = "Service Unavailable"
+                for attempt in range(1, 4):
+                    try:
+                        status_code, resp_body = http_get(url, timeout=25)
+                        if status_code == 200:
+                            break
+                        elif status_code in (502, 503, 504) and attempt < 3:
+                            time.sleep(1.5 * attempt)
+                            continue
+                        else:
+                            break
+                    except Exception as net_err:
+                        if attempt < 3:
+                            time.sleep(1.5 * attempt)
+                            continue
+                        raise net_err
                 
                 if status_code == 200:
                     # Update local state
@@ -572,7 +588,7 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                     logger.warning(f"[-] Server returned {status_code}: {resp_body}")
                     self.send_json({
                         "success": False,
-                        "error": f"Technocore server returned HTTP {status_code}: {resp_body.strip()}",
+                        "error": f"Technocore server returned HTTP {status_code}: {resp_body.strip() or 'Temporary server busy/reload'}",
                         "status_code": status_code,
                     }, status=502)
 
