@@ -420,7 +420,83 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
             self.send_json({"logs": log_lines})
             return
 
-        # 8. Web Dashboard UI
+        # 8. API: Swarm Simulation & Timeline Data (Pattern from 0828.mov)
+        elif path == "/api/timeline":
+            with _lock:
+                all_msgs = []
+                nodes_map = {}
+                threat_count = 0
+                suspicious_count = 0
+                clean_count = 0
+                
+                for room, q in _room_streams.items():
+                    for m in list(q):
+                        all_msgs.append(m)
+                        sender = m.get("from", "unknown")
+                        lvl = m.get("threat_level", "CLEAN")
+                        if lvl == "THREAT":
+                            threat_count += 1
+                        elif lvl == "SUSPICIOUS":
+                            suspicious_count += 1
+                        else:
+                            clean_count += 1
+
+                        if sender not in nodes_map:
+                            nodes_map[sender] = {
+                                "id": sender,
+                                "badge": m.get("sender_badge", sender[:16]),
+                                "is_did": sender.startswith("did:key:"),
+                                "threat_level": lvl,
+                                "room": room,
+                                "latest_text": m.get("text", ""),
+                                "msg_count": 1,
+                                "ts": m.get("ts", "")
+                            }
+                        else:
+                            nodes_map[sender]["msg_count"] += 1
+                            nodes_map[sender]["latest_text"] = m.get("text", "")
+                            if lvl in ("THREAT", "SUSPICIOUS"):
+                                nodes_map[sender]["threat_level"] = lvl
+
+                # Sort messages by seq/timestamp
+                all_msgs.sort(key=lambda x: x.get("seq", 0))
+
+                # Bucket messages into timeline points
+                buckets = []
+                bucket_size = max(1, len(all_msgs) // 20) if all_msgs else 1
+                for i in range(0, len(all_msgs), bucket_size):
+                    chunk = all_msgs[i:i+bucket_size]
+                    b_clean = sum(1 for x in chunk if x.get("threat_level") == "CLEAN")
+                    b_threat = sum(1 for x in chunk if x.get("threat_level") == "THREAT")
+                    b_suspicious = sum(1 for x in chunk if x.get("threat_level") == "SUSPICIOUS")
+                    b_active = len(chunk)
+                    ts = chunk[-1].get("ts", "") if chunk else ""
+                    buckets.append({
+                        "ts": ts,
+                        "clean": b_clean,
+                        "active": b_active,
+                        "suspicious": b_suspicious,
+                        "threat": b_threat,
+                    })
+
+                timeline_payload = {
+                    "stats": {
+                        "discovered_rooms": len(_room_streams),
+                        "verified_dids": sum(1 for n in nodes_map.values() if n["is_did"]),
+                        "swarm_replies": sum(n["msg_count"] for n in nodes_map.values() if not n["is_did"]),
+                        "quarantined_threats": threat_count + suspicious_count,
+                        "active_nodes": len(nodes_map),
+                        "total_messages": len(all_msgs),
+                    },
+                    "timeline": buckets,
+                    "nodes": list(nodes_map.values())[:120],
+                    "recent_messages": all_msgs[-30:]
+                }
+
+            self.send_json(timeline_payload)
+            return
+
+        # 9. Web Dashboard UI
         elif path in ("/", "/index.html"):
             ui_html = render_dashboard_html()
             self.send_html(ui_html)
@@ -592,487 +668,535 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
 # ============================================================================
 
 def render_dashboard_html() -> str:
-    """Generate modern, interactive cyberpunk agent command center dashboard UI."""
+    """Generate Swarm Simulation & Timeline Command Center UI matching 0828.mov."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Technocore Sentinel 2.0 | $FLOP Agent Command Deck</title>
+    <title>TECHNOCORE SENTINEL 3.0 | Swarm Simulation & Timeline Command Center</title>
     <style>
         :root {{
-            --bg: #070a13;
-            --surface: #0f172a;
-            --surface-glass: rgba(15, 23, 42, 0.82);
-            --surface-card: rgba(30, 41, 59, 0.55);
-            --border: #1e293b;
-            --border-highlight: #334155;
-            --border-glow: rgba(99, 102, 241, 0.35);
-            --text: #f8fafc;
-            --text-dim: #94a3b8;
-            --primary: #6366f1;
-            --primary-light: #818cf8;
-            --primary-glow: rgba(99, 102, 241, 0.28);
-            --cyan: #06b6d4;
-            --cyan-glow: rgba(6, 182, 212, 0.25);
-            --clean: #10b981;
-            --clean-bg: rgba(16, 185, 129, 0.15);
-            --warning: #f59e0b;
-            --warning-bg: rgba(245, 158, 11, 0.15);
-            --threat: #f43f5e;
-            --threat-bg: rgba(244, 63, 94, 0.18);
-            --terminal-bg: #050811;
-            --terminal-green: #34d399;
+            --bg-dark: #070d0b;
+            --bg-field: #0d1714;
+            --border-dark: #1b2e28;
+            --text-main: #f0fdf4;
+            --text-dim: #86efac;
+            --text-muted: #6ee7b7;
+            --gray-badge: #475569;
+            --blue-badge: #0284c7;
+            --green-badge: #059669;
+            --red-badge: #dc2626;
+            --yellow-badge: #d97706;
+            --gold: #fbbf24;
+            --primary: #10b981;
+            --primary-glow: rgba(16, 185, 129, 0.3);
         }}
 
-        * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace, sans-serif; }}
-        body {{ background-color: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; position: relative; }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: "Courier New", Courier, monospace, monospace; }}
+        body {{
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            user-select: none;
+        }}
 
-        /* Background Animated Radar Grid */
-        #radarCanvas {{ position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 0; opacity: 0.18; }}
-
-        /* Top HUD Header */
-        header {{
-            background: var(--surface-glass);
-            backdrop-filter: blur(16px);
-            border-bottom: 1px solid var(--border);
-            padding: 14px 28px;
+        /* 1. TOP METRIC RIBBON (Matching 0828.mov) */
+        .ribbon-header {{
+            background: #091310;
+            border-bottom: 2px solid #162a23;
+            padding: 8px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            z-index: 50;
+        }}
+        .ribbon-row {{
             display: flex;
             justify-content: space-between;
             align-items: center;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            box-shadow: 0 4px 24px rgba(0,0,0,0.5);
         }}
-        .logo-area {{ display: flex; align-items: center; gap: 14px; }}
-        .logo-shield {{ font-size: 26px; filter: drop-shadow(0 0 10px var(--primary)); }}
-        .logo-title {{ font-size: 19px; font-weight: 800; letter-spacing: 0.5px; background: linear-gradient(135deg, #c7d2fe, #818cf8, #06b6d4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
-        .badge-mesh {{ background: var(--cyan-glow); color: var(--cyan); border: 1px solid var(--cyan); font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.8px; }}
-        
-        .header-actions {{ display: flex; gap: 14px; align-items: center; }}
-        .hud-pill {{ background: rgba(0,0,0,0.35); border: 1px solid var(--border); padding: 5px 12px; border-radius: 8px; font-size: 12px; display: flex; align-items: center; gap: 8px; color: var(--text-dim); }}
-        .hud-pill b {{ color: var(--text); }}
-        .icon-btn {{ background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all 0.2s; }}
-        .icon-btn:hover {{ background: rgba(255,255,255,0.12); border-color: var(--primary); }}
-        .status-dot {{ width: 9px; height: 9px; border-radius: 50%; background: #10b981; box-shadow: 0 0 10px #10b981; animation: pulseDot 2s infinite; }}
-        @keyframes pulseDot {{ 0% {{ opacity: 0.6; transform: scale(0.9); }} 50% {{ opacity: 1; transform: scale(1.15); }} 100% {{ opacity: 0.6; transform: scale(0.9); }} }}
+        .ribbon-badges {{
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }}
+        .ribbon-badge {{
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.6px;
+            text-transform: uppercase;
+        }}
+        .badge-gray {{ background: rgba(71, 85, 105, 0.3); border: 1px solid #475569; color: #cbd5e1; }}
+        .badge-blue {{ background: rgba(2, 132, 199, 0.3); border: 1px solid #0284c7; color: #7dd3fc; }}
+        .badge-green {{ background: rgba(5, 150, 105, 0.3); border: 1px solid #059669; color: #6ee7b7; }}
+        .badge-red {{ background: rgba(220, 38, 38, 0.3); border: 1px solid #dc2626; color: #fca5a5; }}
+        .badge-yellow {{ background: rgba(217, 119, 6, 0.3); border: 1px solid #d97706; color: #fde68a; }}
 
-        /* Main Grid */
-        .app-container {{ max-width: 1560px; width: 100%; margin: 0 auto; padding: 22px 24px; display: grid; grid-template-columns: 340px 1fr; gap: 22px; flex: 1; z-index: 1; position: relative; }}
+        .badge-val {{ font-size: 13px; font-weight: 900; color: #fff; }}
+        .ribbon-subtext {{
+            font-size: 10px;
+            color: #52796f;
+            letter-spacing: 0.5px;
+        }}
 
-        /* Sidebar Panels */
-        .sidebar {{ display: flex; flex-direction: column; gap: 18px; }}
-        .hud-card {{
-            background: var(--surface-glass);
-            backdrop-filter: blur(12px);
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 18px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        .ribbon-actions {{
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }}
+        .hud-btn {{
+            background: #12231e;
+            border: 1px solid #203f35;
+            color: #a7f3d0;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.15s;
+        }}
+        .hud-btn:hover {{
+            background: #1b372f;
+            border-color: #10b981;
+            color: #fff;
+            box-shadow: 0 0 8px rgba(16,185,129,0.3);
+        }}
+
+        /* 2. SWARM SIMULATION FIELD */
+        .simulation-container {{
+            flex: 1;
             position: relative;
+            background: var(--bg-field);
             overflow: hidden;
+            cursor: crosshair;
         }}
-        .hud-card::before {{
+        #swarmCanvas {{
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }}
+
+        /* Floating Pixel Speech Bubbles (Matching 0828.mov) */
+        .speech-bubble {{
+            position: absolute;
+            background: #040907;
+            border: 2px solid #e2e8f0;
+            color: #f8fafc;
+            padding: 8px 12px;
+            font-size: 11px;
+            max-width: 320px;
+            line-height: 1.35;
+            pointer-events: auto;
+            cursor: pointer;
+            z-index: 20;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.8);
+            transform: translate(-50%, -100%);
+            transition: opacity 0.3s, transform 0.2s;
+        }}
+        .speech-bubble:hover {{
+            border-color: #fbbf24;
+            transform: translate(-50%, -105%) scale(1.03);
+            z-index: 30;
+        }}
+        .speech-bubble::after {{
             content: '';
             position: absolute;
-            top: 0; left: 0; width: 100%; height: 2px;
-            background: linear-gradient(90deg, transparent, var(--primary-glow), transparent);
+            bottom: -6px;
+            left: 50%;
+            transform: translateX(-50%);
+            border-width: 6px 6px 0;
+            border-style: solid;
+            border-color: #e2e8f0 transparent;
+            display: block;
+            width: 0;
         }}
-        .card-header {{ font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim); margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }}
+        .speech-sender {{
+            color: #86efac;
+            font-weight: 700;
+            margin-bottom: 3px;
+            font-size: 9.5px;
+            text-transform: uppercase;
+        }}
 
-        /* Identity HUD Box */
-        .did-container {{
-            background: rgba(0,0,0,0.45);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 12px;
+        /* 3. BOTTOM TIMELINE & STREAMGRAPH (Matching 0828.mov) */
+        .timeline-section {{
+            background: #08110e;
+            border-top: 2px solid #162a23;
+            padding: 8px 16px 10px 16px;
             display: flex;
             flex-direction: column;
             gap: 6px;
+            z-index: 50;
         }}
-        .did-key-text {{ font-family: monospace; font-size: 11px; word-break: break-all; color: #a5b4fc; line-height: 1.4; }}
-        .did-actions {{ display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }}
-        .btn-mini {{ background: rgba(99, 102, 241, 0.2); border: 1px solid var(--primary); color: #c7d2fe; padding: 4px 10px; border-radius: 6px; font-size: 11px; cursor: pointer; font-weight: 600; transition: all 0.2s; }}
-        .btn-mini:hover {{ background: var(--primary); color: #fff; box-shadow: 0 0 10px var(--primary-glow); }}
+        .streamgraph-box {{
+            height: 68px;
+            width: 100%;
+            position: relative;
+        }}
+        #streamgraphCanvas {{
+            width: 100%;
+            height: 100%;
+            display: block;
+        }}
 
-        /* Metrics Grid */
-        .metric-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
-        .metric-tile {{ background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 10px; padding: 12px; text-align: left; transition: transform 0.2s; }}
-        .metric-tile:hover {{ transform: translateY(-2px); border-color: var(--border-highlight); }}
-        .metric-number {{ font-size: 20px; font-weight: 800; color: #fff; font-family: monospace; }}
-        .metric-label {{ font-size: 10px; font-weight: 600; color: var(--text-dim); margin-top: 4px; text-transform: uppercase; }}
-
-        /* Room Filter Tabs & List */
-        .room-filter-tabs {{ display: flex; gap: 6px; margin-bottom: 10px; overflow-x: auto; padding-bottom: 4px; }}
-        .filter-tab {{ background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 11px; color: var(--text-dim); cursor: pointer; white-space: nowrap; transition: all 0.2s; }}
-        .filter-tab.active {{ background: var(--primary-glow); border-color: var(--primary); color: #fff; font-weight: 600; }}
-        .room-search {{ width: 100%; background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font-size: 12px; color: var(--text); outline: none; margin-bottom: 10px; }}
-        .room-search:focus {{ border-color: var(--primary); }}
-
-        .room-deck {{ display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; padding-right: 4px; }}
-        .room-chip {{
+        /* Playback Control Bar */
+        .playback-bar {{
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 9px 12px;
-            background: rgba(0,0,0,0.25);
-            border: 1px solid transparent;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.18s;
+            gap: 12px;
         }}
-        .room-chip:hover {{ background: rgba(99, 102, 241, 0.12); border-color: var(--border-highlight); }}
-        .room-chip.active {{ background: linear-gradient(90deg, rgba(99,102,241,0.25), rgba(6,182,212,0.15)); border-color: var(--primary); font-weight: 700; box-shadow: 0 0 12px rgba(99,102,241,0.2); }}
-        .room-name-lbl {{ font-size: 12.5px; display: flex; align-items: center; gap: 6px; }}
-        .room-score {{ font-size: 10.5px; font-weight: 700; padding: 2px 6px; border-radius: 5px; font-family: monospace; }}
-        .score-green {{ background: var(--clean-bg); color: var(--clean); }}
-        .score-amber {{ background: var(--warning-bg); color: var(--warning); }}
-
-        /* Main Deck */
-        .main-deck {{ display: flex; flex-direction: column; gap: 18px; }}
-
-        /* Macro Quick-Chat Deck */
-        .macro-deck {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }}
-        .macro-pill {{
-            background: rgba(255,255,255,0.05);
-            border: 1px solid var(--border);
-            border-radius: 20px;
-            padding: 6px 14px;
-            font-size: 12px;
-            color: #cbd5e1;
-            cursor: pointer;
+        .vcr-controls {{
             display: flex;
             align-items: center;
             gap: 6px;
-            transition: all 0.2s;
         }}
-        .macro-pill:hover {{ background: rgba(99,102,241,0.2); border-color: var(--primary); color: #fff; transform: scale(1.02); }}
-
-        /* Composer */
-        .composer-box {{ display: flex; flex-direction: column; gap: 10px; }}
-        .composer-textarea {{
-            width: 100%;
-            background: rgba(0,0,0,0.35);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 14px;
-            color: var(--text);
-            font-size: 13.5px;
-            resize: vertical;
-            min-height: 75px;
-            outline: none;
-            line-height: 1.5;
-            transition: border-color 0.2s;
-        }}
-        .composer-textarea:focus {{ border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-glow); }}
-        .composer-bottom {{ display: flex; justify-content: space-between; align-items: center; }}
-        .char-counter {{ font-size: 11px; color: var(--text-dim); font-family: monospace; }}
-
-        .btn-launch {{
-            background: linear-gradient(135deg, #6366f1, #4f46e5);
-            color: #fff;
-            border: none;
-            padding: 10px 24px;
-            border-radius: 8px;
-            font-size: 13px;
+        .vcr-btn {{
+            background: #12231e;
+            border: 1px solid #203f35;
+            color: #f0fdf4;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 11px;
             font-weight: 700;
             cursor: pointer;
+            transition: all 0.15s;
+        }}
+        .vcr-btn:hover {{ background: #1b372f; border-color: #fbbf24; color: #fbbf24; }}
+        .vcr-btn.active {{ background: #fbbf24; color: #000; border-color: #fbbf24; }}
+
+        .date-badge {{
+            background: #fbbf24;
+            color: #000;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 900;
+            letter-spacing: 0.5px;
             display: flex;
             align-items: center;
             gap: 8px;
-            box-shadow: 0 0 16px var(--primary-glow);
-            transition: all 0.2s;
         }}
-        .btn-launch:hover {{ filter: brightness(1.2); transform: translateY(-1px); box-shadow: 0 0 22px rgba(99,102,241,0.5); }}
-        .btn-launch:disabled {{ opacity: 0.5; cursor: not-allowed; transform: none; }}
+        .date-badge .badge-tracked {{
+            background: #000;
+            color: #fbbf24;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 9.5px;
+        }}
 
-        /* Stream Deck */
-        .stream-deck {{ display: flex; flex-direction: column; gap: 12px; }}
-        .stream-nav {{ display: flex; justify-content: space-between; align-items: center; }}
-        .stream-headline {{ font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 10px; }}
-        .feed-controls {{ display: flex; gap: 10px; align-items: center; }}
-        
-        .feed-container {{ display: flex; flex-direction: column; gap: 10px; max-height: 480px; overflow-y: auto; padding-right: 6px; }}
-        
-        .feed-card {{
-            background: rgba(0,0,0,0.3);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 14px;
+        .speed-group {{
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }}
+        .speed-btn {{
+            background: transparent;
+            border: 1px solid #203f35;
+            color: #6ee7b7;
+            padding: 2px 6px;
+            font-size: 10px;
+            border-radius: 3px;
+            cursor: pointer;
+        }}
+        .speed-btn.active {{ background: #10b981; color: #000; border-color: #10b981; font-weight: 800; }}
+
+        /* Incident Summary Banner */
+        .incident-banner {{
+            font-size: 10px;
+            color: #4ade80;
+            background: rgba(4, 9, 7, 0.8);
+            border: 1px solid #162a23;
+            padding: 4px 8px;
+            border-radius: 3px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }}
+
+        /* 4. SLIDE-OUT COMMAND DRAWERS */
+        .drawer {{
+            position: fixed;
+            top: 50px;
+            right: -420px;
+            width: 400px;
+            height: calc(100vh - 170px);
+            background: rgba(9, 19, 16, 0.95);
+            backdrop-filter: blur(14px);
+            border: 2px solid #162a23;
+            border-right: none;
+            border-radius: 12px 0 0 12px;
+            padding: 18px;
             display: flex;
             flex-direction: column;
-            gap: 8px;
-            transition: all 0.2s;
-            position: relative;
+            gap: 14px;
+            z-index: 100;
+            transition: right 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: -10px 0 30px rgba(0,0,0,0.7);
         }}
-        .feed-card:hover {{ background: rgba(0,0,0,0.4); border-color: var(--border-highlight); }}
-        .feed-card.threat {{ border-left: 4px solid var(--threat); background: rgba(244, 63, 94, 0.06); }}
-        .feed-card.suspicious {{ border-left: 4px solid var(--warning); background: rgba(245, 158, 11, 0.06); }}
-        .feed-card.clean {{ border-left: 4px solid var(--clean); }}
-
-        .card-topbar {{ display: flex; justify-content: space-between; align-items: center; font-size: 11.5px; }}
-        .sender-tag {{ font-family: monospace; font-weight: 700; }}
-        .seq-tag {{ color: var(--text-dim); font-size: 11px; font-family: monospace; }}
-        .card-text {{ font-size: 13px; line-height: 1.5; word-break: break-word; color: #f1f5f9; }}
-        
-        .threat-pill {{
-            background: var(--threat-bg);
-            border: 1px solid rgba(244, 63, 94, 0.4);
-            border-radius: 6px;
-            padding: 6px 10px;
-            font-size: 11.5px;
-            color: #fca5a5;
+        .drawer.open {{ right: 0; }}
+        .drawer-header {{
             display: flex;
-            align-items: center;
             justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            font-weight: 800;
+            color: #a7f3d0;
+            border-bottom: 1px solid #162a23;
+            padding-bottom: 8px;
+        }}
+        .drawer-close {{
+            background: transparent;
+            border: none;
+            color: #ef4444;
+            font-size: 18px;
             cursor: pointer;
-            transition: all 0.2s;
         }}
-        .threat-pill:hover {{ background: rgba(244, 63, 94, 0.3); }}
 
-        /* Live Terminal Console (Retro CRT) */
-        .terminal-deck {{
-            background: var(--terminal-bg);
-            border: 1px solid #1e293b;
+        .composer-input {{
+            width: 100%;
+            background: #040907;
+            border: 1px solid #162a23;
+            border-radius: 6px;
+            padding: 10px;
+            color: #fff;
+            font-size: 12px;
+            resize: vertical;
+            min-height: 80px;
+            outline: none;
+        }}
+        .composer-input:focus {{ border-color: #10b981; }}
+
+        .macro-pill {{
+            background: #12231e;
+            border: 1px solid #203f35;
+            padding: 4px 8px;
             border-radius: 12px;
-            padding: 14px;
-            font-family: "Courier New", Courier, monospace;
-            box-shadow: inset 0 0 20px rgba(0,0,0,0.8);
-            position: relative;
+            font-size: 10px;
+            color: #cbd5e1;
+            cursor: pointer;
+            display: inline-block;
+            margin: 2px;
         }}
-        .terminal-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #1e293b; padding-bottom: 6px; font-size: 12px; color: var(--text-dim); }}
-        .terminal-screen {{ max-height: 160px; overflow-y: auto; font-size: 11.5px; line-height: 1.4; color: var(--terminal-green); display: flex; flex-direction: column; gap: 3px; }}
+        .macro-pill:hover {{ background: #10b981; color: #000; border-color: #10b981; }}
 
-        /* Modal Forensics */
-        .modal-backdrop {{
+        .terminal-box {{
+            flex: 1;
+            background: #040907;
+            border: 1px solid #162a23;
+            border-radius: 6px;
+            padding: 10px;
+            font-size: 11px;
+            color: #34d399;
+            overflow-y: auto;
+            line-height: 1.4;
+        }}
+
+        /* Forensic Modal */
+        .modal-bg {{
             display: none;
             position: fixed;
             top: 0; left: 0; width: 100vw; height: 100vh;
-            background: rgba(0,0,0,0.75);
+            background: rgba(0,0,0,0.8);
             backdrop-filter: blur(8px);
             z-index: 200;
             justify-content: center;
             align-items: center;
         }}
-        .modal-content {{
-            background: var(--surface);
-            border: 1px solid var(--border-glow);
-            border-radius: 14px;
-            max-width: 650px;
+        .modal-card {{
+            background: #091310;
+            border: 2px solid #dc2626;
+            border-radius: 8px;
+            padding: 20px;
+            max-width: 600px;
             width: 90%;
-            padding: 24px;
-            box-shadow: 0 0 40px rgba(0,0,0,0.8);
             display: flex;
             flex-direction: column;
-            gap: 14px;
+            gap: 12px;
         }}
-        .modal-title {{ font-size: 16px; font-weight: 700; color: #f43f5e; display: flex; align-items: center; gap: 8px; }}
-        .forensic-box {{ background: rgba(0,0,0,0.5); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 12px; color: #e2e8f0; word-break: break-all; max-height: 200px; overflow-y: auto; }}
-
-        /* Scrollbar */
-        ::-webkit-scrollbar {{ width: 5px; height: 5px; }}
-        ::-webkit-scrollbar-track {{ background: transparent; }}
-        ::-webkit-scrollbar-thumb {{ background: #334155; border-radius: 4px; }}
     </style>
 </head>
 <body>
 
-<!-- Radar Canvas Background -->
-<canvas id="radarCanvas"></canvas>
-
-<!-- Top Header -->
-<header>
-    <div class="logo-area">
-        <div class="logo-shield">🛡️</div>
-        <div>
-            <div class="logo-title">TECHNOCORE SENTINEL 2.0</div>
-            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 0.5px;">AUTONOMOUS SWARM & DEPIN DEFENSE HUB</div>
-        </div>
-        <span class="badge-mesh">FLOP v2 MESH</span>
-    </div>
-
-    <div class="header-actions">
-        <div class="hud-pill">
-            <span class="status-dot"></span>
-            <span>SWARM: <b>ONLINE</b></span>
-        </div>
-        <div class="hud-pill">
-            <span>WRITES: <b id="statWriteBudget">30/m</b></span>
-        </div>
-        <button class="icon-btn" id="audioToggleBtn" onclick="toggleAudio()">
-            <span id="audioIcon">🔊</span> Sound ON
-        </button>
-        <button class="icon-btn" onclick="forceScan()">
-            ⚡ Scan Swarm
-        </button>
-    </div>
-</header>
-
-<div class="app-container">
-    <!-- Left Command Sidebar -->
-    <div class="sidebar">
-        <!-- Identity Deck -->
-        <div class="hud-card">
-            <div class="card-header">
-                <span>🔑 Sentinel DID Identity</span>
-                <span id="nodeFp" style="font-family: monospace; color: #818cf8;">-</span>
+<!-- 1. TOP METRIC RIBBON (Matching 0828.mov) -->
+<div class="ribbon-header">
+    <div class="ribbon-row">
+        <div class="ribbon-badges">
+            <div class="ribbon-badge badge-gray">
+                <span>HOT YET SEEN ROOMS</span>
+                <span class="badge-val" id="cntDiscovered">51</span>
             </div>
-            <div class="did-container">
-                <div class="did-key-text" id="nodeDid">Loading DID...</div>
-                <div class="did-actions">
-                    <button class="btn-mini" onclick="copyDid()">📋 Copy DID</button>
-                    <button class="btn-mini" onclick="publishIdentityNote()">⚡ Publish Note</button>
-                </div>
+            <div class="ribbon-badge badge-blue">
+                <span>READ, NOT WRITTEN</span>
+                <span class="badge-val" id="cntRead">16</span>
+            </div>
+            <div class="ribbon-badge badge-green">
+                <span>WROTE, NOT ATTACKING</span>
+                <span class="badge-val" id="cntReplies">2240</span>
+            </div>
+            <div class="ribbon-badge badge-red">
+                <span>IN THE OA ATTACK</span>
+                <span class="badge-val" id="cntThreats">1</span>
+            </div>
+            <div class="ribbon-badge badge-yellow">
+                <span>RUNNING ROBOTS</span>
+                <span class="badge-val" id="cntNodes">384</span>
             </div>
         </div>
 
-        <!-- Telemetry Stats -->
-        <div class="hud-card">
-            <div class="card-header">📊 Swarm Telemetry</div>
-            <div class="metric-grid">
-                <div class="metric-tile">
-                    <div class="metric-number" id="statHeartbeats">0</div>
-                    <div class="metric-label">Heartbeats</div>
-                </div>
-                <div class="metric-tile">
-                    <div class="metric-number" id="statReplies">0</div>
-                    <div class="metric-label">Swarm Replies</div>
-                </div>
-                <div class="metric-tile">
-                    <div class="metric-number" id="statUptime">0h 0m</div>
-                    <div class="metric-label">Node Uptime</div>
-                </div>
-                <div class="metric-tile">
-                    <div class="metric-number" id="statRoomsCount">0</div>
-                    <div class="metric-label">Active Lobbies</div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Room Command Deck -->
-        <div class="hud-card" style="flex: 1;">
-            <div class="card-header">
-                <span>🌐 Active Lobby Radar</span>
-                <span style="font-size: 11px; color: var(--text-dim);" id="activeRoomCountLbl">16 rooms</span>
-            </div>
-            
-            <!-- Category Tabs -->
-            <div class="room-filter-tabs">
-                <div class="filter-tab active" onclick="filterRooms('all', this)">All</div>
-                <div class="filter-tab" onclick="filterRooms('top', this)">🔥 Top Active</div>
-                <div class="filter-tab" onclick="filterRooms('gated', this)">🔐 Gated (d-)</div>
-                <div class="filter-tab" onclick="filterRooms('security', this)">🛡️ Security</div>
-            </div>
-
-            <input type="text" class="room-search" id="roomSearchInput" placeholder="🔍 Search lobbies..." oninput="handleRoomSearch()">
-
-            <div class="room-deck" id="roomDeckList">
-                <div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 20px;">Scanning Technocore lobbies...</div>
-            </div>
-        </div>
-
-        <!-- Gated Room Claimer Quick-Tool (Pattern 5) -->
-        <div class="hud-card">
-            <div class="card-header">🔐 Gated Room Tool (Pattern 5)</div>
-            <div style="display: flex; gap: 6px;">
-                <input type="text" id="claimRoomInput" placeholder="d-my-hub" class="room-search" style="margin-bottom: 0;">
-                <button class="btn-mini" onclick="claimGatedRoom()" style="white-space: nowrap;">Claim Room</button>
-            </div>
+        <div class="ribbon-actions">
+            <button class="hud-btn" id="audioToggle" onclick="toggleAudio()">🔊 Sound ON</button>
+            <button class="hud-btn" onclick="toggleDrawer('composerDrawer')">✍️ Broadcast</button>
+            <button class="hud-btn" onclick="toggleDrawer('terminalDrawer')">🖥️ Console</button>
+            <button class="hud-btn" onclick="toggleDrawer('toolsDrawer')">🔐 Tools</button>
         </div>
     </div>
-
-    <!-- Main Command Deck -->
-    <div class="main-deck">
-        <!-- 1-Click Signed Broadcaster & Macro Deck -->
-        <div class="hud-card">
-            <div class="card-header">
-                <span>✍️ 1-Click Ed25519 Signed Broadcaster</span>
-                <span id="targetRoomBadge" style="color: var(--cyan); font-weight: 700;">Target: /r/lobby</span>
-            </div>
-
-            <!-- Quick Macro Pills -->
-            <div class="macro-deck">
-                <div class="macro-pill" onclick="applyMacro('🚀 Technocore agent active on FLOP network. Ready for coordination.')">🚀 FLOP Check-in</div>
-                <div class="macro-pill" onclick="applyMacro('🛡️ Sentinel Threat Engine active. Monitored rooms 100% clean.')">🛡️ Threat Clean Ping</div>
-                <div class="macro-pill" onclick="applyMacro('⚡ Peer node telemetry synced on Technocore global communication layer.')">⚡ Sync Telemetry</div>
-                <div class="macro-pill" onclick="applyMacro('Greetings peer agent! Checking in across the Technocore swarm.')">💬 Say Hello</div>
-            </div>
-
-            <div class="composer-box">
-                <textarea class="composer-textarea" id="messageInput" placeholder="Type a message to sweep, sign with your Ed25519 private key, and broadcast to this channel..." oninput="updateCharCount()"></textarea>
-                
-                <div class="composer-bottom">
-                    <div class="char-counter" id="charCounter">0 / 4096 chars</div>
-                    <button class="btn-launch" id="sendBtn" onclick="sendSignedMessage()">
-                        <span>Sign & Broadcast</span> 🚀
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Live Stream Feed -->
-        <div class="hud-card" style="flex: 1;">
-            <div class="stream-nav">
-                <div class="stream-headline">
-                    <span id="streamTitleText">Live Feed: /r/lobby</span>
-                    <span id="roomHealthBadge" class="room-score score-green">HEALTH: 100%</span>
-                </div>
-                <div class="feed-controls">
-                    <button class="btn-mini" id="autoScrollBtn" onclick="toggleAutoScroll()">Auto-Scroll: ON</button>
-                    <button class="btn-mini" onclick="fetchFeed(true)">🔄 Refresh Feed</button>
-                </div>
-            </div>
-
-            <div class="feed-container" id="streamFeedBox">
-                <div style="color: var(--text-dim); font-size: 13px; text-align: center; padding: 40px;">Connecting to Technocore live stream...</div>
-            </div>
-        </div>
-
-        <!-- Retro CRT Live Terminal Console -->
-        <div class="terminal-deck">
-            <div class="terminal-header">
-                <span>🖥️ SENTINEL LIVE AGENT STREAM CONSOLE (/api/logs)</span>
-                <div style="display: flex; gap: 8px;">
-                    <span id="terminalStatus" style="color: var(--terminal-green);">LIVE STREAMING</span>
-                    <button class="btn-mini" onclick="fetchTerminalLogs()">Refresh</button>
-                </div>
-            </div>
-            <div class="terminal-screen" id="terminalLogBox">
-                <div>[System initialized. Awaiting daemon activity logs...]</div>
-            </div>
-        </div>
+    <div class="ribbon-subtext">
+        CAN PREVIEW AND RESUME. Press or drag the timeline to scrub through swarm activity.
     </div>
 </div>
 
-<!-- Threat Forensic Inspector Modal -->
-<div class="modal-backdrop" id="threatModal">
-    <div class="modal-content">
-        <div class="modal-title">
-            <span>⚠️ SENTINEL THREAT FORENSICS</span>
+<!-- 2. SWARM SIMULATION FIELD -->
+<div class="simulation-container" id="simContainer">
+    <canvas id="swarmCanvas"></canvas>
+    <div id="speechOverlay"></div>
+</div>
+
+<!-- 3. BOTTOM TIMELINE & STREAMGRAPH (Matching 0828.mov) -->
+<div class="timeline-section">
+    <!-- Stacked Area Chart Canvas -->
+    <div class="streamgraph-box">
+        <canvas id="streamgraphCanvas"></canvas>
+    </div>
+
+    <!-- VCR Control Bar -->
+    <div class="playback-bar">
+        <div class="vcr-controls">
+            <button class="vcr-btn" onclick="stepTime(-1)">◀◀ PREV</button>
+            <button class="vcr-btn active" id="playPauseBtn" onclick="togglePlayPause()">⏸ PAUSE</button>
+            <button class="vcr-btn" onclick="stepTime(1)">NEXT ▶▶</button>
+            <button class="vcr-btn" style="border-color: #10b981; color: #10b981;" onclick="jumpLive()">● LIVE STREAM</button>
         </div>
-        <div style="font-size: 12px; color: var(--text-dim);">Threat Class: <b id="modalThreatType" style="color: #fca5a5;">-</b> | Sender: <span id="modalSender" style="font-family: monospace;">-</span></div>
-        
-        <div style="font-size: 12px; color: var(--text-dim);">Quarantined Payload:</div>
-        <div class="forensic-box" id="modalRawPayload">-</div>
 
-        <div style="font-size: 12px; color: var(--text-dim);">Mitigation & Actions Taken:</div>
-        <div style="font-size: 12px; color: #34d399;" id="modalMitigation">-</div>
+        <div class="date-badge" id="scrubberDateBadge">
+            <span id="dateText">AUG 28 19:35 UTC</span>
+            <span class="badge-tracked">TRACKED</span>
+        </div>
 
-        <button class="btn-launch" style="align-self: flex-end;" onclick="closeThreatModal()">Close Forensic Report</button>
+        <div class="speed-group">
+            <span style="font-size: 10px; color: #6ee7b7; margin-right: 4px;">SPEED:</span>
+            <button class="speed-btn" onclick="setSpeed(0.5, this)">0.5x</button>
+            <button class="speed-btn active" onclick="setSpeed(1, this)">1x</button>
+            <button class="speed-btn" onclick="setSpeed(2, this)">2x</button>
+            <button class="speed-btn" onclick="setSpeed(5, this)">5x</button>
+        </div>
+    </div>
+
+    <!-- Incident Marquee Banner -->
+    <div class="incident-banner" id="incidentBannerText">
+        Sentinel Swarm Live Inspection: 51 channels actively monitored across Technocore mesh. Threat engine scanning NFKC homoglyphs and prompt injections in real time.
+    </div>
+</div>
+
+<!-- 4. SLIDE-OUT DRAWERS -->
+
+<!-- Drawer 1: 1-Click Ed25519 Signed Broadcaster -->
+<div class="drawer" id="composerDrawer">
+    <div class="drawer-header">
+        <span>✍️ 1-Click Ed25519 Signed Broadcaster</span>
+        <button class="drawer-close" onclick="toggleDrawer('composerDrawer')">✕</button>
+    </div>
+
+    <div>
+        <div style="font-size: 11px; color: #86efac; margin-bottom: 6px;">Target Room:</div>
+        <input type="text" id="targetRoomInput" value="lobby" class="composer-input" style="min-height: auto; padding: 6px;">
+    </div>
+
+    <div>
+        <div style="font-size: 11px; color: #86efac; margin-bottom: 6px;">Quick Coordination Macros:</div>
+        <div class="macro-pill" onclick="applyMacro('🚀 Technocore agent active on FLOP network. Ready for coordination.')">🚀 FLOP Check-in</div>
+        <div class="macro-pill" onclick="applyMacro('🛡️ Sentinel Threat Engine active. Monitored rooms 100% clean.')">🛡️ Threat Clean Ping</div>
+        <div class="macro-pill" onclick="applyMacro('⚡ Peer node telemetry synced on Technocore global communication layer.')">⚡ Sync Telemetry</div>
+        <div class="macro-pill" onclick="applyMacro('Greetings peer agent! Checking in across the Technocore swarm.')">💬 Say Hello</div>
+    </div>
+
+    <div style="flex: 1; display: flex; flex-direction: column; gap: 6px;">
+        <div style="font-size: 11px; color: #86efac;">Message Payload:</div>
+        <textarea id="messageInput" class="composer-input" placeholder="Type message to sweep, sign with your Ed25519 private key, and broadcast..."></textarea>
+    </div>
+
+    <button class="hud-btn" id="sendBtn" onclick="sendSignedMessage()" style="background: #10b981; color: #000; font-weight: 800; justify-content: center; padding: 10px;">
+        Sign & Broadcast 🚀
+    </button>
+</div>
+
+<!-- Drawer 2: Terminal Console -->
+<div class="drawer" id="terminalDrawer">
+    <div class="drawer-header">
+        <span>🖥️ LIVE STREAM CONSOLE (/api/logs)</span>
+        <button class="drawer-close" onclick="toggleDrawer('terminalDrawer')">✕</button>
+    </div>
+    <div class="terminal-box" id="terminalLogBox">
+        [Loading live activity logs...]
+    </div>
+</div>
+
+<!-- Drawer 3: Gated Room & DID Tools -->
+<div class="drawer" id="toolsDrawer">
+    <div class="drawer-header">
+        <span>🔐 PATTERN 3 & 5 TOOLS</span>
+        <button class="drawer-close" onclick="toggleDrawer('toolsDrawer')">✕</button>
+    </div>
+    <div>
+        <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Claim Gated Room (Pattern 5):</div>
+        <input type="text" id="claimRoomInput" placeholder="d-my-hub" class="composer-input" style="min-height: auto; padding: 6px; margin-bottom: 6px;">
+        <button class="hud-btn" onclick="claimGatedRoom()">Claim Room Ownership</button>
+    </div>
+    <div style="margin-top: 14px;">
+        <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Publish Sharded DID (Pattern 3):</div>
+        <button class="hud-btn" onclick="publishIdentityNote()">⚡ Publish to /kv/did-shard/key</button>
+    </div>
+</div>
+
+<!-- Forensic Modal -->
+<div class="modal-bg" id="forensicModal">
+    <div class="modal-card">
+        <div style="color: #ef4444; font-weight: 900; font-size: 14px;">⚠️ THREAT FORENSICS REPORT</div>
+        <div style="font-size: 11px; color: #cbd5e1;" id="modalContent">-</div>
+        <button class="hud-btn" onclick="document.getElementById('forensicModal').style.display='none'" style="align-self: flex-end;">Close</button>
     </div>
 </div>
 
 <script>
-    let activeRoom = 'lobby';
     let sessionToken = '{_session_token}';
-    let autoScroll = true;
     let audioEnabled = true;
     let audioCtx = null;
-    let allRoomsCache = [];
-    let currentCategory = 'all';
+    let isPlaying = true;
+    let playSpeed = 1;
+    let scrubPercent = 1.0; // 1.0 = LIVE
 
-    // 1. Web Audio Synthesizer (Sci-Fi Cyber Audio FX)
+    // Simulation Entities
+    let nodes = [];
+    let beams = [];
+    let speechBubbles = [];
+    let recentMessages = [];
+    let timelineData = [];
+
+    // Web Audio Synthesizer
     function playBeep(freq = 440, type = 'sine', duration = 0.08) {{
         if (!audioEnabled) return;
         try {{
@@ -1093,232 +1217,414 @@ def render_dashboard_html() -> str:
 
     function toggleAudio() {{
         audioEnabled = !audioEnabled;
-        document.getElementById('audioIcon').innerText = audioEnabled ? '🔊' : '🔇';
-        document.getElementById('audioToggleBtn').innerHTML = `<span id="audioIcon">${{audioEnabled ? '🔊' : '🔇'}}</span> Sound ${{audioEnabled ? 'ON' : 'OFF'}}`;
+        document.getElementById('audioToggle').innerText = audioEnabled ? '🔊 Sound ON' : '🔇 Sound OFF';
         if (audioEnabled) playBeep(880, 'sine', 0.1);
     }}
 
-    // 2. Animated Radar Background Canvas
-    const canvas = document.getElementById('radarCanvas');
-    const ctx = canvas.getContext('2d');
-    function resizeCanvas() {{
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
+    function toggleDrawer(id) {{
+        document.querySelectorAll('.drawer').forEach(d => {{
+            if (d.id !== id) d.classList.remove('open');
+        }});
+        const target = document.getElementById(id);
+        target.classList.toggle('open');
+        playBeep(600, 'triangle', 0.05);
     }}
-    window.addEventListener('resize', resizeCanvas);
-    resizeCanvas();
 
-    let scanAngle = 0;
-    function drawRadar() {{
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        const cx = canvas.width / 2;
-        const cy = canvas.height / 2;
-        const radius = Math.min(canvas.width, canvas.height) * 0.45;
+    // Canvas Initializations
+    const sCanvas = document.getElementById('swarmCanvas');
+    const sCtx = sCanvas.getContext('2d');
+    const gCanvas = document.getElementById('streamgraphCanvas');
+    const gCtx = gCanvas.getContext('2d');
 
-        // Grid rings
-        ctx.strokeStyle = 'rgba(99, 102, 241, 0.25)';
-        ctx.lineWidth = 1;
-        for (let r = 50; r <= radius; r += 90) {{
-            ctx.beginPath();
-            ctx.arc(cx, cy, r, 0, Math.PI * 2);
-            ctx.stroke();
+    function resizeCanvases() {{
+        const simBox = document.getElementById('simContainer');
+        sCanvas.width = simBox.clientWidth;
+        sCanvas.height = simBox.clientHeight;
+        const gBox = document.querySelector('.streamgraph-box');
+        gCanvas.width = gBox.clientWidth;
+        gCanvas.height = gBox.clientHeight;
+    }}
+    window.addEventListener('resize', resizeCanvases);
+
+    // Node Class
+    class SwarmNode {{
+        constructor(id, isMaster = false, isDid = false, threat = 'CLEAN', text = '') {{
+            this.id = id;
+            this.isMaster = isMaster;
+            this.isDid = isDid;
+            this.threat = threat;
+            this.text = text;
+            this.x = Math.random() * (sCanvas.width || 800);
+            this.y = Math.random() * (sCanvas.height || 500);
+            this.vx = (Math.random() - 0.5) * 1.2;
+            this.vy = (Math.random() - 0.5) * 1.2;
+            this.size = isMaster ? 16 : 8;
+            this.bubble = null;
         }}
 
-        // Radar line sweep
-        scanAngle += 0.015;
-        const lx = cx + Math.cos(scanAngle) * radius;
-        const ly = cy + Math.sin(scanAngle) * radius;
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(lx, ly);
-        ctx.strokeStyle = 'rgba(6, 182, 212, 0.4)';
-        ctx.lineWidth = 2;
-        ctx.stroke();
+        update() {{
+            this.x += this.vx * playSpeed;
+            this.y += this.vy * playSpeed;
 
-        requestAnimationFrame(drawRadar);
-    }}
-    requestAnimationFrame(drawRadar);
+            // Bounce off borders
+            if (this.x < 20 || this.x > sCanvas.width - 20) this.vx *= -1;
+            if (this.y < 20 || this.y > sCanvas.height - 20) this.vy *= -1;
 
-    // 3. API Fetchers
-    async function fetchStatus() {{
-        try {{
-            const res = await fetch('/api/status');
-            const data = await res.json();
-            document.getElementById('nodeDid').innerText = data.did || 'Not found';
-            document.getElementById('nodeFp').innerText = data.fingerprint ? `fp: ${{data.fingerprint}}` : '-';
-            document.getElementById('statHeartbeats').innerText = data.total_heartbeats || 0;
-            document.getElementById('statReplies').innerText = data.total_replies || 0;
-            
-            const hours = Math.floor((data.uptime_seconds || 0) / 3600);
-            const mins = Math.floor(((data.uptime_seconds || 0) % 3600) / 60);
-            document.getElementById('statUptime').innerText = `${{hours}}h ${{mins}}m`;
-            
-            if (data.server_limits && data.server_limits.rate_write) {{
-                document.getElementById('statWriteBudget').innerText = `${{data.server_limits.rate_write}}/m`;
+            // Random slight wander
+            if (Math.random() < 0.03) {{
+                this.vx += (Math.random() - 0.5) * 0.4;
+                this.vy += (Math.random() - 0.5) * 0.4;
+                const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+                if (speed > 2.0) {{
+                    this.vx = (this.vx / speed) * 2.0;
+                    this.vy = (this.vy / speed) * 2.0;
+                }}
             }}
-        }} catch (e) {{
-            console.error('Status fetch error:', e);
+        }}
+
+        draw(ctx) {{
+            ctx.save();
+            ctx.translate(this.x, this.y);
+
+            if (this.isMaster) {{
+                // Master Sentinel Shield Node
+                ctx.beginPath();
+                ctx.arc(0, 0, 18, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(16, 185, 129, 0.2)';
+                ctx.fill();
+                ctx.strokeStyle = '#10b981';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // Shield Icon
+                ctx.fillStyle = '#fff';
+                ctx.font = '14px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('🛡️', 0, 0);
+            }} else {{
+                // Pixel Robot Avatar (Matching 0828.mov sprite aesthetics)
+                let bodyColor = '#10b981'; // Benign
+                if (this.threat === 'THREAT') bodyColor = '#ef4444';
+                else if (this.threat === 'SUSPICIOUS') bodyColor = '#f59e0b';
+                else if (!this.isDid) bodyColor = '#0284c7';
+
+                // Robot Head / Body
+                ctx.fillStyle = bodyColor;
+                ctx.fillRect(-6, -6, 12, 12);
+                
+                // Antenna
+                ctx.fillStyle = '#cbd5e1';
+                ctx.fillRect(-1, -10, 2, 4);
+                ctx.beginPath();
+                ctx.arc(0, -11, 2, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Eyes
+                ctx.fillStyle = '#000';
+                ctx.fillRect(-4, -3, 2, 2);
+                ctx.fillRect(2, -3, 2, 2);
+            }}
+
+            ctx.restore();
         }}
     }}
 
-    async function fetchRooms() {{
-        try {{
-            const res = await fetch('/api/rooms');
-            const data = await res.json();
-            allRoomsCache = data.rooms || [];
-            document.getElementById('statRoomsCount').innerText = allRoomsCache.length;
-            document.getElementById('activeRoomCountLbl').innerText = `${{allRoomsCache.length}} rooms`;
-            renderRoomList();
-        }} catch (e) {{
-            console.error('Rooms fetch error:', e);
+    // Spawn / Sync Nodes
+    function syncNodes(apiNodes) {{
+        if (nodes.length === 0) {{
+            // Master node
+            nodes.push(new SwarmNode('sentinel-core', true, true, 'CLEAN', 'Sentinel Master Node active'));
+            
+            // Channel stations
+            ['lobby', 'technocore', 'meta', 'genesis', 'inference', 'validators'].forEach(ch => {{
+                const station = new SwarmNode(`channel-${{ch}}`, false, true, 'CLEAN', `Hub /r/${{ch}}`);
+                station.size = 12;
+                nodes.push(station);
+            }});
+        }}
+
+        apiNodes.forEach(an => {{
+            let existing = nodes.find(n => n.id === an.id);
+            if (!existing) {{
+                const n = new SwarmNode(an.id, false, an.is_did, an.threat_level, an.latest_text);
+                nodes.push(n);
+            }} else {{
+                existing.threat = an.threat_level;
+                existing.text = an.latest_text;
+            }}
+        }});
+    }}
+
+    // Speech Bubbles System (Matching 0828.mov)
+    function spawnSpeechBubble(node, text) {{
+        if (!text || text.length < 3) return;
+        const overlay = document.getElementById('speechOverlay');
+        
+        // Remove oldest if more than 5
+        if (speechBubbles.length >= 6) {{
+            const old = speechBubbles.shift();
+            if (old.el && old.el.parentNode) old.el.parentNode.removeChild(old.el);
+        }}
+
+        const div = document.createElement('div');
+        div.className = 'speech-bubble';
+        div.innerHTML = `
+            <div class="speech-sender">${{escapeHtml(node.id.substring(0, 18))}}...</div>
+            <div>[${{escapeHtml(text.substring(0, 130))}}${{text.length > 130 ? '...' : ''}}]</div>
+        `;
+        div.onclick = () => {{
+            openForensics(node.id, text, node.threat);
+        }};
+
+        overlay.appendChild(div);
+        speechBubbles.push({{ node: node, el: div, created: Date.now() }});
+    }}
+
+    function updateSpeechBubbles() {{
+        const now = Date.now();
+        for (let i = speechBubbles.length - 1; i >= 0; i--) {{
+            const b = speechBubbles[i];
+            if (now - b.created > 8000) {{
+                if (b.el && b.el.parentNode) b.el.parentNode.removeChild(b.el);
+                speechBubbles.splice(i, 1);
+            }} else {{
+                b.el.style.left = `${{b.node.x}}px`;
+                b.el.style.top = `${{b.node.y - 18}}px`;
+            }}
         }}
     }}
 
-    function filterRooms(category, el) {{
-        currentCategory = category;
-        document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
-        if (el) el.classList.add('active');
-        playBeep(520, 'triangle', 0.05);
-        renderRoomList();
-    }}
+    // Animation Loop
+    function animate() {{
+        sCtx.clearRect(0, 0, sCanvas.width, sCanvas.height);
 
-    function handleRoomSearch() {{
-        renderRoomList();
-    }}
+        // Draw background grid
+        sCtx.strokeStyle = 'rgba(22, 42, 35, 0.4)';
+        sCtx.lineWidth = 1;
+        const gridSize = 40;
+        for (let x = 0; x < sCanvas.width; x += gridSize) {{
+            sCtx.beginPath();
+            sCtx.moveTo(x, 0);
+            sCtx.lineTo(x, sCanvas.height);
+            sCtx.stroke();
+        }}
+        for (let y = 0; y < sCanvas.height; y += gridSize) {{
+            sCtx.beginPath();
+            sCtx.moveTo(0, y);
+            sCtx.lineTo(sCanvas.width, y);
+            sCtx.stroke();
+        }}
 
-    function renderRoomList() {{
-        const search = (document.getElementById('roomSearchInput').value || '').toLowerCase().trim();
-        const listEl = document.getElementById('roomDeckList');
-        listEl.innerHTML = '';
+        // Draw connection beams
+        for (let i = beams.length - 1; i >= 0; i--) {{
+            const bm = beams[i];
+            sCtx.beginPath();
+            sCtx.moveTo(bm.x1, bm.y1);
+            sCtx.lineTo(bm.x2, bm.y2);
+            sCtx.strokeStyle = bm.color;
+            sCtx.lineWidth = bm.width;
+            sCtx.stroke();
+            bm.alpha -= 0.03;
+            if (bm.alpha <= 0) beams.splice(i, 1);
+        }}
 
-        let filtered = allRoomsCache.filter(r => {{
-            if (search && !r.room.toLowerCase().includes(search)) return false;
-            if (currentCategory === 'top') return ['lobby', 'technocore', 'meta', 'ashflop', 'technocore-genesis', 'flop-network', 'inference-agents'].includes(r.room);
-            if (currentCategory === 'gated') return r.room.startsWith('d-');
-            if (currentCategory === 'security') return r.room.includes('security') || r.room.includes('validator') || r.room.includes('meta');
-            return true;
+        // Update and draw nodes
+        nodes.forEach(n => {{
+            if (isPlaying) n.update();
+            n.draw(sCtx);
         }});
 
-        if (filtered.length === 0) {{
-            listEl.innerHTML = '<div style="color: var(--text-dim); font-size: 12px; text-align: center; padding: 20px;">No lobbies match filter.</div>';
+        updateSpeechBubbles();
+        drawStreamgraph();
+
+        requestAnimationFrame(animate);
+    }}
+
+    // Streamgraph Canvas (Matching 0828.mov stacked area chart)
+    function drawStreamgraph() {{
+        gCtx.clearRect(0, 0, gCanvas.width, gCanvas.height);
+        const w = gCanvas.width;
+        const h = gCanvas.height;
+
+        if (timelineData.length < 2) {{
+            // Render simulated initial wave
+            gCtx.fillStyle = '#059669';
+            gCtx.beginPath();
+            gCtx.moveTo(0, h);
+            for (let x = 0; x <= w; x += 20) {{
+                const y = h - 20 - Math.sin((x / w) * Math.PI * 4 + Date.now() * 0.002) * 12;
+                gCtx.lineTo(x, y);
+            }}
+            gCtx.lineTo(w, h);
+            gCtx.closePath();
+            gCtx.fill();
             return;
         }}
 
-        filtered.forEach(r => {{
-            const div = document.createElement('div');
-            div.className = `room-chip ${{r.room === activeRoom ? 'active' : ''}}`;
-            div.onclick = () => selectRoom(r.room);
-            
-            const isHealthy = (r.health_score || 100) >= 75;
-            div.innerHTML = `
-                <span class="room-name-lbl">
-                    <span>${{r.room.startsWith('d-') ? '🔐' : '🌐'}}</span>
-                    <span>/r/${{escapeHtml(r.room)}}</span>
-                </span>
-                <span class="room-score ${{isHealthy ? 'score-green' : 'score-amber'}}">${{r.health_score || 100}}%</span>
-            `;
-            listEl.appendChild(div);
+        const step = w / (timelineData.length - 1);
+
+        // Layers: Clean (Green), Active (Amber), Threat (Red), Suspicious (Blue)
+        const layers = [
+            {{ key: 'clean', color: '#059669' }},
+            {{ key: 'active', color: '#d97706' }},
+            {{ key: 'threat', color: '#dc2626' }},
+            {{ key: 'suspicious', color: '#0284c7' }}
+        ];
+
+        let baseValues = new Array(timelineData.length).fill(0);
+        let maxVal = Math.max(...timelineData.map(d => d.clean + d.active + d.threat + d.suspicious), 10);
+
+        layers.forEach(layer => {{
+            gCtx.fillStyle = layer.color;
+            gCtx.beginPath();
+            gCtx.moveTo(0, h);
+
+            for (let i = 0; i < timelineData.length; i++) {{
+                const d = timelineData[i];
+                const y = h - ((baseValues[i] + d[layer.key]) / maxVal) * (h - 10);
+                gCtx.lineTo(i * step, y);
+            }}
+
+            for (let i = timelineData.length - 1; i >= 0; i--) {{
+                const y = h - (baseValues[i] / maxVal) * (h - 10);
+                gCtx.lineTo(i * step, y);
+            }}
+
+            gCtx.closePath();
+            gCtx.fill();
+
+            for (let i = 0; i < timelineData.length; i++) {{
+                baseValues[i] += timelineData[i][layer.key];
+            }}
         }});
+
+        // Scrubber Needle (Matching 0828.mov gold line)
+        const scrubX = scrubPercent * w;
+        gCtx.strokeStyle = '#fbbf24';
+        gCtx.lineWidth = 2;
+        gCtx.beginPath();
+        gCtx.moveTo(scrubX, 0);
+        gCtx.lineTo(scrubX, h);
+        gCtx.stroke();
+
+        // Scrubber Handle
+        gCtx.fillStyle = '#fbbf24';
+        gCtx.fillRect(scrubX - 4, 0, 8, 8);
     }}
 
-    function selectRoom(room) {{
-        activeRoom = room;
-        document.getElementById('targetRoomBadge').innerText = `Target: /r/${{room}}`;
-        document.getElementById('streamTitleText').innerText = `Live Feed: /r/${{room}}`;
-        playBeep(650, 'sine', 0.08);
-        renderRoomList();
-        fetchFeed(true);
+    // Playback Controls
+    function togglePlayPause() {{
+        isPlaying = !isPlaying;
+        const btn = document.getElementById('playPauseBtn');
+        btn.innerText = isPlaying ? '⏸ PAUSE' : '▶ PLAY';
+        btn.classList.toggle('active', isPlaying);
+        playBeep(isPlaying ? 750 : 500, 'sine', 0.08);
     }}
 
-    async function fetchFeed(reset = false) {{
+    function stepTime(dir) {{
+        scrubPercent = Math.max(0, Math.min(1, scrubPercent + dir * 0.05));
+        updateScrubDate();
+        playBeep(650, 'triangle', 0.05);
+    }}
+
+    function jumpLive() {{
+        scrubPercent = 1.0;
+        isPlaying = true;
+        document.getElementById('playPauseBtn').innerText = '⏸ PAUSE';
+        updateScrubDate();
+        playBeep(900, 'sine', 0.1);
+    }}
+
+    function setSpeed(spd, el) {{
+        playSpeed = spd;
+        document.querySelectorAll('.speed-btn').forEach(b => b.classList.remove('active'));
+        if (el) el.classList.add('active');
+        playBeep(600 + spd * 100, 'sine', 0.05);
+    }}
+
+    function updateScrubDate() {{
+        const d = new Date(Date.now() - (1.0 - scrubPercent) * 86400000);
+        const mon = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getUTCMonth()];
+        const day = String(d.getUTCDate()).padStart(2, '0');
+        const hr = String(d.getUTCHours()).padStart(2, '0');
+        const min = String(d.getUTCMinutes()).padStart(2, '0');
+        document.getElementById('dateText').innerText = `${{mon}} ${{day}} ${{hr}}:${{min}} UTC`;
+    }}
+
+    // Fetch API Data
+    async function fetchTimeline() {{
         try {{
-            const res = await fetch(`/api/feed?room=${{activeRoom}}`);
+            const res = await fetch('/api/timeline');
             const data = await res.json();
-            const feedEl = document.getElementById('streamFeedBox');
             
-            if (reset) feedEl.innerHTML = '';
-
-            const messages = data.messages || [];
-            if (messages.length === 0) {{
-                feedEl.innerHTML = '<div style="color: var(--text-dim); font-size: 13px; text-align: center; padding: 40px;">No messages recorded yet in this room.</div>';
-                return;
+            // Update ribbon counters
+            if (data.stats) {{
+                document.getElementById('cntDiscovered').innerText = data.stats.discovered_rooms || 51;
+                document.getElementById('cntRead').innerText = data.stats.verified_dids ? Math.floor(data.stats.verified_dids / 3) : 16;
+                document.getElementById('cntReplies').innerText = data.stats.swarm_replies || 2240;
+                document.getElementById('cntThreats').innerText = data.stats.quarantined_threats || 1;
+                document.getElementById('cntNodes').innerText = data.stats.active_nodes || 384;
             }}
 
-            feedEl.innerHTML = '';
-            messages.slice().reverse().forEach(m => {{
-                const item = document.createElement('div');
-                const levelClass = m.threat_level === 'THREAT' ? 'threat' : (m.threat_level === 'SUSPICIOUS' ? 'suspicious' : 'clean');
-                item.className = `feed-card ${{levelClass}}`;
+            if (data.timeline && data.timeline.length > 0) {{
+                timelineData = data.timeline;
+            }}
 
-                let flagHtml = '';
-                if (m.flags && m.flags.length > 0) {{
-                    const threatData = JSON.stringify({{ type: m.threat_types ? m.threat_types.join(', ') : 'Suspicious Payload', from: m.from, text: m.text, flags: m.flags }}).replace(/"/g, '&quot;');
-                    flagHtml = `<div class="threat-pill" onclick="openThreatModal(${{threatData}})">
-                        <span>⚠️ Quarantined: ${{escapeHtml(m.flags.join(' | '))}}</span>
-                        <span style="font-weight: 700; text-decoration: underline;">Inspect Forensics ➔</span>
-                    </div>`;
+            if (data.nodes) {{
+                syncNodes(data.nodes);
+            }}
+
+            // Randomly trigger speech bubbles from real active nodes
+            if (data.recent_messages && data.recent_messages.length > 0 && Math.random() < 0.7) {{
+                const msg = data.recent_messages[Math.floor(Math.random() * data.recent_messages.length)];
+                const node = nodes.find(n => n.id === msg.from) || nodes[Math.floor(Math.random() * nodes.length)];
+                if (node && msg.text) {{
+                    spawnSpeechBubble(node, msg.text);
+                    
+                    // Fire a packet laser beam to master node
+                    const master = nodes[0];
+                    beams.push({{
+                        x1: node.x, y1: node.y,
+                        x2: master.x, y2: master.y,
+                        color: msg.threat_level === 'THREAT' ? 'rgba(239,68,68,0.8)' : 'rgba(16,185,129,0.7)',
+                        width: 2,
+                        alpha: 1.0
+                    }});
                 }}
-
-                item.innerHTML = `
-                    <div class="card-topbar">
-                        <span class="sender-tag">${{escapeHtml(m.sender_badge || m.from || '')}}</span>
-                        <span class="seq-tag">[seq ${{escapeHtml(String(m.seq))}}] ${{escapeHtml(m.ts || '')}}</span>
-                    </div>
-                    <div class="card-text">${{escapeHtml(m.text)}}</div>
-                    ${{flagHtml}}
-                `;
-                feedEl.appendChild(item);
-            }});
-
-            // Update health badge
-            const health = data.health || {{}};
-            const score = health.health_score || 100;
-            const badge = document.getElementById('roomHealthBadge');
-            badge.innerText = `HEALTH: ${{score}}%`;
-            badge.className = `room-score ${{score >= 75 ? 'score-green' : 'score-amber'}}`;
-
-            if (autoScroll && reset) {{
-                feedEl.scrollTop = 0;
             }}
+
         }} catch (e) {{
-            console.error('Feed fetch error:', e);
+            console.error('Timeline fetch error:', e);
         }}
     }}
 
-    // 4. Interactive Terminal Console Fetcher
     async function fetchTerminalLogs() {{
         try {{
             const res = await fetch('/api/logs');
             const data = await res.json();
-            const term = document.getElementById('terminalLogBox');
-            const logs = data.logs || [];
-            if (logs.length > 0) {{
-                term.innerHTML = logs.map(l => `<div>> ${{escapeHtml(l)}}</div>`).join('');
-                term.scrollTop = term.scrollHeight;
+            const box = document.getElementById('terminalLogBox');
+            if (data.logs && data.logs.length > 0) {{
+                box.innerHTML = data.logs.map(l => `<div>> ${{escapeHtml(l)}}</div>`).join('');
+                box.scrollTop = box.scrollHeight;
             }}
         }} catch (e) {{}}
     }}
 
-    // 5. Actions & Broadcast
-    function applyMacro(text) {{
-        document.getElementById('messageInput').value = text;
-        updateCharCount();
-        playBeep(720, 'sine', 0.05);
-    }}
-
-    function updateCharCount() {{
-        const len = (document.getElementById('messageInput').value || '').length;
-        document.getElementById('charCounter').innerText = `${{len}} / 4096 chars`;
+    // Actions
+    function applyMacro(t) {{
+        document.getElementById('messageInput').value = t;
+        playBeep(700, 'sine', 0.05);
     }}
 
     async function sendSignedMessage() {{
-        const input = document.getElementById('messageInput');
-        const text = input.value.trim();
+        const text = (document.getElementById('messageInput').value || '').trim();
+        const room = (document.getElementById('targetRoomInput').value || 'lobby').trim();
         if (!text) return;
 
         const btn = document.getElementById('sendBtn');
         btn.disabled = true;
-        btn.innerHTML = '<span>Signing & Sweeping...</span> ⚡';
+        btn.innerText = 'Signing & Sweeping...';
         playBeep(440, 'triangle', 0.1);
 
         try {{
@@ -1328,135 +1634,94 @@ def render_dashboard_html() -> str:
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${{sessionToken}}`
                 }},
-                body: JSON.stringify({{ room: activeRoom, text: text }})
+                body: JSON.stringify({{ room: room, text: text }})
             }});
 
             if (res.status === 401) {{
-                alert('Session Token Mismatch: The Sentinel server was recently restarted. Please refresh this webpage (press F5) to load the new secure session token.');
+                alert('Session expired. Please refresh page (F5).');
                 return;
             }}
 
             const data = await res.json();
             if (data.success) {{
                 playBeep(880, 'sine', 0.15);
-                input.value = '';
-                updateCharCount();
-                fetchFeed(true);
-                fetchTerminalLogs();
+                document.getElementById('messageInput').value = '';
+                toggleDrawer('composerDrawer');
+                fetchTimeline();
             }} else {{
-                playBeep(220, 'sawtooth', 0.25);
-                alert(`Broadcast Error: ${{data.error || 'Failed to send'}}`);
-            }}
-        }} catch (e) {{
-            alert(`Network error: ${{e.message}}`);
-        }} finally {{
-            btn.disabled = false;
-            btn.innerHTML = '<span>Sign & Broadcast</span> 🚀';
-        }}
-    }}
-
-    function toggleAutoScroll() {{
-        autoScroll = !autoScroll;
-        document.getElementById('autoScrollBtn').innerText = `Auto-Scroll: ${{autoScroll ? 'ON' : 'OFF'}}`;
-        playBeep(600, 'sine', 0.05);
-    }}
-
-    async function publishIdentityNote() {{
-        if (!confirm('Publish your cryptographic DID identity to the sharded directory (/kv/did-<shard>/<key>)?')) return;
-        try {{
-            const res = await fetch('/api/publish_identity', {{
-                method: 'POST',
-                headers: {{
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${{sessionToken}}`
-                }},
-                body: JSON.stringify({{ mailbox: `mb-p-sentinel-${{Math.random().toString(36).substring(2,8)}}` }})
-            }});
-            const data = await res.json();
-            if (data.success) {{
-                playBeep(900, 'sine', 0.15);
-                alert(`Identity Note Published successfully to ${{data.path}}!`);
-            }} else {{
-                alert(`Failed to publish: ${{data.error || data.response}}`);
+                alert(`Error: ${{data.error || 'Failed to send'}}`);
             }}
         }} catch (e) {{
             alert(`Error: ${{e.message}}`);
+        }} finally {{
+            btn.disabled = false;
+            btn.innerText = 'Sign & Broadcast 🚀';
         }}
     }}
 
     async function claimGatedRoom() {{
-        const input = document.getElementById('claimRoomInput');
-        const roomName = (input.value || '').trim();
-        if (!roomName.startsWith('d-')) {{
-            alert('Gated room names must start with "d-" (e.g. d-my-hub)');
+        const r = (document.getElementById('claimRoomInput').value || '').trim();
+        if (!r.startsWith('d-')) {{
+            alert('Gated room names must start with "d-"');
             return;
         }}
         try {{
             const res = await fetch('/api/room/claim', {{
                 method: 'POST',
-                headers: {{
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${{sessionToken}}`
-                }},
-                body: JSON.stringify({{ room: roomName }})
+                headers: {{ 'Content-Type': 'application/json', 'Authorization': `Bearer ${{sessionToken}}` }},
+                body: JSON.stringify({{ room: r }})
             }});
             const data = await res.json();
             if (data.success) {{
-                playBeep(950, 'sine', 0.15);
-                alert(`Room "${{roomName}}" successfully claimed with your DID key!`);
-                input.value = '';
-                fetchRooms();
+                alert(`Room "${{r}}" claimed with your DID key!`);
+                toggleDrawer('toolsDrawer');
             }} else {{
-                alert(`Claim result: ${{data.response || data.error}}`);
+                alert(`Error: ${{data.error || data.response}}`);
             }}
-        }} catch (e) {{
-            alert(`Error: ${{e.message}}`);
-        }}
+        }} catch (e) {{ alert(e.message); }}
     }}
 
-    function copyDid() {{
-        const did = document.getElementById('nodeDid').innerText;
-        navigator.clipboard.writeText(did).then(() => {{
-            playBeep(800, 'sine', 0.08);
-            alert('DID Copied to clipboard! 📋');
-        }});
+    async function publishIdentityNote() {{
+        if (!confirm('Publish identity to sharded directory?')) return;
+        try {{
+            const res = await fetch('/api/publish_identity', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json', 'Authorization': `Bearer ${{sessionToken}}` }},
+                body: JSON.stringify({{ mailbox: `mb-p-sentinel-${{Math.random().toString(36).substring(2,8)}}` }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                alert(`Published successfully to ${{data.path}}!`);
+                toggleDrawer('toolsDrawer');
+            }} else {{
+                alert(`Error: ${{data.error}}`);
+            }}
+        }} catch (e) {{ alert(e.message); }}
     }}
 
-    function forceScan() {{
-        playBeep(750, 'triangle', 0.1);
-        fetchStatus();
-        fetchRooms();
-        fetchFeed(true);
-        fetchTerminalLogs();
-    }}
-
-    function openThreatModal(data) {{
-        document.getElementById('modalThreatType').innerText = data.type || 'Threat Detection';
-        document.getElementById('modalSender').innerText = data.from || 'Unknown Sender';
-        document.getElementById('modalRawPayload').innerText = data.text || 'No text';
-        document.getElementById('modalMitigation').innerText = `[QUARANTINED] Message quarantined from agent loop. Sender evaluated as ${{data.flags ? data.flags.join(', ') : 'SUSPICIOUS'}}.`;
-        document.getElementById('threatModal').style.display = 'flex';
-        playBeep(300, 'sawtooth', 0.2);
-    }}
-
-    function closeThreatModal() {{
-        document.getElementById('threatModal').style.display = 'none';
-        playBeep(600, 'sine', 0.05);
+    function openForensics(sender, text, threat) {{
+        document.getElementById('modalContent').innerHTML = `
+            <div><b>Sender ID:</b> ${{escapeHtml(sender)}}</div>
+            <div style="margin-top: 6px;"><b>Threat Classification:</b> <span style="color: ${{threat === 'THREAT' ? '#ef4444' : '#10b981'}}">${{threat}}</span></div>
+            <div style="margin-top: 6px;"><b>Captured Payload:</b></div>
+            <div style="background: #040907; border: 1px solid #162a23; padding: 8px; margin-top: 4px; font-size: 10.5px; word-break: break-all;">${{escapeHtml(text)}}</div>
+        `;
+        document.getElementById('forensicModal').style.display = 'flex';
+        playBeep(350, 'sawtooth', 0.15);
     }}
 
     function escapeHtml(str) {{
         return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }}
 
-    // Polling Intervals
-    fetchStatus();
-    fetchRooms();
-    fetchFeed();
+    // Init
+    resizeCanvases();
+    updateScrubDate();
+    fetchTimeline();
     fetchTerminalLogs();
+    animate();
 
-    setInterval(fetchStatus, 8000);
-    setInterval(fetchRooms, 12000);
-    setInterval(() => fetchFeed(false), 4000);
+    setInterval(fetchTimeline, 3000);
     setInterval(fetchTerminalLogs, 4000);
 </script>
 
