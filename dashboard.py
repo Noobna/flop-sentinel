@@ -1519,10 +1519,15 @@ def render_dashboard_html() -> str:
             // 1. Orbital Physics
             this.angle += this.orbitSpeed * playSpeed;
             const wobble = Math.sin(this.animTick * 1.5) * this.radialWobble;
-            const currentR = this.orbitRadius + wobble;
             
-            let targetX = centerX + Math.cos(this.angle) * currentR;
-            let targetY = centerY + Math.sin(this.angle) * (currentR * (currentMode === 'isometric' ? 0.5 : 0.85));
+            // Scale orbits dynamically to fill the entire browser window!
+            const scaleX = Math.max(1.0, sCanvas.width / 650);
+            const scaleY = Math.max(1.0, sCanvas.height / 600);
+            const currentRx = (this.orbitRadius * scaleX) + wobble;
+            const currentRy = (this.orbitRadius * scaleY) + wobble;
+            
+            let targetX = centerX + Math.cos(this.angle) * currentRx;
+            let targetY = centerY + Math.sin(this.angle) * (currentRy * (currentMode === 'isometric' ? 0.5 : 0.95));
 
             // 2. Mouse Gravitational Warp Force
             const distMouse = Math.hypot(targetX - mousePos.x, targetY - mousePos.y);
