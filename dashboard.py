@@ -652,6 +652,9 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 for attempt in range(1, 4):
                     try:
                         st, resp_text = claim_gated_room(priv, did, room)
+                        if st in (502, 503, 504) and attempt < 3:
+                            time.sleep(1.5 * attempt)
+                            continue
                         break # Success or explicit HTTP error
                     except Exception as net_err:
                         # If a timeout occurs, check if the room was successfully claimed anyway!
