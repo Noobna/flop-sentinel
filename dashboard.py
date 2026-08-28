@@ -217,8 +217,63 @@ class SentinelStreamMonitor(threading.Thread):
 
 
 # ============================================================================
+# ============================================================================
 # HTTP Request Handler & REST API
 # ============================================================================
+import queue
+OUTBOUND_MSG_QUEUE = queue.Queue()
+
+def _outbound_worker():
+    while True:
+        try:
+            task = OUTBOUND_MSG_QUEUE.get()
+            room = task['room']
+            did = task['did']
+            sig = task['sig']
+            nonce = task['nonce']
+            swept_text = task['swept_text']
+            
+            encoded_text = urllib.parse.quote(swept_text)
+            url = f"https://technocore.chat/r/{room}/say-signed/{did}/{sig}/{nonce}/{encoded_text}"
+            
+            logger.info(f"[*] Async Broadcast started for /r/{room}")
+            for _ in range(25): # Try for a long time (~5 minutes)
+                try:
+                    st, body = http_get(url, timeout=35)
+                    if st == 200:
+                        logger.info(f"[+] Async Broadcast SUCCESS in /r/{room}: '{swept_text}'")
+                        
+                        # Verify we can also read it
+                        try:
+                            http_get(f"https://technocore.chat/r/{room}?limit=2", timeout=10)
+                        except Exception:
+                            pass
+                        break
+                    
+                    if st in (403, 400, 422, 409):
+                        logger.error(f"[!] Async Broadcast failed (fatal {st}) in /r/{room}: {body}")
+                        break
+                        
+                except Exception as e:
+                    logger.warning(f"[-] Async Broadcast network error in /r/{room} (retrying): {e}")
+                    try:
+                        v_st, v_body = http_get(f"https://technocore.chat/r/{room}?limit=3", timeout=10)
+                        if v_st == 200 and swept_text in v_body:
+                            logger.info(f"[+] Async Broadcast SUCCESS (recovered from timeout) in /r/{room}")
+                            break
+                    except Exception:
+                        pass
+                
+                # Sleep and retry on 503/timeout
+                time.sleep(10)
+            
+            OUTBOUND_MSG_QUEUE.task_done()
+        except Exception as err:
+            logger.error(f"[!] Outbound worker crashed: {err}")
+            time.sleep(5)
+
+threading.Thread(target=_outbound_worker, daemon=True).start()
+
 
 class SentinelRequestHandler(BaseHTTPRequestHandler):
     """Hardened HTTP Request Handler for Local Control Hub."""
@@ -549,60 +604,29 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 nonce = get_next_nonce(room)
                 swept_text, sig = sign_message(priv, room, nonce, text)
 
-                # Send GET /r/<room>/say-signed/<did>/<sig>/<nonce>/<encoded_text> with auto-retry
-                encoded_text = urllib.parse.quote(swept_text)
-                url = f"https://technocore.chat/r/{room}/say-signed/{did}/{sig}/{nonce}/{encoded_text}"
+                # Queue the broadcast asynchronously
+                OUTBOUND_MSG_QUEUE.put({
+                    'room': room,
+                    'did': did,
+                    'sig': sig,
+                    'nonce': nonce,
+                    'swept_text': swept_text
+                })
                 
-                status_code = 503
-                resp_body = "Service Unavailable"
-                for attempt in range(1, 4):
-                    try:
-                        status_code, resp_body = http_get(url, timeout=35)
-                        if status_code == 200:
-                            break
-                        elif status_code in (502, 503, 504) and attempt < 3:
-                            time.sleep(1.5 * attempt)
-                            continue
-                        else:
-                            break
-                    except Exception as net_err:
-                        # Check if message actually posted despite socket read timeout
-                        try:
-                            v_st, v_body = http_get(f"https://technocore.chat/r/{room}?limit=3", timeout=10)
-                            if v_st == 200 and swept_text in v_body:
-                                status_code = 200
-                                resp_body = v_body
-                                break
-                        except Exception:
-                            pass
-
-                        if attempt < 3:
-                            time.sleep(1.5 * attempt)
-                            continue
-                        raise net_err
+                # Update local state immediately so UI feels responsive
+                state = load_json_safe(STATE_FILE, {})
+                state["last_write_time"] = time.time()
+                save_json_atomic(STATE_FILE, state)
                 
-                if status_code == 200:
-                    # Update local state
-                    state = load_json_safe(STATE_FILE, {})
-                    state["last_write_time"] = time.time()
-                    save_json_atomic(STATE_FILE, state)
-                    
-                    logger.info(f"[+] UI Broadcast SUCCESS in /r/{room}: \"{swept_text}\"")
-                    self.send_json({
-                        "success": True,
-                        "room": room,
-                        "nonce": nonce,
-                        "swept_text": swept_text,
-                        "signature": sig,
-                        "status_code": status_code,
-                    })
-                else:
-                    logger.warning(f"[-] Server returned {status_code}: {resp_body}")
-                    self.send_json({
-                        "success": False,
-                        "error": f"Technocore server returned HTTP {status_code}: {resp_body.strip() or 'Temporary server busy/reload'}",
-                        "status_code": status_code,
-                    }, status=502)
+                self.send_json({
+                    "success": True,
+                    "room": room,
+                    "nonce": nonce,
+                    "swept_text": swept_text,
+                    "signature": sig,
+                    "status_code": 202, # 202 Accepted (queued)
+                    "message": "Queued & Sweeping..."
+                })
 
             except Exception as err:
                 logger.error(f"[!] Error broadcasting message: {err}")
