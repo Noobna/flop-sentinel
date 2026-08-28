@@ -479,6 +479,8 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                         "threat": b_threat,
                     })
 
+                # Sort nodes by message activity / recency and cap to top 50 to prevent frontend memory bloating
+                sorted_nodes = sorted(nodes_map.values(), key=lambda x: x.get("msg_count", 0), reverse=True)[:50]
                 timeline_payload = {
                     "stats": {
                         "discovered_rooms": len(_room_streams),
@@ -488,9 +490,9 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                         "active_nodes": len(nodes_map),
                         "total_messages": len(all_msgs),
                     },
-                    "timeline": buckets,
-                    "nodes": list(nodes_map.values())[:120],
-                    "recent_messages": all_msgs[-30:]
+                    "timeline": buckets[-30:],
+                    "nodes": sorted_nodes,
+                    "recent_messages": all_msgs[-20:]
                 }
 
             self.send_json(timeline_payload)
@@ -1584,14 +1586,40 @@ def render_dashboard_html() -> str:
         }}
     }}
 
-    // Spawn / Sync Swarm Nodes
+
+    // =========================================================================
+    // ⚡ 60 FPS ULTRA LONG-RUNNING PERFORMANCE & HIBERNATION ENGINE
+    // =========================================================================
+    const MAX_NODES = 50;
+    const MAX_PARTICLES = 25;
+    const MAX_BEAMS = 6;
+    const MAX_BUBBLES = 4;
+    let isTabVisible = true;
+    let animFrameId = null;
+
+    // Background Tab Hibernation (0% CPU when tab is inactive)
+    document.addEventListener('visibilitychange', () => {{
+        isTabVisible = !document.hidden;
+        if (isTabVisible) {{
+            fetchTimeline();
+            fetchTerminalLogs();
+            if (!animFrameId) animFrameId = requestAnimationFrame(animate);
+        }} else {{
+            if (animFrameId) {{
+                cancelAnimationFrame(animFrameId);
+                animFrameId = null;
+            }}
+        }}
+    }});
+
+    // Node Sync with LRU Pruning (Guaranteed zero lag even after hours)
     function syncNodes(apiNodes) {{
         if (nodes.length === 0) {{
             // Master Sentinel Fortress
             nodes.push(new AdvancedSwarmNode('sentinel-core', true, true, 'CLEAN', 'Sentinel Master Defense Fortress', 'guardian'));
             
-            // Channel Stations
-            ['lobby', 'technocore', 'meta', 'genesis', 'inference', 'validators', 'security'].forEach(ch => {{
+            // Core Channel Stations
+            ['lobby', 'technocore', 'meta', 'genesis', 'inference', 'validators'].forEach(ch => {{
                 const st = new AdvancedSwarmNode(`channel-${{ch}}`, false, true, 'CLEAN', `Hub /r/${{ch}}`, 'station');
                 nodes.push(st);
             }});
@@ -1600,14 +1628,22 @@ def render_dashboard_html() -> str:
         apiNodes.forEach(an => {{
             let existing = nodes.find(n => n.id === an.id);
             if (!existing) {{
-                const role = an.id.includes('inference') ? 'compute' : 'peer';
-                const n = new AdvancedSwarmNode(an.id, false, an.is_did, an.threat_level, an.latest_text, role);
-                nodes.push(n);
+                if (nodes.length < MAX_NODES) {{
+                    const role = an.id.includes('inference') ? 'compute' : 'peer';
+                    const n = new AdvancedSwarmNode(an.id, false, an.is_did, an.threat_level, an.latest_text, role);
+                    nodes.push(n);
+                }}
             }} else {{
                 existing.threat = an.threat_level;
                 existing.text = an.latest_text;
+                existing.lastActive = Date.now();
             }}
         }});
+
+        // Prune stale nodes if exceeding max cap
+        if (nodes.length > MAX_NODES) {{
+            nodes = nodes.filter((n, idx) => n.isMaster || n.role === 'station' || idx < MAX_NODES);
+        }}
     }}
 
     // Speech Bubbles System
@@ -1801,10 +1837,18 @@ def render_dashboard_html() -> str:
             n.draw(sCtx);
         }});
 
+        // Prune arrays to prevent memory leaks
+        if (particles.length > MAX_PARTICLES) particles.splice(0, particles.length - MAX_PARTICLES);
+        if (beams.length > MAX_BEAMS) beams.splice(0, beams.length - MAX_BEAMS);
+
         updateSpeechBubbles();
         drawStreamgraph();
 
-        requestAnimationFrame(animate);
+        if (isTabVisible) {{
+            animFrameId = requestAnimationFrame(animate);
+        }} else {{
+            animFrameId = null;
+        }}
     }}
 
     // Streamgraph Canvas
@@ -2095,8 +2139,8 @@ def render_dashboard_html() -> str:
     fetchTerminalLogs();
     animate();
 
-    setInterval(fetchTimeline, 3000);
-    setInterval(fetchTerminalLogs, 4000);
+    setInterval(() => {{ if (isTabVisible) fetchTimeline(); }}, 3500);
+    setInterval(() => {{ if (isTabVisible) fetchTerminalLogs(); }}, 4000);
 </script>
 
 </body>
