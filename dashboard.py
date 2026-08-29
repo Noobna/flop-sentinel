@@ -206,7 +206,7 @@ class SentinelStreamMonitor(threading.Thread):
                                     "level": assessment.level,
                                     "threat_types": assessment.threat_types,
                                     "flags": assessment.flags,
-                                    "text": text[:80],
+                                    "text": text,
                                 })
 
                     # Update room health metrics
