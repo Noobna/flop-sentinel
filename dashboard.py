@@ -2189,11 +2189,11 @@ def render_dashboard_html() -> str:
             const data = await res.json();
             
             if (data.stats) {{
-                document.getElementById('cntDiscovered').innerText = data.stats.discovered_rooms || 51;
-                document.getElementById('cntRead').innerText = data.stats.verified_dids ? Math.floor(data.stats.verified_dids / 3) : 16;
-                document.getElementById('cntReplies').innerText = data.stats.swarm_replies || 2240;
-                document.getElementById('cntThreats').innerText = data.stats.quarantined_threats || 1;
-                document.getElementById('cntNodes').innerText = data.stats.active_nodes || 384;
+                document.getElementById('cntDiscovered').innerText = data.stats.discovered_rooms ?? 0;
+                document.getElementById('cntRead').innerText = data.stats.verified_dids ?? 0;
+                document.getElementById('cntReplies').innerText = data.stats.swarm_replies ?? 0;
+                document.getElementById('cntThreats').innerText = data.stats.quarantined_threats ?? 0;
+                document.getElementById('cntNodes').innerText = data.stats.active_nodes ?? 0;
             }}
 
             if (data.timeline && data.timeline.length > 0) {{
