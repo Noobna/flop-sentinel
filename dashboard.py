@@ -1367,7 +1367,7 @@ def render_dashboard_html() -> str:
     let shockwaves = [];
 
     // Memory & FPS bounding
-    const MAX_NODES = 50;
+    const MAX_NODES = 400;
     const MAX_PARTICLES = 30;
     const MAX_BEAMS = 8;
     let isTabVisible = true;
