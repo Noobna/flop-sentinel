@@ -1338,16 +1338,16 @@ def render_dashboard_html() -> str:
 <!-- Drawer 3: Gated Room & DID Tools -->
 <div class="drawer" id="toolsDrawer">
     <div class="drawer-header">
-        <span>🔐 PATTERN 3 & 5 TOOLS</span>
+        <span>🔐 ROOM & IDENTITY TOOLS</span>
         <button class="drawer-close" onclick="toggleDrawer('toolsDrawer')">✕</button>
     </div>
     <div>
-        <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Claim Gated Room (Pattern 5):</div>
+        <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Claim Gated Room:</div>
         <input type="text" id="claimRoomInput" placeholder="d-my-hub" class="composer-input" style="min-height: auto; padding: 6px; margin-bottom: 6px;">
         <button class="hud-btn" onclick="claimGatedRoom()">Claim Room Ownership</button>
     </div>
     <div style="margin-top: 14px;">
-        <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Publish Sharded DID (Pattern 3):</div>
+        <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Publish Sharded DID:</div>
         <button class="hud-btn" onclick="publishIdentityNote()">⚡ Publish to /kv/did-shard/key</button>
     </div>
 </div>
