@@ -119,7 +119,7 @@ class SentinelStreamMonitor(threading.Thread):
                 # 2. Poll messages across active rooms
                 for room in list(self.active_rooms):
                     self.poll_room_feed(room)
-                    time.sleep(1.0)
+                    time.sleep(0.7)
 
             except Exception as e:
                 logger.warning(f"[!] Error in stream monitor cycle: {e}")
@@ -153,8 +153,8 @@ class SentinelStreamMonitor(threading.Thread):
                     if name and not name.startswith(("p-", "mb-", "d-", "e-")) and name not in rooms_list:
                         rooms_list.append(name)
                 with _lock:
-                    self.active_rooms = rooms_list[:16]
-                logger.info(f"[*] Discovered {len(self.active_rooms)} active rooms: {', '.join(self.active_rooms)}")
+                    self.active_rooms = rooms_list[:64] # Track up to 64 active rooms
+                logger.info(f"[*] Discovered {len(self.active_rooms)} active rooms for tracking.")
         except Exception as e:
             logger.debug(f"Room discovery error: {e}")
 
