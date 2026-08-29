@@ -184,8 +184,9 @@ def analyze_message(sender: str, raw_text: str, room: str = "lobby") -> ThreatAs
     for pattern in SCAM_PATTERNS:
         match = pattern.search(norm_text)
         if match:
-            matched_str = match.group(0)[:40]
-            if "pump" in matched_str.lower() or "0x" in matched_str.lower():
+            full_match = match.group(0)
+            matched_str = full_match[:40]
+            if "pump" in full_match.lower() or "0x" in full_match.lower():
                 threat_types.append("FAKE_TOKEN")
                 flags.append(f"Unverified token contract address detected: '{matched_str}'")
             else:
