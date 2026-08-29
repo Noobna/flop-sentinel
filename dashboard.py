@@ -1179,8 +1179,8 @@ def render_dashboard_html() -> str:
                 <span>WROTE, NOT ATTACKING</span>
                 <span class="badge-val" id="cntReplies">2240</span>
             </div>
-            <div class="ribbon-badge badge-red">
-                <span>IN THE OA ATTACK</span>
+            <div class="ribbon-badge badge-red" style="cursor: pointer;" onclick="showThreatLog()">
+                <span>IN THE OA ATTACK (VIEW)</span>
                 <span class="badge-val" id="cntThreats">1</span>
             </div>
             <div class="ribbon-badge badge-yellow">
@@ -1891,6 +1891,39 @@ def render_dashboard_html() -> str:
             <div style="background:#020705; border:1px solid #132a21; padding:8px; margin-top:4px; font-size:10.5px; word-break:break-all;">${{escapeHtml(lockedTargetNode.text)}}</div>
         `;
         document.getElementById('forensicModal').style.display = 'flex';
+    }}
+
+    async function showThreatLog() {{
+        document.getElementById('modalContent').innerHTML = `<div>Fetching latest security incidents...</div>`;
+        document.getElementById('forensicModal').style.display = 'flex';
+        
+        try {{
+            const res = await fetch('/api/events');
+            const data = await res.json();
+            if (data.events && data.events.length > 0) {{
+                // Show the most recent 3 events
+                const eventsHtml = data.events.slice(-3).reverse().map(e => `
+                    <div style="border-bottom: 1px solid #dc2626; padding-bottom: 10px; margin-bottom: 10px;">
+                        <div style="color: #ef4444; font-weight: bold;">[${{e.level}}] Agent: ${{escapeHtml(e.from)}}</div>
+                        <div style="color: #f59e0b; font-size: 11px;">Room: /r/${{e.room}} (Seq: ${{e.seq}})</div>
+                        <div style="color: #94a3b8; font-size: 11px; margin-top: 4px;">Flags: ${{ (e.flags || []).join(', ') }}</div>
+                        <div style="background:#020705; border:1px solid #132a21; padding:8px; margin-top:6px; font-size:10.5px; word-break:break-all; color:#f8fafc;">
+                            ${{escapeHtml(e.text || '')}}
+                        </div>
+                    </div>
+                `).join('');
+                document.getElementById('modalContent').innerHTML = `
+                    <h3 style="color:#ef4444; margin-top:0;">🛑 OA Attack Log</h3>
+                    <div style="max-height: 400px; overflow-y: auto;">
+                        ${{eventsHtml}}
+                    </div>
+                `;
+            }} else {{
+                document.getElementById('modalContent').innerHTML = `<div style="color:#10b981;">No active threats detected in the stream buffer.</div>`;
+            }}
+        }} catch (err) {{
+            document.getElementById('modalContent').innerHTML = `<div style="color:#ef4444;">Error fetching threat log.</div>`;
+        }}
     }}
 
     // Hyper-Defense Overdrive Demo
