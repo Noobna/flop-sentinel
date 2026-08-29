@@ -534,8 +534,8 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                         "threat": b_threat,
                     })
 
-                # Sort nodes by message activity / recency and cap to top 50 to prevent frontend memory bloating
-                sorted_nodes = sorted(nodes_map.values(), key=lambda x: x.get("msg_count", 0), reverse=True)[:50]
+                # Sort nodes by message activity / recency and cap to top 400
+                sorted_nodes = sorted(nodes_map.values(), key=lambda x: x.get("msg_count", 0), reverse=True)[:400]
                 timeline_payload = {
                     "stats": {
                         "discovered_rooms": len(_room_streams),
