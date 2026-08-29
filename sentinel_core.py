@@ -367,7 +367,13 @@ def claim_gated_room(
     encoded_did = urllib.parse.quote(did)
     
     url = f"{base_url}/kv/room-owners/{clean_room}/set-signed/{did}/{sig_b64}/{nonce}/{encoded_did}?if_absent=1"
-    return http_get(url)
+    st, resp = http_get(url)
+    if st in (200, 201):
+        try:
+            set_room_allowlist(priv, did, clean_room, [did], base_url=base_url)
+        except Exception:
+            pass
+    return st, resp
 
 
 def set_room_allowlist(
