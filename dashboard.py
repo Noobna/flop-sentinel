@@ -509,9 +509,16 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                             }
                         else:
                             nodes_map[sender]["msg_count"] += 1
-                            nodes_map[sender]["latest_text"] = m.get("text", "")
-                            if lvl in ("THREAT", "SUSPICIOUS"):
-                                nodes_map[sender]["threat_level"] = lvl
+                            current_lvl = nodes_map[sender]["threat_level"]
+                            
+                            if lvl == "THREAT" and current_lvl != "THREAT":
+                                nodes_map[sender]["threat_level"] = "THREAT"
+                                nodes_map[sender]["latest_text"] = m.get("text", "")
+                            elif lvl == "SUSPICIOUS" and current_lvl == "CLEAN":
+                                nodes_map[sender]["threat_level"] = "SUSPICIOUS"
+                                nodes_map[sender]["latest_text"] = m.get("text", "")
+                            elif current_lvl == "CLEAN":
+                                nodes_map[sender]["latest_text"] = m.get("text", "")
 
                 # Sort messages by seq/timestamp
                 all_msgs.sort(key=lambda x: x.get("seq", 0))
