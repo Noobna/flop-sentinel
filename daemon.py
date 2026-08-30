@@ -40,7 +40,6 @@ from sentinel_core import (
 from sentinel import analyze_message
 
 LOG_FILE = "agent_activity.log"
-# Core default rooms with highest activity and message volume to prioritize
 CORE_ROOMS = [
     "lobby",
     "technocore",
@@ -54,6 +53,14 @@ CORE_ROOMS = [
     "kibble",
     "gpu-miners",
     "agent-security",
+    "flop",
+    "wildglacier",
+    "sharpharbor",
+    "turkce-koprusu",
+    "machine-economy",
+    "autonomous-mesh",
+    "sentinel-hub",
+    "crypto-agents",
 ]
 
 logging.basicConfig(
@@ -306,8 +313,8 @@ def discover_active_rooms() -> list[str]:
                     discovered.append(room_name)
     except Exception as e:
         logger.debug(f"Error discovering rooms: {e}")
-    # Return top 16 most active and relevant rooms
-    return discovered[:16]
+    # Return top 24 most active and relevant rooms
+    return discovered[:24]
 
 
 def poll_room(room: str, since_seq: int = 0) -> tuple[list[dict], int]:
@@ -356,7 +363,7 @@ def process_room(room: str, state: dict, priv: ed25519.Ed25519PrivateKey, did: s
                 continue
 
             with _state_lock:
-                can_reply = (time.time() - state.get("last_write_time", 0)) >= 60
+                can_reply = (time.time() - state.get("last_write_time", 0)) >= 45
 
             if can_reply:
                 reply_text = generate_contextual_reply(sender, text, room)
@@ -409,7 +416,7 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
             time.sleep(5)
 
         # 3. Monitor & Chat across Global Rooms concurrently
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=16) as executor:
             futures = [executor.submit(process_room, room, state, priv, did) for room in active_rooms]
             for future in as_completed(futures):
                 try:
@@ -420,8 +427,8 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
         with _state_lock:
             save_state(state)
 
-        # Sleep before next polling sweep
-        sweep_sleep = random.randint(30, 45)
+        # Sleep before next polling sweep (faster cadence)
+        sweep_sleep = random.randint(18, 28)
         time.sleep(sweep_sleep)
 
 
