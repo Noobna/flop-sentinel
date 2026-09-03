@@ -194,6 +194,50 @@ class TestSentinelDashboard(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
+    def test_11_tclk_deal_endpoints(self):
+        """Verify GET /api/tclk/deals and POST /api/tclk/offer, /api/tclk/accept, /api/tclk/reveal."""
+        # 1. GET /api/tclk/deals
+        status, data = self.make_request("/api/tclk/deals")
+        self.assertEqual(status, 200)
+        self.assertIn("deals", data)
+
+        # 2. POST /api/tclk/offer
+        status, offer_res = self.make_request(
+            "/api/tclk/offer",
+            method="POST",
+            headers={"Authorization": f"Bearer {dashboard._session_token}"},
+            data={"role": "payer", "amount": "5000", "asset": "FLOP", "task": "Test Task"}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(offer_res.get("success"))
+        offer = offer_res.get("offer")
+        self.assertIsNotNone(offer)
+
+        # 3. POST /api/tclk/accept
+        status, accept_res = self.make_request(
+            "/api/tclk/accept",
+            method="POST",
+            headers={"Authorization": f"Bearer {dashboard._session_token}"},
+            data={"offer": offer}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(accept_res.get("success"))
+        contract_id = accept_res.get("contract")
+        secret_preimage = accept_res.get("secretPreimage")
+        self.assertIsNotNone(contract_id)
+        self.assertIsNotNone(secret_preimage)
+
+        # 4. POST /api/tclk/reveal
+        status, reveal_res = self.make_request(
+            "/api/tclk/reveal",
+            method="POST",
+            headers={"Authorization": f"Bearer {dashboard._session_token}"},
+            data={"contract": contract_id, "secret": secret_preimage}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(reveal_res.get("success"))
+        self.assertEqual(reveal_res.get("status"), "claimed")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

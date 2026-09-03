@@ -328,9 +328,10 @@ def publish_sharded_did(
     did: str,
     mailbox_name: Optional[str] = None,
     x25519_pub: Optional[str] = None,
+    tclk_token: Optional[str] = None,
     base_url: str = "https://technocore.chat",
 ) -> Tuple[int, str]:
-    """Publish agent identity and optional mailbox to official sharded directory (Pattern 3)."""
+    """Publish agent identity, optional mailbox, and TCLK capabilities to official sharded directory (Pattern 3)."""
     shard, key, _ = get_sharded_did_path(did)
     parts = [did]
     if x25519_pub:
@@ -340,6 +341,8 @@ def publish_sharded_did(
         if not clean_mb.startswith("mb-"):
             clean_mb = f"mb-{clean_mb}"
         parts.append(f"mailbox:{clean_mb}")
+    if tclk_token:
+        parts.append(tclk_token)
         
     value_str = " ".join(parts)
     encoded_val = urllib.parse.quote(value_str)

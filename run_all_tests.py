@@ -11,6 +11,9 @@ import unittest
 import test_sentinel_core
 import test_sentinel
 import test_dashboard
+import test_tclk
+import test_evm_rail
+import test_mcp_server
 
 
 def run_full_suite():
@@ -20,6 +23,9 @@ def run_full_suite():
     suite.addTests(loader.loadTestsFromModule(test_sentinel_core))
     suite.addTests(loader.loadTestsFromModule(test_sentinel))
     suite.addTests(loader.loadTestsFromModule(test_dashboard))
+    suite.addTests(loader.loadTestsFromModule(test_tclk))
+    suite.addTests(loader.loadTestsFromModule(test_evm_rail))
+    suite.addTests(loader.loadTestsFromModule(test_mcp_server))
 
     runner = unittest.TextTestRunner(verbosity=2)
     print("=" * 65)

@@ -24,12 +24,17 @@ flop_agent_identity.json
 # Local Agent State & Rolling Logs
 agent_state.json
 agent_state.json.bak
+deal_state.json
+deal_state.json.bak
+top_active_rooms.json
 *.log
 *.tmp*
 
 # Session Tokens & Temporary Local Cache
 sentinel_session.json
 .cache/
+scratch_*
+*.mov
 
 # OS Specific
 .DS_Store

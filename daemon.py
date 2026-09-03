@@ -38,10 +38,19 @@ from sentinel_core import (
     sign_message,
 )
 from sentinel import analyze_message
+from tclk import (
+    apply_frame,
+    derive_deal_room,
+    is_tclk_line,
+    open_contract,
+    try_decode_frame,
+)
 
 LOG_FILE = "agent_activity.log"
+DEAL_STATE_FILE = "deal_state.json"
 CORE_ROOMS = [
     "lobby",
+    "tclk-offers",
     "technocore",
     "meta",
     "ashflop",
@@ -339,6 +348,47 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _state_lock = threading.Lock()
 
+def process_tclk_message(m: dict, room: str, priv: ed25519.Ed25519PrivateKey, did: str):
+    text = m.get("text", "")
+    frame = try_decode_frame(text)
+    if not frame:
+        return
+    
+    with _state_lock:
+        deals = load_json_safe(DEAL_STATE_FILE, {"deals": {}})
+        deal_map = deals.setdefault("deals", {})
+        ftype = frame.get("type")
+        
+        if ftype == "offer":
+            oid = frame.get("id")
+            if oid not in deal_map:
+                deal_map[oid] = {
+                    "id": oid,
+                    "offer": frame,
+                    "status": "proposed",
+                    "discoveredAt": time.time(),
+                    "room": room,
+                }
+                logger.info(f"[TCLK] Discovered new Offer {oid[:18]}... in /r/{room}: {frame.get('amount')} {frame.get('asset')}")
+                save_json_atomic(DEAL_STATE_FILE, deals)
+        elif ftype in ("accept", "lock", "reveal", "refund", "cancel"):
+            cid = frame.get("contract")
+            for d in deal_map.values():
+                if d.get("contract") == cid or (ftype == "accept" and d.get("id") == frame.get("ref")):
+                    d["status"] = "accepted" if ftype == "accept" else ("locked" if ftype == "lock" else ("claimed" if ftype == "reveal" else ftype))
+                    if ftype == "accept":
+                        d["contract"] = cid
+                        d["statement"] = frame.get("statement")
+                    elif ftype == "lock":
+                        d["rail"] = frame.get("rail")
+                        d["railRef"] = frame.get("ref")
+                    elif ftype == "reveal":
+                        d["secret"] = frame.get("secret")
+                    logger.info(f"[TCLK] Updated contract {cid[:18] if cid else 'deal'}... to status '{d['status']}'")
+                    save_json_atomic(DEAL_STATE_FILE, deals)
+                    break
+
+
 def process_room(room: str, state: dict, priv: ed25519.Ed25519PrivateKey, did: str):
     with _state_lock:
         since = state.setdefault("room_seen_seqs", {}).get(room, 0)
@@ -355,6 +405,11 @@ def process_room(room: str, state: dict, priv: ed25519.Ed25519PrivateKey, did: s
             seq = m.get("seq", 0)
 
             if sender in (did, "~server", "server", "system") or not text:
+                continue
+
+            # Check for TCLK Protocol frames
+            if is_tclk_line(text):
+                process_tclk_message(m, room, priv, did)
                 continue
 
             assessment = analyze_message(sender, text, room=room)
@@ -386,6 +441,16 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
     logger.info(f"  Heartbeat Interval: ~{heartbeat_interval_mins} mins")
     logger.info("  Active Rooms: /r/lobby + All Discoverable Global Rooms")
     logger.info("=" * 60)
+
+    # Advertise TCLK capabilities to sharded DID directory
+    try:
+        status, _ = publish_sharded_did(priv, did, tclk_token="tclk1:paper-htlc,evm-htlc,flop-htlc")
+        if status == 200:
+            logger.info("[+] Published TCLK capabilities to sharded DID note: 'tclk1:paper-htlc,evm-htlc,flop-htlc'")
+        else:
+            logger.info(f"[*] DID note update status: HTTP {status}")
+    except Exception as e:
+        logger.warning(f"[-] Could not publish TCLK capability note: {e}")
 
     last_heartbeat_time = 0
     last_discovery_time = 0

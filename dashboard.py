@@ -47,6 +47,14 @@ from sentinel_core import (
     sign_message,
 )
 from sentinel import analyze_message, evaluate_room_health
+from tclk import (
+    derive_deal_room,
+    encode_frame,
+    generate_hash_lock,
+    make_accept,
+    make_offer,
+    make_reveal,
+)
 
 # Server configuration
 HOST = "127.0.0.1"
@@ -560,7 +568,14 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
             self.send_json(timeline_payload)
             return
 
-        # 9. Web Dashboard UI
+        # 9. API: TCLK Deals & Escrows
+        elif path == "/api/tclk/deals":
+            deals_path = os.path.join(os.path.dirname(__file__), "deal_state.json")
+            deals_data = load_json_safe(deals_path, {"deals": {}})
+            self.send_json(deals_data)
+            return
+
+        # 10. Web Dashboard UI
         elif path in ("/", "/index.html"):
             ui_html = render_dashboard_html()
             self.send_html(ui_html)
@@ -738,6 +753,140 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
             except Exception as err:
                 logger.error(f"[!] Error publishing identity: {err}")
                 self.send_json({"error": str(err)}, status=500)
+            return
+
+        # 6. API: Create TCLK Offer
+        elif path == "/api/tclk/offer":
+            role = body.get("role", "payer")
+            amount = str(body.get("amount", "1000"))
+            asset = body.get("asset", "FLOP")
+            rails = body.get("rails", ["paper-htlc", "evm-htlc"])
+            task = body.get("task", "Autonomous agent task")
+            
+            try:
+                priv, did = load_or_create_identity()
+                offer = make_offer(
+                    from_did=did,
+                    role=role,
+                    amount=amount,
+                    asset=asset,
+                    lock="hash",
+                    rails=rails,
+                    job={"proto": "a2a", "id": f"task-{int(time.time())}", "context": task},
+                )
+                offer_line = encode_frame(offer)
+                
+                # Queue broadcast to /r/tclk-offers with numeric transport nonce
+                t_nonce = get_next_nonce('tclk-offers')
+                swept_text, sig = sign_message(priv, 'tclk-offers', t_nonce, offer_line)
+                OUTBOUND_MSG_QUEUE.put({
+                    'room': 'tclk-offers',
+                    'did': did,
+                    'sig': sig,
+                    'nonce': t_nonce,
+                    'swept_text': swept_text
+                })
+                
+                deals_path = os.path.join(os.path.dirname(__file__), "deal_state.json")
+                deals_data = load_json_safe(deals_path, {"deals": {}})
+                deals_data.setdefault("deals", {})[offer["id"]] = {
+                    "id": offer["id"],
+                    "offer": offer,
+                    "status": "proposed",
+                    "createdAt": time.time(),
+                    "room": "tclk-offers"
+                }
+                save_json_atomic(deals_path, deals_data)
+                
+                self.send_json({"success": True, "offer": offer, "wireLine": offer_line})
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
+            return
+
+        # 7. API: Accept TCLK Offer
+        elif path == "/api/tclk/accept":
+            offer = body.get("offer")
+            if not offer:
+                self.send_json({"error": "Missing offer object"}, status=400)
+                return
+            try:
+                priv, did = load_or_create_identity()
+                preimage, statement = generate_hash_lock()
+                accept = make_accept(from_did=did, offer=offer, statement=statement)
+                accept_line = encode_frame(accept)
+                
+                t_nonce = get_next_nonce('tclk-offers')
+                swept_text, sig = sign_message(priv, 'tclk-offers', t_nonce, accept_line)
+                OUTBOUND_MSG_QUEUE.put({
+                    'room': 'tclk-offers',
+                    'did': did,
+                    'sig': sig,
+                    'nonce': t_nonce,
+                    'swept_text': swept_text
+                })
+                
+                deals_path = os.path.join(os.path.dirname(__file__), "deal_state.json")
+                deals_data = load_json_safe(deals_path, {"deals": {}})
+                oid = offer.get("id")
+                deals_data.setdefault("deals", {})[oid] = {
+                    "id": oid,
+                    "contract": accept["contract"],
+                    "offer": offer,
+                    "accept": accept,
+                    "statement": statement,
+                    "secretPreimage": preimage,
+                    "status": "accepted",
+                    "updatedAt": time.time(),
+                    "dealRoom": derive_deal_room(accept["contract"])
+                }
+                save_json_atomic(deals_path, deals_data)
+                
+                self.send_json({
+                    "success": True,
+                    "contract": accept["contract"],
+                    "secretPreimage": preimage,
+                    "statement": statement,
+                    "dealRoom": derive_deal_room(accept["contract"])
+                })
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
+            return
+
+        # 8. API: Reveal TCLK Secret
+        elif path == "/api/tclk/reveal":
+            cid = body.get("contract")
+            secret = body.get("secret")
+            if not cid or not secret:
+                self.send_json({"error": "Missing contract or secret"}, status=400)
+                return
+            try:
+                priv, did = load_or_create_identity()
+                reveal_frame = make_reveal(from_did=did, contract=cid, secret=secret)
+                reveal_line = encode_frame(reveal_frame)
+                deal_room = derive_deal_room(cid)
+                t_nonce = get_next_nonce(deal_room)
+                swept_text, sig = sign_message(priv, deal_room, t_nonce, reveal_line)
+                
+                OUTBOUND_MSG_QUEUE.put({
+                    'room': deal_room,
+                    'did': did,
+                    'sig': sig,
+                    'nonce': t_nonce,
+                    'swept_text': swept_text
+                })
+                
+                deals_path = os.path.join(os.path.dirname(__file__), "deal_state.json")
+                deals_data = load_json_safe(deals_path, {"deals": {}})
+                for d in deals_data.setdefault("deals", {}).values():
+                    if d.get("contract") == cid:
+                        d["status"] = "claimed"
+                        d["secret"] = secret
+                        break
+                save_json_atomic(deals_path, deals_data)
+                
+                self.send_json({"success": True, "contract": cid, "status": "claimed"})
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
             return
 
         else:
@@ -1198,12 +1347,14 @@ def render_dashboard_html() -> str:
 
         <div class="ribbon-actions">
             <button class="hud-btn" id="perspectiveBtn" onclick="cyclePerspective()">🌌 Galaxy Orbit</button>
+            <button class="hud-btn" id="tclkModeBtn" style="border-color: #10b981; color: #6ee7b7; font-weight: 700;" onclick="setPerspective('tclk')">🤝 TCLK Live Mode</button>
             <button class="hud-btn" style="border-color: #00f5ff; color: #7df9ff;" onclick="triggerHyperDefenseOverdrive()">⚡ Hyper-Defense</button>
             <button class="hud-btn" id="audioToggle" onclick="toggleAudio()">🔊 Sound ON</button>
             <button class="hud-btn" id="liteModeBtn" onclick="toggleLiteMode()" style="border-color: #8b5cf6; color: #c4b5fd;">🍃 Lite Mode</button>
             <button class="hud-btn" onclick="toggleDrawer('composerDrawer')">✍️ Broadcast</button>
             <button class="hud-btn" onclick="toggleDrawer('terminalDrawer')">🖥️ Console</button>
             <button class="hud-btn" onclick="toggleDrawer('toolsDrawer')">🔐 Tools</button>
+            <button class="hud-btn" style="border-color: #10b981; color: #a7f3d0;" onclick="toggleDrawer('tclkDrawer'); loadTclkDeals();">🤝 TCLK Deals</button>
         </div>
     </div>
     <div class="ribbon-subtext">
@@ -1322,6 +1473,44 @@ def render_dashboard_html() -> str:
     <button class="hud-btn" id="sendBtn" onclick="sendSignedMessage()" style="background: #10b981; color: #000; font-weight: 800; justify-content: center; padding: 10px;">
         Sign & Broadcast 🚀
     </button>
+</div>
+
+<!-- Drawer: TCLK Escrow Deals -->
+<div class="drawer" id="tclkDrawer" style="width: 440px;">
+    <div class="drawer-header">
+        <span>🤝 TCLK Escrow & Bounty Deals</span>
+        <button class="drawer-close" onclick="toggleDrawer('tclkDrawer')">✕</button>
+    </div>
+    <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+        <button class="hud-btn" onclick="const f=document.getElementById('tclkOfferForm'); f.style.display = f.style.display === 'none' ? 'block' : 'none';" style="flex: 1; justify-content: center; background: #064e3b; border-color: #10b981; color: #a7f3d0;">+ Propose Bounty</button>
+        <button class="hud-btn" onclick="loadTclkDeals()" style="justify-content: center;">🔄 Refresh</button>
+    </div>
+
+    <!-- Quick Proposal Form -->
+    <div id="tclkOfferForm" style="display: none; background: #030a07; border: 1px solid #10b981; border-radius: 6px; padding: 10px; margin-bottom: 10px;">
+        <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Task Description:</div>
+        <input type="text" id="tclkTaskInput" placeholder="e.g. Scrape & summarize dataset" class="composer-input" style="min-height: auto; padding: 5px; margin-bottom: 6px;">
+        
+        <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+            <div style="flex: 1;">
+                <div style="font-size: 10px; color: #86efac;">Amount:</div>
+                <input type="text" id="tclkAmountInput" value="5000" class="composer-input" style="min-height: auto; padding: 5px;">
+            </div>
+            <div style="flex: 1;">
+                <div style="font-size: 10px; color: #86efac;">Asset:</div>
+                <input type="text" id="tclkAssetInput" value="FLOP" class="composer-input" style="min-height: auto; padding: 5px;">
+            </div>
+        </div>
+
+        <button class="hud-btn" onclick="submitTclkOffer()" style="width: 100%; justify-content: center; background: #10b981; color: #000; font-weight: 800;">
+            Broadcast Offer to /r/tclk-offers 🚀
+        </button>
+    </div>
+
+    <!-- Deals Feed -->
+    <div id="tclkDealList" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
+        <div style="color: #6ee7b7; font-size: 11px;">Loading active contracts from /api/tclk/deals...</div>
+    </div>
 </div>
 
 <!-- Drawer 2: Terminal Console -->
@@ -1476,24 +1665,32 @@ def render_dashboard_html() -> str:
         }});
     }}
 
-    function cyclePerspective() {{
-        const modes = ['galaxy', 'neural', 'isometric'];
-        const idx = (modes.indexOf(currentMode) + 1) % modes.length;
-        currentMode = modes[idx];
-        
+    function setPerspective(mode) {{
+        currentMode = mode;
         const labels = {{
             'galaxy': '🌌 Galaxy Orbit',
             'neural': '⚡ Neural Mesh',
-            'isometric': '📐 2.5D Isometric'
+            'isometric': '📐 2.5D Isometric',
+            'tclk': '🤝 TCLK Escrow Grid'
         }};
         const badgeLabels = {{
             'galaxy': '🌌 CELESTIAL GALAXY',
             'neural': '⚡ NEURAL CONSTELLATION',
-            'isometric': '📐 2.5D ISOMETRIC MATRIX'
+            'isometric': '📐 2.5D ISOMETRIC MATRIX',
+            'tclk': '🤝 TCLK CRYPTOGRAPHIC ESCROW GRID'
         }};
-        document.getElementById('perspectiveBtn').innerText = labels[currentMode];
-        document.getElementById('perspectiveLbl').innerText = badgeLabels[currentMode];
-        playBeep(currentMode === 'galaxy' ? 700 : 900, 'triangle', 0.08);
+        document.getElementById('perspectiveBtn').innerText = labels[currentMode] || labels['galaxy'];
+        document.getElementById('perspectiveLbl').innerText = badgeLabels[currentMode] || badgeLabels['galaxy'];
+        playBeep(currentMode === 'tclk' ? 880 : 700, 'triangle', 0.08);
+        if (currentMode === 'tclk') {{
+            loadTclkDeals();
+        }}
+    }}
+
+    function cyclePerspective() {{
+        const modes = ['galaxy', 'neural', 'isometric', 'tclk'];
+        const idx = (modes.indexOf(currentMode) + 1) % modes.length;
+        setPerspective(modes[idx]);
     }}
 
     function toggleDrawer(id) {{
@@ -1641,15 +1838,27 @@ def render_dashboard_html() -> str:
         }}
 
         getScreenPos() {{
+            const cx = sCanvas.width / 2;
+            const cy = sCanvas.height / 2;
             if (currentMode === 'isometric') {{
-                const cx = sCanvas.width / 2;
-                const cy = sCanvas.height / 2;
                 const relX = this.x - cx;
                 const relY = this.y - cy;
                 return {{
                     x: cx + (relX - relY) * 0.82,
                     y: cy + (relX + relY) * 0.44,
                     scale: 0.85 + (this.y / sCanvas.height) * 0.3
+                }};
+            }}
+            if (currentMode === 'tclk') {{
+                if (this.isMaster) {{
+                    return {{ x: cx, y: cy - 120, scale: 1.2 }};
+                }}
+                const rx = sCanvas.width * 0.36;
+                const ry = sCanvas.height * 0.32;
+                return {{
+                    x: cx + Math.cos(this.angle) * rx,
+                    y: cy + Math.sin(this.angle) * ry,
+                    scale: 1.05
                 }};
             }}
             return {{ x: this.x, y: this.y, scale: 1.0 }};
@@ -1962,13 +2171,168 @@ def render_dashboard_html() -> str:
         }});
     }}
 
+    let tclkVaultAngle = 0;
+
+    function drawTclkEscrowMatrix(cx, cy) {{
+        tclkVaultAngle += 0.02;
+
+        // 1. Draw Cryptographic Floor Grid
+        sCtx.save();
+        sCtx.strokeStyle = 'rgba(16, 185, 129, 0.07)';
+        sCtx.lineWidth = 1;
+        const step = 45;
+        for (let x = 0; x < sCanvas.width; x += step) {{
+            sCtx.beginPath();
+            sCtx.moveTo(x, 0);
+            sCtx.lineTo(x, sCanvas.height);
+            sCtx.stroke();
+        }}
+        for (let y = 0; y < sCanvas.height; y += step) {{
+            sCtx.beginPath();
+            sCtx.moveTo(0, y);
+            sCtx.lineTo(sCanvas.width, y);
+            sCtx.stroke();
+        }}
+
+        // 2. Central Escrow Vault Core (Settlement Rail)
+        const deals = window.tclkLiveDeals || {{}};
+        const dealKeys = Object.keys(deals);
+        let totalLockedVal = 0;
+        let activeEscrowCount = 0;
+
+        dealKeys.forEach(k => {{
+            const d = deals[k];
+            const amt = parseFloat((d.offer && d.offer.amount) || 0);
+            if (d.status === 'locked' || d.status === 'accepted' || d.status === 'claimed') {{
+                totalLockedVal += amt;
+                activeEscrowCount++;
+            }}
+        }});
+
+        // Rotating Vault Rings
+        const r1 = 70 + Math.sin(tclkVaultAngle * 2) * 4;
+        sCtx.beginPath();
+        sCtx.arc(cx, cy, r1, 0, Math.PI * 2);
+        sCtx.strokeStyle = 'rgba(0, 245, 255, 0.35)';
+        sCtx.lineWidth = 2;
+        sCtx.stroke();
+
+        // Rotating Hexagon/Segments
+        sCtx.save();
+        sCtx.translate(cx, cy);
+        sCtx.rotate(tclkVaultAngle);
+        sCtx.strokeStyle = '#10b981';
+        sCtx.lineWidth = 2.5;
+        sCtx.shadowColor = '#10b981';
+        sCtx.shadowBlur = 15;
+        sCtx.beginPath();
+        for (let i = 0; i < 6; i++) {{
+            const a = (i * Math.PI) / 3;
+            const hx = Math.cos(a) * 50;
+            const hy = Math.sin(a) * 50;
+            if (i === 0) sCtx.moveTo(hx, hy);
+            else sCtx.lineTo(hx, hy);
+        }}
+        sCtx.closePath();
+        sCtx.stroke();
+
+        // Counter-rotating Inner Square/Shield
+        sCtx.rotate(-tclkVaultAngle * 2.5);
+        sCtx.strokeStyle = '#fbbf24';
+        sCtx.lineWidth = 1.5;
+        sCtx.strokeRect(-20, -20, 40, 40);
+        sCtx.restore();
+
+        // Central Vault Telemetry Text
+        sCtx.textAlign = 'center';
+        sCtx.fillStyle = '#fff';
+        sCtx.font = 'bold 11px Courier New';
+        sCtx.fillText('FLOP HTLC VAULT', cx, cy - 8);
+        sCtx.fillStyle = '#10b981';
+        sCtx.font = '900 13px Courier New';
+        sCtx.fillText(`${{totalLockedVal.toLocaleString()}} FLOP`, cx, cy + 10);
+        sCtx.font = '9px Courier New';
+        sCtx.fillStyle = '#86efac';
+        sCtx.fillText(`${{activeEscrowCount}} ACTIVE ESCROWS`, cx, cy + 24);
+
+        // 3. Connect Live Deals between Nodes and Central Vault
+        if (nodes.length >= 2 && dealKeys.length > 0) {{
+            dealKeys.slice(-6).forEach((k, idx) => {{
+                const d = deals[k];
+                const off = d.offer || {{}};
+                const status = (d.status || 'proposed').toUpperCase();
+
+                const pIdx = (idx * 2) % nodes.length;
+                const wIdx = (idx * 2 + 1) % nodes.length;
+                const payerNode = nodes[pIdx];
+                const payeeNode = nodes[wIdx];
+
+                const pPos = payerNode.getScreenPos();
+                const wPos = payeeNode.getScreenPos();
+
+                let beamColor = 'rgba(139, 92, 246, 0.7)';
+                let glowColor = '#8b5cf6';
+                if (status === 'LOCKED') {{
+                    beamColor = 'rgba(0, 245, 255, 0.85)';
+                    glowColor = '#00f5ff';
+                }} else if (status === 'CLAIMED') {{
+                    beamColor = 'rgba(16, 185, 129, 0.9)';
+                    glowColor = '#10b981';
+                }} else if (status === 'ACCEPTED') {{
+                    beamColor = 'rgba(251, 191, 36, 0.8)';
+                    glowColor = '#fbbf24';
+                }}
+
+                // Laser Escrow Beam: Payer -> Vault -> Payee
+                sCtx.save();
+                sCtx.beginPath();
+                sCtx.moveTo(pPos.x, pPos.y);
+                sCtx.lineTo(cx, cy);
+                sCtx.lineTo(wPos.x, wPos.y);
+                sCtx.strokeStyle = beamColor;
+                sCtx.lineWidth = 2;
+                sCtx.shadowColor = glowColor;
+                sCtx.shadowBlur = 10;
+                sCtx.stroke();
+
+                // Animated Cryptographic Packets along the beam
+                const tProg = (Date.now() / 1500 + idx * 0.3) % 1;
+                const packetX = pPos.x + (cx - pPos.x) * tProg;
+                const packetY = pPos.y + (cy - pPos.y) * tProg;
+
+                sCtx.fillStyle = glowColor;
+                sCtx.shadowColor = glowColor;
+                sCtx.shadowBlur = 12;
+                sCtx.beginPath();
+                sCtx.arc(packetX, packetY, 4, 0, Math.PI * 2);
+                sCtx.fill();
+
+                // Floating Deal Tag
+                const midX = (pPos.x + cx) / 2;
+                const midY = (pPos.y + cy) / 2;
+                sCtx.fillStyle = 'rgba(2, 6, 5, 0.85)';
+                sCtx.strokeStyle = glowColor;
+                sCtx.lineWidth = 1;
+                sCtx.fillRect(midX - 50, midY - 12, 100, 20);
+                sCtx.strokeRect(midX - 50, midY - 12, 100, 20);
+
+                sCtx.fillStyle = '#fff';
+                sCtx.font = 'bold 9px Courier New';
+                sCtx.fillText(`[${{status}}] ${{off.amount || ''}}`, midX, midY + 2);
+                sCtx.restore();
+            }});
+        }}
+
+        sCtx.restore();
+    }}
+
     // Animation Loop
     function animate() {{
         sCtx.clearRect(0, 0, sCanvas.width, sCanvas.height);
         const cx = sCanvas.width / 2;
         const cy = sCanvas.height / 2;
 
-        // 1. Draw Celestial Orbital Rings (Galaxy Mode)
+        // 1. Draw Mode Graphics
         if (currentMode === 'galaxy') {{
             [90, 135, 180, 225, 270, 315].forEach((r, idx) => {{
                 sCtx.beginPath();
@@ -1995,6 +2359,8 @@ def render_dashboard_html() -> str:
                     }}
                 }}
             }}
+        }} else if (currentMode === 'tclk') {{
+            drawTclkEscrowMatrix(cx, cy);
         }}
 
         // 2. Draw Shockwaves
@@ -2211,6 +2577,12 @@ def render_dashboard_html() -> str:
                 syncNodes(data.nodes);
             }}
 
+            try {{
+                const dRes = await fetch('/api/tclk/deals');
+                const dData = await dRes.json();
+                window.tclkLiveDeals = dData.deals || {{}};
+            }} catch (err) {{}}
+
             if (data.recent_messages && data.recent_messages.length > 0 && Math.random() < 0.7) {{
                 const msg = data.recent_messages[Math.floor(Math.random() * data.recent_messages.length)];
                 const node = nodes.find(n => n.id === msg.from) || nodes[Math.floor(Math.random() * nodes.length)];
@@ -2249,6 +2621,77 @@ def render_dashboard_html() -> str:
     function applyMacro(t) {{
         document.getElementById('messageInput').value = t;
         playBeep(700, 'sine', 0.05);
+    }}
+
+    async function loadTclkDeals() {{
+        const listEl = document.getElementById('tclkDealList');
+        if (!listEl) return;
+        try {{
+            const res = await fetch('/api/tclk/deals');
+            const data = await res.json();
+            const deals = data.deals || {{}};
+            const keys = Object.keys(deals);
+            if (keys.length === 0) {{
+                listEl.innerHTML = '<div style="color: #64748b; font-size: 11px; text-align: center; padding: 20px;">No active deals yet. Propose one or watch /r/tclk-offers!</div>';
+                return;
+            }}
+            let html = '';
+            for (const k of keys.reverse()) {{
+                const d = deals[k];
+                const off = d.offer || {{}};
+                const status = (d.status || 'proposed').toUpperCase();
+                const statusColor = status === 'CLAIMED' ? '#10b981' : (status === 'LOCKED' ? '#00f5ff' : (status === 'ACCEPTED' ? '#fbbf24' : '#8b5cf6'));
+                
+                html += `
+                <div style="background: #05140e; border: 1px solid #133324; border-radius: 6px; padding: 10px; display: flex; flex-direction: column; gap: 4px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-weight: 800; font-size: 11px; color: ${{statusColor}};">[${{status}}]</span>
+                        <span style="font-size: 12px; font-weight: 900; color: #fff;">${{off.amount || '0'}} ${{off.asset || ''}}</span>
+                    </div>
+                    <div style="font-size: 10px; color: #86efac; word-break: break-all;"><b>Contract:</b> ${{d.contract || d.id || 'Pending'}}</div>
+                    ${{off.job ? `<div style="font-size: 10px; color: #cbd5e1;"><b>Task:</b> ${{off.job.context || off.job.id}}</div>` : ''}}
+                    <div style="display: flex; justify-content: space-between; font-size: 9px; color: #4e786b; margin-top: 4px;">
+                        <span>Rail: ${{(off.rails || ['paper-htlc'])[0]}}</span>
+                        <span>Room: ${{d.room || d.dealRoom || 'tclk-offers'}}</span>
+                    </div>
+                    ${{d.secret ? `<div style="font-size: 9px; color: #10b981; word-break: break-all;"><b>Witness Secret:</b> ${{d.secret}}</div>` : ''}}
+                </div>`;
+            }}
+            listEl.innerHTML = html;
+        }} catch (e) {{
+            listEl.innerHTML = `<div style="color: #ef4444; font-size: 11px;">Error loading deals: ${{e.message}}</div>`;
+        }}
+    }}
+
+    async function submitTclkOffer() {{
+        const task = (document.getElementById('tclkTaskInput').value || '').trim();
+        const amount = (document.getElementById('tclkAmountInput').value || '').trim();
+        const asset = (document.getElementById('tclkAssetInput').value || 'FLOP').trim();
+        if (!amount || !asset) {{
+            alert('Amount and Asset are required');
+            return;
+        }}
+
+        try {{
+            const res = await fetch('/api/tclk/offer', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${{sessionToken}}`
+                }},
+                body: JSON.stringify({{ role: 'payer', amount: amount, asset: asset, task: task }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                alert('TCLK Bounty Offer broadcast to /r/tclk-offers!');
+                document.getElementById('tclkOfferForm').style.display = 'none';
+                loadTclkDeals();
+            }} else {{
+                alert(`Error: ${{data.error}}`);
+            }}
+        }} catch (e) {{
+            alert(`Network error: ${{e.message}}`);
+        }}
     }}
 
     async function sendSignedMessage() {{

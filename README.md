@@ -117,35 +117,39 @@ python run_all_tests.py
 ```
 
 ### Test Suite Summary (19/19 Tests Passing)
+### 🤝 Feature 4: Technocore Lock Protocol (tclk/1) & EVM Escrows
+* **Trustless Bilateral Coordination:** Implements pure, fail-closed `tclk/1` state machine (`proposed` -> `accepted` -> `locked` -> `claimed` / `refunded`).
+* **Canonical JSON & Deterministic Hashing:** Sorted keys, compact format, ASCII escaping, and domain-separated Offer/Contract identifiers.
+* **Solidity Smart Contract (`contracts/FlopHtlc.sol`):** Trustless on-chain HTLC escrow supporting native ETH and ERC-20 ($FLOP/USDC) with timelock protection.
+* **Model Context Protocol (MCP) Server (`tclk_mcp_server.py`):** Exposes programmatic tools (`tclk_make_offer`, `tclk_accept_offer`, `tclk_make_lock`, `tclk_make_reveal`, `tclk_verify_transcript`) for LLMs (Claude, Cursor, Antigravity).
+* **Cinematic TCLK Escrow Matrix:** Interactive visualizer displaying rotating central HTLC Vault, live cryptographic laser channels, and floating deal badges.
+
+---
+
+## 🧪 Rigorous Verification & Test Suite
+
+The unified test suite rigorously verifies all components across **43 tests**:
+
+```powershell
+python run_all_tests.py
+```
+
 ```text
 =================================================================
   RUNNING COMPLETE TECHNOCORE SENTINEL TEST SUITE
 =================================================================
-test_01_base58_roundtrip (test_sentinel_core.TestSentinelCore) ....................... ok
-test_02_did_validation_and_parsing (test_sentinel_core.TestSentinelCore) ............. ok
-test_03_unicode_canonical_sweep (test_sentinel_core.TestSentinelCore) ................ ok
-test_04_per_room_monotonic_nonces_concurrent (test_sentinel_core.TestSentinelCore) ... ok
-test_05_windows_safe_atomic_io (test_sentinel_core.TestSentinelCore) ................. ok
-test_06_signing_and_cryptographic_verification (test_sentinel_core.TestSentinelCore) . ok
-test_01_homoglyph_normalization (test_sentinel.TestSentinelThreatEngine) ............. ok
-test_02_benign_messages_clean (test_sentinel.TestSentinelThreatEngine) ............... ok
-test_03_prompt_injection_detection (test_sentinel.TestSentinelThreatEngine) .......... ok
-test_04_obfuscated_injection_detection (test_sentinel.TestSentinelThreatEngine) ...... ok
-test_05_fake_token_and_phishing_detection (test_sentinel.TestSentinelThreatEngine) ... ok
-test_06_provenance_and_impersonation (test_sentinel.TestSentinelThreatEngine) ......... ok
-test_07_room_health_analytics (test_sentinel.TestSentinelThreatEngine) ............... ok
-test_01_get_status_endpoint (test_dashboard.TestSentinelDashboard) ................... ok
-test_02_get_rooms_and_feed_endpoints (test_dashboard.TestSentinelDashboard) .......... ok
-test_03_get_html_ui (test_dashboard.TestSentinelDashboard) ........................... ok
-test_04_unauthorized_mutations_blocked (test_dashboard.TestSentinelDashboard) ........ ok
-test_05_authenticated_post_validation (test_dashboard.TestSentinelDashboard) ......... ok
-test_06_authenticated_post_send_pipeline (test_dashboard.TestSentinelDashboard) ...... ok
-
+test_sentinel_core.py     (8 tests)  ... OK (Base58, did:key, Canonical Sweeper, Monotonic Nonces)
+test_sentinel.py          (11 tests) ... OK (Prompt Injection, Homoglyphs, Fake Tokens, Provenance)
+test_dashboard.py         (11 tests) ... OK (Local Auth, CORS, REST API, TCLK Deals Endpoints)
+test_tclk.py              (8 tests)  ... OK (Canonical JSON, Hashing, State Machine, PaperRail)
+test_evm_rail.py          (3 tests)  ... OK (EVM Rail Lock, Claim, Timelock Refund)
+test_mcp_server.py        (2 tests)  ... OK (MCP Tools Catalog, End-to-End MCP Deal Negotiation)
 ----------------------------------------------------------------------
-Ran 19 tests in 1.281s
+Ran 43 tests in 1.463s
 
+OK
 =================================================================
-  [SUCCESS] ALL 19 TESTS PASSED (100% VERIFIED)
+  [SUCCESS] ALL 43 TESTS PASSED (100% VERIFIED)
 =================================================================
 ```
 
