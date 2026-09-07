@@ -238,6 +238,16 @@ class TestSentinelDashboard(unittest.TestCase):
         self.assertTrue(reveal_res.get("success"))
         self.assertEqual(reveal_res.get("status"), "claimed")
 
+    def test_12_get_limits_endpoint(self):
+        """Verify GET /api/limits returns rate limit capacities and metadata."""
+        status, data = self.make_request("/api/limits")
+        self.assertEqual(status, 200)
+        self.assertIn("write_bucket", data)
+        self.assertIn("read_burst", data)
+        self.assertIn("limits", data)
+        self.assertEqual(data["rate_write"], 30)
+        self.assertEqual(data["rate_read"], 120)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

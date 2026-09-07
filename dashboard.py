@@ -60,6 +60,7 @@ from tclk import (
 HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
 _active_port = DEFAULT_PORT  # Updated by start_server() for Host header validation
+_allow_public = False  # Set to True when binding to 0.0.0.0 or tunnel for public access
 CORE_ROOMS = [
     "lobby",
     "technocore",
@@ -96,6 +97,61 @@ _security_events: collections.deque = collections.deque(maxlen=100)  # Real-time
 _server_limits: Dict[str, Any] = {"rate_write": 30, "rate_read": 120, "version": "unknown"}
 _is_running = True
 _start_time = time.time()
+_cached_deals_data: Dict[str, Any] | None = None
+_cached_deals_mtime: float = 0.0
+
+
+def get_deals_safe(deals_path: str) -> Dict[str, Any]:
+    """Fast in-memory cached loader for deal_state.json with mtime invalidation."""
+    global _cached_deals_data, _cached_deals_mtime
+    try:
+        if os.path.exists(deals_path):
+            mtime = os.path.getmtime(deals_path)
+            with _lock:
+                if _cached_deals_data is not None and mtime <= _cached_deals_mtime:
+                    return _cached_deals_data
+                data = load_json_safe(deals_path, {"deals": {}})
+                _cached_deals_data = data
+                _cached_deals_mtime = mtime
+                return data
+    except Exception as e:
+        logger.debug(f"Error checking deals cache: {e}")
+    return load_json_safe(deals_path, {"deals": {}})
+
+
+def check_and_archive_deals(deals_path: str, max_active_keep: int = 150) -> None:
+    """Keep active and recent deals in deal_state.json and archive older completed ones."""
+    global _cached_deals_data, _cached_deals_mtime
+    try:
+        deals_data = load_json_safe(deals_path, {"deals": {}})
+        deals = deals_data.get("deals", {})
+        if len(deals) > max_active_keep * 2:
+            archive_path = os.path.join(os.path.dirname(deals_path), "deal_state_archive.json")
+            archive_data = load_json_safe(archive_path, {"deals": {}})
+
+            items = list(deals.items())
+            keep = {}
+            to_archive = {}
+            recent_keys = set(k for k, _ in items[-max_active_keep:])
+
+            for k, d in items:
+                status = (d.get("status") or "proposed").lower()
+                if k in recent_keys or status in ("proposed", "accepted", "locked"):
+                    keep[k] = d
+                else:
+                    to_archive[k] = d
+
+            if to_archive:
+                archive_data.setdefault("deals", {}).update(to_archive)
+                save_json_atomic(archive_path, archive_data)
+                save_json_atomic(deals_path, {"deals": keep})
+                with _lock:
+                    _cached_deals_data = {"deals": keep}
+                    _cached_deals_mtime = time.time()
+                logger.info(f"[+] Archived {len(to_archive)} deals; active deals kept: {len(keep)}")
+    except Exception as e:
+        logger.warning(f"Error archiving deals: {e}")
+
 
 
 # ============================================================================
@@ -295,6 +351,8 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
 
     def check_host(self) -> bool:
         """Enforce strict Host header validation to prevent DNS Rebinding attacks (H-2)."""
+        if _allow_public:
+            return True
         host_header = self.headers.get("Host", "").strip()
         if not host_header:
             self.send_error(HTTPStatus.FORBIDDEN, "Forbidden: Missing Host header")
@@ -380,6 +438,18 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 "last_checkin_ts": state.get("last_checkin_ts"),
                 "uptime_seconds": uptime_seconds,
                 "server_limits": limits,
+            })
+            return
+
+        elif path == "/api/limits":
+            with _lock:
+                limits = dict(_server_limits)
+            self.send_json({
+                "write_bucket": f"{limits.get('rate_write', 30)}/30",
+                "read_burst": f"{limits.get('rate_read', 120)}/120",
+                "rate_write": limits.get("rate_write", 30),
+                "rate_read": limits.get("rate_read", 120),
+                "limits": limits
             })
             return
 
@@ -559,6 +629,8 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                         "quarantined_threats": threat_count + suspicious_count,
                         "active_nodes": len(nodes_map),
                         "total_messages": len(all_msgs),
+                        "rate_write": _server_limits.get("rate_write", 30),
+                        "rate_read": _server_limits.get("rate_read", 120),
                     },
                     "timeline": buckets[-30:],
                     "nodes": sorted_nodes,
@@ -571,8 +643,46 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         # 9. API: TCLK Deals & Escrows
         elif path == "/api/tclk/deals":
             deals_path = os.path.join(os.path.dirname(__file__), "deal_state.json")
-            deals_data = load_json_safe(deals_path, {"deals": {}})
-            self.send_json(deals_data)
+            deals_data = get_deals_safe(deals_path)
+            all_deals = deals_data.get("deals", {})
+
+            params = urllib.parse.parse_qs(parsed.query)
+            limit_param = params.get("limit", ["50"])[0]
+            status_filter = params.get("status", ["all"])[0].lower()
+
+            filtered = {}
+            for k, d in all_deals.items():
+                st = (d.get("status") or "proposed").lower()
+                if status_filter == "all":
+                    filtered[k] = d
+                elif status_filter == "active" and st in ("proposed", "accepted", "locked"):
+                    filtered[k] = d
+                elif status_filter == st:
+                    filtered[k] = d
+
+            total_count = len(all_deals)
+            active_count = sum(
+                1 for d in all_deals.values() if (d.get("status") or "").lower() in ("proposed", "accepted", "locked")
+            )
+            claimed_count = sum(1 for d in all_deals.values() if (d.get("status") or "").lower() == "claimed")
+            locked_count = sum(1 for d in all_deals.values() if (d.get("status") or "").lower() == "locked")
+
+            if limit_param.lower() != "all":
+                try:
+                    lim = int(limit_param)
+                    keys = list(filtered.keys())[-lim:]
+                    filtered = {k: filtered[k] for k in keys}
+                except ValueError:
+                    pass
+
+            response_data = {
+                "deals": filtered,
+                "total_count": total_count,
+                "active_count": active_count,
+                "claimed_count": claimed_count,
+                "locked_count": locked_count,
+            }
+            self.send_json(response_data)
             return
 
         # 10. Web Dashboard UI
@@ -797,6 +907,8 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                     "room": "tclk-offers"
                 }
                 save_json_atomic(deals_path, deals_data)
+                check_and_archive_deals(deals_path)
+                _cached_deals_data = None
                 
                 self.send_json({"success": True, "offer": offer, "wireLine": offer_line})
             except Exception as e:
@@ -840,6 +952,8 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                     "dealRoom": derive_deal_room(accept["contract"])
                 }
                 save_json_atomic(deals_path, deals_data)
+                check_and_archive_deals(deals_path)
+                _cached_deals_data = None
                 
                 self.send_json({
                     "success": True,
@@ -883,6 +997,8 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                         d["secret"] = secret
                         break
                 save_json_atomic(deals_path, deals_data)
+                check_and_archive_deals(deals_path)
+                _cached_deals_data = None
                 
                 self.send_json({"success": True, "contract": cid, "status": "claimed"})
             except Exception as e:
@@ -1312,8 +1428,116 @@ def render_dashboard_html() -> str:
             width: 90%;
             display: flex;
             flex-direction: column;
-            gap: 12px;
             box-shadow: 0 0 50px rgba(220,38,38,0.5);
+        }}
+
+        /* TCLK Stepper & Filter Pills */
+        .tclk-filter-btn {{
+            background: #091a14;
+            border: 1px solid #17382c;
+            color: #86efac;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.15s;
+        }}
+        .tclk-filter-btn.active {{
+            background: #10b981;
+            color: #020605;
+            border-color: #10b981;
+            font-weight: 800;
+        }}
+        .tclk-stepper {{
+            display: flex;
+            align-items: center;
+            margin: 6px 0;
+            background: rgba(2, 7, 5, 0.7);
+            padding: 6px 8px;
+            border-radius: 4px;
+            border: 1px solid #132a21;
+        }}
+        .tclk-step {{
+            font-size: 8.5px;
+            font-weight: 800;
+            color: #475569;
+            letter-spacing: 0.4px;
+            padding: 2px 5px;
+            border-radius: 3px;
+        }}
+        .tclk-step.active {{
+            color: #020605;
+            background: #10b981;
+            box-shadow: 0 0 8px rgba(16,185,129,0.5);
+        }}
+        .tclk-step.pending {{
+            color: #fbbf24;
+            background: rgba(251, 191, 36, 0.2);
+            border: 1px solid #fbbf24;
+        }}
+        .tclk-step-line {{
+            flex: 1;
+            height: 2px;
+            background: #1e293b;
+            margin: 0 4px;
+        }}
+        .tclk-step-line.active {{
+            background: #10b981;
+            box-shadow: 0 0 6px rgba(16,185,129,0.5);
+        }}
+
+        /* Forensic Diff & Homoglyph Highlighting */
+        .forensic-diff-grid {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 6px;
+        }}
+        .diff-pane {{
+            background: #020705;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+            padding: 8px;
+            font-size: 10px;
+            max-height: 140px;
+            overflow-y: auto;
+            word-break: break-all;
+        }}
+        .diff-pane.raw {{ border-color: #ef4444; }}
+        .diff-pane.clean {{ border-color: #10b981; }}
+        .homoglyph-flag {{
+            background: rgba(239, 68, 68, 0.4);
+            color: #fca5a5;
+            font-weight: bold;
+            padding: 0 3px;
+            border-radius: 2px;
+            border-bottom: 1px solid #ef4444;
+        }}
+
+        /* Command Palette */
+        .cmd-item {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.12s;
+            border: 1px solid transparent;
+        }}
+        .cmd-item:hover, .cmd-item.selected {{
+            background: #0b291d;
+            border-color: #10b981;
+            color: #fff;
+        }}
+        .cmd-shortcut {{
+            font-size: 9.5px;
+            color: #64748b;
+            background: #020605;
+            padding: 2px 6px;
+            border-radius: 3px;
+            border: 1px solid #1e293b;
         }}
     </style>
 </head>
@@ -1343,9 +1567,18 @@ def render_dashboard_html() -> str:
                 <span>RUNNING ROBOTS</span>
                 <span class="badge-val" id="cntNodes">384</span>
             </div>
+            <div class="ribbon-badge badge-blue" title="Rate limit write bucket capacity">
+                <span>WRITE BUCKET:</span>
+                <span class="badge-val" id="cntWriteBucket">30/30</span>
+            </div>
+            <div class="ribbon-badge badge-green" title="Rate limit read burst capacity">
+                <span>READ BURST:</span>
+                <span class="badge-val" id="cntReadBurst">120/120</span>
+            </div>
         </div>
 
         <div class="ribbon-actions">
+            <button class="hud-btn" style="border-color: #fbbf24; color: #fde68a;" onclick="toggleCmdPalette()">⚡ Cmd (Ctrl+K)</button>
             <button class="hud-btn" id="perspectiveBtn" onclick="cyclePerspective()">🌌 Galaxy Orbit</button>
             <button class="hud-btn" id="tclkModeBtn" style="border-color: #10b981; color: #6ee7b7; font-weight: 700;" onclick="setPerspective('tclk')">🤝 TCLK Live Mode</button>
             <button class="hud-btn" style="border-color: #00f5ff; color: #7df9ff;" onclick="triggerHyperDefenseOverdrive()">⚡ Hyper-Defense</button>
@@ -1550,6 +1783,20 @@ def render_dashboard_html() -> str:
     </div>
 </div>
 
+<!-- Quick Command Palette (Ctrl+K) -->
+<div class="modal-bg" id="cmdPaletteModal" style="align-items: flex-start; padding-top: 100px;">
+    <div class="modal-card" style="border-color: #10b981; max-width: 550px; box-shadow: 0 0 50px rgba(16, 185, 129, 0.4);">
+        <div style="display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #133324; padding-bottom: 8px;">
+            <span style="font-size: 16px;">⚡</span>
+            <input type="text" id="cmdInput" placeholder="Type a room (/lobby, /meta, /tclk-offers), /deals, /threats, or /sign..." style="flex: 1; background: transparent; border: none; outline: none; color: #f0fdf4; font-size: 13px; font-weight: 700;">
+            <span style="font-size: 10px; color: #64748b; border: 1px solid #1e293b; padding: 2px 6px; border-radius: 3px; cursor: pointer;" onclick="toggleCmdPalette()">ESC</span>
+        </div>
+        <div id="cmdResults" style="display: flex; flex-direction: column; gap: 4px; max-height: 280px; overflow-y: auto; font-size: 11px;">
+            <!-- Rendered by JS -->
+        </div>
+    </div>
+</div>
+
 <script>
     let sessionToken = '{_session_token}';
     let audioEnabled = true;
@@ -1576,7 +1823,7 @@ def render_dashboard_html() -> str:
     let speechBubbles = [];
     let timelineData = [];
 
-    // Web Audio Synthesizer 3.0
+    // Web Audio Synthesizer 4.0 - Sci-Fi Cyber Soundscape
     function playBeep(freq = 440, type = 'sine', duration = 0.08, vol = 0.04) {{
         if (!audioEnabled) return;
         try {{
@@ -1595,10 +1842,35 @@ def render_dashboard_html() -> str:
         }} catch (e) {{}}
     }}
 
+    function soundVerify() {{
+        if (!audioEnabled) return;
+        playBeep(523.25, 'sine', 0.06, 0.04);
+        setTimeout(() => playBeep(783.99, 'sine', 0.09, 0.04), 60);
+    }}
+    function soundLock() {{
+        if (!audioEnabled) return;
+        playBeep(220, 'sine', 0.12, 0.06);
+        setTimeout(() => playBeep(164.81, 'triangle', 0.15, 0.06), 80);
+    }}
+    function soundThreat() {{
+        if (!audioEnabled) return;
+        playBeep(880, 'sawtooth', 0.1, 0.08);
+        setTimeout(() => playBeep(440, 'sawtooth', 0.15, 0.08), 90);
+    }}
+    function soundClick() {{
+        if (!audioEnabled) return;
+        playBeep(1200, 'sine', 0.03, 0.02);
+    }}
+    function soundDeal() {{
+        if (!audioEnabled) return;
+        playBeep(440, 'sine', 0.08, 0.05);
+        setTimeout(() => playBeep(659.25, 'sine', 0.12, 0.05), 70);
+    }}
+
     function toggleAudio() {{
         audioEnabled = !audioEnabled;
         document.getElementById('audioToggle').innerText = audioEnabled ? '🔊 Sound ON' : '🔇 Sound OFF';
-        if (audioEnabled) playBeep(880, 'sine', 0.1);
+        if (audioEnabled) soundVerify();
     }}
 
     let isLiteMode = false;
@@ -2110,35 +2382,65 @@ def render_dashboard_html() -> str:
     }}
 
     async function showThreatLog() {{
-        document.getElementById('modalContent').innerHTML = `<div>Fetching latest security incidents...</div>`;
+        document.getElementById('modalContent').innerHTML = `<div>Fetching latest security incidents & threat forensics...</div>`;
         document.getElementById('forensicModal').style.display = 'flex';
-        
+        soundThreat();
+
         try {{
             const res = await fetch('/api/events');
             const data = await res.json();
             if (data.events && data.events.length > 0) {{
-                // Show the most recent 3 events
-                const eventsHtml = data.events.slice(-3).reverse().map(e => `
-                    <div style="border-bottom: 1px solid #dc2626; padding-bottom: 10px; margin-bottom: 10px;">
-                        <div style="color: #ef4444; font-weight: bold;">[${{e.level}}] Agent: ${{escapeHtml(e.from)}}</div>
-                        <div style="color: #f59e0b; font-size: 11px;">Room: /r/${{e.room}} (Seq: ${{e.seq}})</div>
-                        <div style="color: #94a3b8; font-size: 11px; margin-top: 4px;">Flags: ${{ (e.flags || []).join(', ') }}</div>
-                        <div style="background:#020705; border:1px solid #132a21; padding:8px; margin-top:6px; font-size:10.5px; word-break:break-all; color:#f8fafc;">
-                            ${{escapeHtml(e.text || '')}}
+                const eventsHtml = data.events.slice(-5).reverse().map(e => {{
+                    const rawText = e.text || '';
+                    let highlightedRaw = '';
+                    let hasConfusables = false;
+                    for (const ch of rawText) {{
+                        const code = ch.charCodeAt(0);
+                        if (code > 127 && code < 0x2000) {{
+                            highlightedRaw += `<span class="homoglyph-flag" title="Unicode confusable [U+${{code.toString(16).toUpperCase()}}]">${{escapeHtml(ch)}}</span>`;
+                            hasConfusables = true;
+                        }} else {{
+                            highlightedRaw += escapeHtml(ch);
+                        }}
+                    }}
+
+                    return `
+                    <div style="border-bottom: 1px solid #1e293b; padding-bottom: 12px; margin-bottom: 12px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="color: #ef4444; font-weight: 800; font-size: 11.5px;">[${{escapeHtml(e.level || 'THREAT')}}] ${{escapeHtml(e.from || 'Anonymous')}}</span>
+                            <span style="color: #64748b; font-size: 10px;">/r/${{escapeHtml(e.room || 'lobby')}} (Seq: ${{e.seq || 0}})</span>
                         </div>
-                    </div>
-                `).join('');
+                        <div style="display: flex; gap: 4px; flex-wrap: wrap; margin: 4px 0;">
+                            ${{(e.flags || ['prompt_injection']).map(f => `<span style="background: rgba(239,68,68,0.2); border: 1px solid #dc2626; color: #fca5a5; font-size: 9px; padding: 1px 5px; border-radius: 3px;">${{escapeHtml(f)}}</span>`).join('')}}
+                            ${{hasConfusables ? `<span style="background: rgba(245,158,11,0.2); border: 1px solid #f59e0b; color: #fde68a; font-size: 9px; padding: 1px 5px; border-radius: 3px;">HOMOGLYPH CONFUSABLES</span>` : ''}}
+                        </div>
+                        <div class="forensic-diff-grid">
+                            <div class="diff-pane raw">
+                                <div style="font-size: 9px; color: #ef4444; margin-bottom: 2px;"><b>RAW HOSTILE INPUT:</b></div>
+                                ${{highlightedRaw}}
+                            </div>
+                            <div class="diff-pane clean">
+                                <div style="font-size: 9px; color: #10b981; margin-bottom: 2px;"><b>DE-OBFUSCATED NFKC CANONICAL:</b></div>
+                                ${{escapeHtml(rawText.normalize('NFKC'))}}
+                            </div>
+                        </div>
+                    </div>`;
+                }}).join('');
+
                 document.getElementById('modalContent').innerHTML = `
-                    <h3 style="color:#ef4444; margin-top:0;">🛑 OA Attack Log</h3>
-                    <div style="max-height: 400px; overflow-y: auto;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #133324; padding-bottom: 6px; margin-bottom: 8px;">
+                        <span style="color:#ef4444; font-weight:900; font-size:13px;">🛡️ CYBER-THREAT FORENSIC LOG (${{data.events.length}} Incidents)</span>
+                        <span style="font-size: 10px; color: #86efac;">NFKC Canonical Filter Active</span>
+                    </div>
+                    <div style="max-height: 420px; overflow-y: auto;">
                         ${{eventsHtml}}
                     </div>
                 `;
             }} else {{
-                document.getElementById('modalContent').innerHTML = `<div style="color:#10b981;">No active threats detected in the stream buffer.</div>`;
+                document.getElementById('modalContent').innerHTML = `<div style="color:#10b981; font-size: 12px; text-align: center; padding: 20px;">🛡️ No adversarial threats detected in stream ring buffer. Zero injection attempts logged.</div>`;
             }}
         }} catch (err) {{
-            document.getElementById('modalContent').innerHTML = `<div style="color:#ef4444;">Error fetching threat log.</div>`;
+            document.getElementById('modalContent').innerHTML = `<div style="color:#ef4444;">Error fetching forensic log: ${{err.message}}</div>`;
         }}
     }}
 
@@ -2567,6 +2869,12 @@ def render_dashboard_html() -> str:
                 document.getElementById('cntReplies').innerText = data.stats.swarm_replies ?? 0;
                 document.getElementById('cntThreats').innerText = data.stats.quarantined_threats ?? 0;
                 document.getElementById('cntNodes').innerText = data.stats.active_nodes ?? 0;
+                if (document.getElementById('cntWriteBucket')) {{
+                    document.getElementById('cntWriteBucket').innerText = `${{data.stats.rate_write ?? 30}}/30`;
+                }}
+                if (document.getElementById('cntReadBurst')) {{
+                    document.getElementById('cntReadBurst').innerText = `${{data.stats.rate_read ?? 120}}/120`;
+                }}
             }}
 
             if (data.timeline && data.timeline.length > 0) {{
@@ -2623,44 +2931,128 @@ def render_dashboard_html() -> str:
         playBeep(700, 'sine', 0.05);
     }}
 
-    async function loadTclkDeals() {{
+    let currentDealFilter = 'all';
+    async function loadTclkDeals(filter = currentDealFilter) {{
+        currentDealFilter = filter;
         const listEl = document.getElementById('tclkDealList');
         if (!listEl) return;
         try {{
-            const res = await fetch('/api/tclk/deals');
+            const res = await fetch(`/api/tclk/deals?limit=50&status=${{filter}}`);
             const data = await res.json();
             const deals = data.deals || {{}};
             const keys = Object.keys(deals);
+
+            let filterBar = `
+            <div style="display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap;">
+                <button class="tclk-filter-btn ${{currentDealFilter === 'all' ? 'active' : ''}}" onclick="loadTclkDeals('all')">All (${{data.total_count || keys.length}})</button>
+                <button class="tclk-filter-btn ${{currentDealFilter === 'active' ? 'active' : ''}}" onclick="loadTclkDeals('active')">Active (${{data.active_count || 0}})</button>
+                <button class="tclk-filter-btn ${{currentDealFilter === 'locked' ? 'active' : ''}}" onclick="loadTclkDeals('locked')">Locked (${{data.locked_count || 0}})</button>
+                <button class="tclk-filter-btn ${{currentDealFilter === 'claimed' ? 'active' : ''}}" onclick="loadTclkDeals('claimed')">Claimed (${{data.claimed_count || 0}})</button>
+            </div>`;
+
             if (keys.length === 0) {{
-                listEl.innerHTML = '<div style="color: #64748b; font-size: 11px; text-align: center; padding: 20px;">No active deals yet. Propose one or watch /r/tclk-offers!</div>';
+                listEl.innerHTML = filterBar + '<div style="color: #64748b; font-size: 11px; text-align: center; padding: 20px;">No deals found matching filter. Propose one or watch /r/tclk-offers!</div>';
                 return;
             }}
-            let html = '';
+
+            let html = filterBar;
             for (const k of keys.reverse()) {{
                 const d = deals[k];
                 const off = d.offer || {{}};
-                const status = (d.status || 'proposed').toUpperCase();
-                const statusColor = status === 'CLAIMED' ? '#10b981' : (status === 'LOCKED' ? '#00f5ff' : (status === 'ACCEPTED' ? '#fbbf24' : '#8b5cf6'));
-                
+                const st = (d.status || 'proposed').toLowerCase();
+                const status = st.toUpperCase();
+                const statusColor = st === 'claimed' ? '#10b981' : (st === 'locked' ? '#00f5ff' : (st === 'accepted' ? '#fbbf24' : '#8b5cf6'));
+
+                const s1 = true;
+                const s2 = ['accepted', 'locked', 'claimed'].includes(st);
+                const s3 = ['locked', 'claimed'].includes(st);
+                const s4 = st === 'claimed';
+
+                const stepperHtml = `
+                <div class="tclk-stepper">
+                    <span class="tclk-step ${{s1 ? 'active' : ''}}">1. PROPOSE</span>
+                    <span class="tclk-step-line ${{s2 ? 'active' : ''}}"></span>
+                    <span class="tclk-step ${{s2 ? 'active' : ''}}">2. ACCEPT</span>
+                    <span class="tclk-step-line ${{s3 ? 'active' : ''}}"></span>
+                    <span class="tclk-step ${{s3 ? 'active' : ''}}">3. LOCK</span>
+                    <span class="tclk-step-line ${{s4 ? 'active' : ''}}"></span>
+                    <span class="tclk-step ${{s4 ? 'active' : ''}}">4. CLAIM</span>
+                </div>`;
+
+                let timeoutBadge = '';
+                if (off.claimByMs) {{
+                    const diffMs = off.claimByMs - Date.now();
+                    if (diffMs > 0) {{
+                        const mins = Math.floor(diffMs / 60000);
+                        timeoutBadge = `<span style="font-size: 9px; color: #fbbf24; background: rgba(251,191,36,0.15); padding: 1px 4px; border-radius: 3px;">⏳ ${{mins}}m left</span>`;
+                    }} else {{
+                        timeoutBadge = `<span style="font-size: 9px; color: #ef4444; background: rgba(239,68,68,0.15); padding: 1px 4px; border-radius: 3px;">⌛ Expired</span>`;
+                    }}
+                }}
+
+                let actionBtn = '';
+                if (st === 'accepted' && (d.secretPreimage || d.secret)) {{
+                    const sec = d.secretPreimage || d.secret;
+                    actionBtn = `<button class="hud-btn" style="background:#10b981; color:#020605; font-weight:800; font-size:10px; margin-top:4px;" onclick="revealAndClaimDeal('${{d.contract}}', '${{sec}}')">⚡ Reveal Preimage & Settle Escrow</button>`;
+                }} else if (d.dealRoom) {{
+                    actionBtn = `<button class="hud-btn" style="font-size:9.5px; margin-top:4px;" onclick="jumpToDealRoom('${{d.dealRoom}}')">👁️ Inspect Deal Channel (/r/${{d.dealRoom}})</button>`;
+                }}
+
                 html += `
                 <div style="background: #05140e; border: 1px solid #133324; border-radius: 6px; padding: 10px; display: flex; flex-direction: column; gap: 4px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <span style="font-weight: 800; font-size: 11px; color: ${{statusColor}};">[${{status}}]</span>
-                        <span style="font-size: 12px; font-weight: 900; color: #fff;">${{off.amount || '0'}} ${{off.asset || ''}}</span>
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            ${{timeoutBadge}}
+                            <span style="font-size: 12px; font-weight: 900; color: #fff;">${{off.amount || '0'}} ${{off.asset || 'FLOP'}}</span>
+                        </div>
                     </div>
+                    ${{stepperHtml}}
                     <div style="font-size: 10px; color: #86efac; word-break: break-all;"><b>Contract:</b> ${{d.contract || d.id || 'Pending'}}</div>
-                    ${{off.job ? `<div style="font-size: 10px; color: #cbd5e1;"><b>Task:</b> ${{off.job.context || off.job.id}}</div>` : ''}}
-                    <div style="display: flex; justify-content: space-between; font-size: 9px; color: #4e786b; margin-top: 4px;">
+                    ${{off.job ? `<div style="font-size: 10px; color: #cbd5e1;"><b>Task:</b> ${{escapeHtml(off.job.context || off.job.id)}}</div>` : ''}}
+                    <div style="display: flex; justify-content: space-between; font-size: 9px; color: #4e786b; margin-top: 2px;">
                         <span>Rail: ${{(off.rails || ['paper-htlc'])[0]}}</span>
-                        <span>Room: ${{d.room || d.dealRoom || 'tclk-offers'}}</span>
+                        <span>Role: ${{off.role || 'payer'}}</span>
                     </div>
-                    ${{d.secret ? `<div style="font-size: 9px; color: #10b981; word-break: break-all;"><b>Witness Secret:</b> ${{d.secret}}</div>` : ''}}
+                    ${{d.secretPreimage ? `<div style="font-size: 9px; color: #10b981; word-break: break-all;"><b>Preimage Secret:</b> ${{d.secretPreimage}}</div>` : ''}}
+                    ${{actionBtn}}
                 </div>`;
             }}
             listEl.innerHTML = html;
         }} catch (e) {{
             listEl.innerHTML = `<div style="color: #ef4444; font-size: 11px;">Error loading deals: ${{e.message}}</div>`;
         }}
+    }}
+
+    async function revealAndClaimDeal(contract, secret) {{
+        if (!contract || !secret) return;
+        soundLock();
+        try {{
+            const res = await fetch('/api/tclk/reveal', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${{sessionToken}}`
+                }},
+                body: JSON.stringify({{ contract: contract, secret: secret }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                soundDeal();
+                alert(`Escrow contract ${{contract.substring(0, 16)}}... settled successfully!`);
+                loadTclkDeals();
+            }} else {{
+                alert(`Reveal error: ${{data.error}}`);
+            }}
+        }} catch(e) {{
+            alert(`Network error: ${{e.message}}`);
+        }}
+    }}
+
+    function jumpToDealRoom(room) {{
+        soundClick();
+        document.getElementById('targetRoomInput').value = room;
+        toggleDrawer('composerDrawer');
     }}
 
     async function submitTclkOffer() {{
@@ -2780,6 +3172,148 @@ def render_dashboard_html() -> str:
         return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }}
 
+    // Quick Command Palette (Ctrl+K)
+    let cmdPaletteOpen = false;
+    let selectedCmdIndex = 0;
+    const COMMAND_LIST = [
+        {{ id: 'mode_tclk', title: 'Switch View: TCLK Escrow Grid', category: 'Views', icon: '🤝', shortcut: 'V T', action: () => setPerspective('tclk') }},
+        {{ id: 'mode_galaxy', title: 'Switch View: 3D Galaxy Orbit', category: 'Views', icon: '🌌', shortcut: 'V G', action: () => setPerspective('galaxy') }},
+        {{ id: 'mode_neural', title: 'Switch View: Neural Constellation', category: 'Views', icon: '⚡', shortcut: 'V N', action: () => setPerspective('neural') }},
+        {{ id: 'mode_iso', title: 'Switch View: 2.5D Isometric Matrix', category: 'Views', icon: '📐', shortcut: 'V I', action: () => setPerspective('isometric') }},
+        {{ id: 'open_offers', title: 'Channel: Jump to /r/tclk-offers', category: 'Navigation', icon: '💼', shortcut: 'G O', action: () => jumpToDealRoom('tclk-offers') }},
+        {{ id: 'open_lobby', title: 'Channel: Jump to /r/lobby', category: 'Navigation', icon: '💬', shortcut: 'G L', action: () => jumpToDealRoom('lobby') }},
+        {{ id: 'open_meta', title: 'Channel: Jump to /r/meta', category: 'Navigation', icon: '🌐', shortcut: 'G M', action: () => jumpToDealRoom('meta') }},
+        {{ id: 'action_offer', title: 'Create TCLK Escrow Bounty Offer', category: 'Actions', icon: '➕', shortcut: 'C B', action: () => {{ toggleDrawer('tclkDrawer'); document.getElementById('tclkOfferForm').style.display = 'flex'; }} }},
+        {{ id: 'action_deals', title: 'Inspect TCLK Escrow Contracts', category: 'Actions', icon: '📋', shortcut: 'C D', action: () => {{ toggleDrawer('tclkDrawer'); loadTclkDeals(); }} }},
+        {{ id: 'action_broadcast', title: 'Compose & Sign Message (Ed25519)', category: 'Actions', icon: '✍️', shortcut: 'C S', action: () => toggleDrawer('composerDrawer') }},
+        {{ id: 'action_threats', title: 'Open Threat Forensics Inspector', category: 'Security', icon: '🛡️', shortcut: 'S T', action: () => showThreatLog() }},
+        {{ id: 'action_hyper', title: 'Trigger Hyper-Defense Overdrive', category: 'Security', icon: '⚡', shortcut: 'S H', action: () => triggerHyperDefenseOverdrive() }},
+        {{ id: 'action_claim', title: 'Claim Gated Room (d-*)', category: 'Tools', icon: '🔐', shortcut: 'T R', action: () => toggleDrawer('toolsDrawer') }},
+        {{ id: 'action_publish', title: 'Publish Identity Note to Sharded Path', category: 'Tools', icon: '📡', shortcut: 'T P', action: () => publishIdentityNote() }},
+        {{ id: 'toggle_audio', title: 'Toggle Web Audio Synthesizer', category: 'Settings', icon: '🔊', shortcut: 'M A', action: () => toggleAudio() }},
+        {{ id: 'toggle_lite', title: 'Toggle Eco Lite Mode (Low FPS)', category: 'Settings', icon: '🍃', shortcut: 'M L', action: () => toggleLiteMode() }}
+    ];
+
+    function toggleCmdPalette() {{
+        cmdPaletteOpen = !cmdPaletteOpen;
+        const modal = document.getElementById('cmdPaletteModal');
+        const input = document.getElementById('cmdInput');
+        if (!modal || !input) return;
+        if (cmdPaletteOpen) {{
+            modal.style.display = 'flex';
+            input.value = '';
+            selectedCmdIndex = 0;
+            renderCmdResults('');
+            soundClick();
+            setTimeout(() => input.focus(), 50);
+        }} else {{
+            modal.style.display = 'none';
+        }}
+    }}
+
+    function renderCmdResults(filter) {{
+        const resultsEl = document.getElementById('cmdResults');
+        if (!resultsEl) return;
+        const query = (filter || '').toLowerCase().trim();
+        const filtered = COMMAND_LIST.filter(c => 
+            !query || 
+            c.title.toLowerCase().includes(query) || 
+            c.category.toLowerCase().includes(query) || 
+            c.shortcut.toLowerCase().includes(query) ||
+            c.id.toLowerCase().includes(query)
+        );
+
+        if (filtered.length === 0) {{
+            resultsEl.innerHTML = '<div style="color: #64748b; padding: 12px; text-align: center;">No matching commands found.</div>';
+            return;
+        }}
+
+        if (selectedCmdIndex >= filtered.length) selectedCmdIndex = 0;
+
+        resultsEl.innerHTML = filtered.map((c, idx) => `
+            <div class="cmd-item ${{idx === selectedCmdIndex ? 'selected' : ''}}" 
+                 onclick="execCmd('${{c.id}}')"
+                 onmouseenter="selectedCmdIndex = ${{idx}}; highlightSelectedCmd();">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span>${{c.icon}}</span>
+                    <span style="font-weight: 600;">${{escapeHtml(c.title)}}</span>
+                    <span style="font-size: 9px; color: #4e786b; background: rgba(16,185,129,0.1); padding: 1px 4px; border-radius: 2px;">${{c.category}}</span>
+                </div>
+                <span class="cmd-shortcut">${{c.shortcut}}</span>
+            </div>
+        `).join('');
+    }}
+
+    function highlightSelectedCmd() {{
+        const items = document.querySelectorAll('.cmd-item');
+        items.forEach((it, idx) => {{
+            if (idx === selectedCmdIndex) it.classList.add('selected');
+            else it.classList.remove('selected');
+        }});
+    }}
+
+    function execCmd(id) {{
+        const cmd = COMMAND_LIST.find(c => c.id === id);
+        if (cmd) {{
+            soundClick();
+            toggleCmdPalette();
+            try {{
+                cmd.action();
+            }} catch (err) {{
+                console.error('Command execution error:', err);
+            }}
+        }}
+    }}
+
+    document.addEventListener('keydown', (e) => {{
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {{
+            e.preventDefault();
+            toggleCmdPalette();
+            return;
+        }}
+        if (cmdPaletteOpen) {{
+            if (e.key === 'Escape') {{
+                e.preventDefault();
+                toggleCmdPalette();
+                return;
+            }}
+            const query = (document.getElementById('cmdInput')?.value || '').toLowerCase().trim();
+            const filtered = COMMAND_LIST.filter(c => 
+                !query || 
+                c.title.toLowerCase().includes(query) || 
+                c.category.toLowerCase().includes(query) || 
+                c.shortcut.toLowerCase().includes(query) ||
+                c.id.toLowerCase().includes(query)
+            );
+            if (e.key === 'ArrowDown') {{
+                e.preventDefault();
+                if (filtered.length > 0) {{
+                    selectedCmdIndex = (selectedCmdIndex + 1) % filtered.length;
+                    highlightSelectedCmd();
+                }}
+            }} else if (e.key === 'ArrowUp') {{
+                e.preventDefault();
+                if (filtered.length > 0) {{
+                    selectedCmdIndex = (selectedCmdIndex - 1 + filtered.length) % filtered.length;
+                    highlightSelectedCmd();
+                }}
+            }} else if (e.key === 'Enter') {{
+                e.preventDefault();
+                if (filtered.length > 0 && filtered[selectedCmdIndex]) {{
+                    execCmd(filtered[selectedCmdIndex].id);
+                }}
+            }}
+        }}
+    }});
+
+    const cmdInputEl = document.getElementById('cmdInput');
+    if (cmdInputEl) {{
+        cmdInputEl.addEventListener('input', (e) => {{
+            selectedCmdIndex = 0;
+            renderCmdResults(e.target.value);
+        }});
+    }}
+
     // Init
     resizeCanvases();
     updateScrubDate();
@@ -2799,10 +3333,12 @@ def render_dashboard_html() -> str:
 # Main Entrypoint
 # ============================================================================
 
-def start_server(port: int = DEFAULT_PORT):
+def start_server(port: int = DEFAULT_PORT, host: str = HOST, public: bool = False):
     """Start threaded Sentinel server and background stream monitor."""
-    global _is_running, _active_port
+    global _is_running, _active_port, _allow_public
     _active_port = port
+    _allow_public = public
+    bind_host = "0.0.0.0" if public else host
     priv, did = load_or_create_identity()
     fp = hashlib.sha256(did.encode()).hexdigest()[:16]
 
@@ -2811,17 +3347,17 @@ def start_server(port: int = DEFAULT_PORT):
     print("=" * 65)
     print(f"  Agent DID:        {did}")
     print(f"  Fingerprint:      {fp}")
-    print(f"  Local Web UI:     http://{HOST}:{port}")
+    print(f"  Mode:             {'PUBLIC (0.0.0.0)' if public else 'LOCAL ONLY (127.0.0.1)'}")
+    print(f"  Web URL:          http://{bind_host}:{port}")
     print(f"  Session Token:    [redacted — embedded in dashboard HTML]")
     print("=" * 65)
-    print("[+] Protected with Bearer Token & Local Origin Lockdown.")
-    print(f"[+] Launching on http://{HOST}:{port} ...\n")
+    print(f"[+] Launching on http://{bind_host}:{port} ...\n")
 
     # Start background monitor thread
     monitor = SentinelStreamMonitor(poll_interval=12)
     monitor.start()
 
-    server = ThreadingHTTPServer((HOST, port), SentinelRequestHandler)
+    server = ThreadingHTTPServer((bind_host, port), SentinelRequestHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2831,10 +3367,9 @@ def start_server(port: int = DEFAULT_PORT):
 
 
 if __name__ == "__main__":
-    port = DEFAULT_PORT
-    if len(sys.argv) > 1:
-        try:
-            port = int(sys.argv[1])
-        except ValueError:
-            pass
-    start_server(port=port)
+    port = int(os.environ.get("PORT", DEFAULT_PORT))
+    public = "--public" in sys.argv or os.environ.get("PUBLIC", "0") == "1"
+    for arg in sys.argv[1:]:
+        if arg.isdigit():
+            port = int(arg)
+    start_server(port=port, public=public)
