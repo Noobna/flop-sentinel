@@ -41,7 +41,11 @@ from sentinel import analyze_message
 from tclk import (
     apply_frame,
     derive_deal_room,
+    encode_frame,
+    generate_hash_lock,
     is_tclk_line,
+    make_accept,
+    make_reveal,
     open_contract,
     try_decode_frame,
 )
@@ -347,6 +351,71 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _state_lock = threading.Lock()
+_last_worker_job_time: float = 0.0
+_active_deal_rooms: set[str] = set()
+
+def maybe_accept_offer(offer: dict, room: str, priv: ed25519.Ed25519PrivateKey, did: str, deals: dict) -> bool:
+    """Evaluate and automatically accept an eligible payer bounty offer."""
+    global _last_worker_job_time
+    now = time.time()
+    now_ms = int(now * 1000)
+
+    # 1. Eligibility criteria
+    if offer.get("role") != "payer":
+        return False
+    if offer.get("from") == did:
+        return False
+    if offer.get("expiresMs", 0) <= now_ms + 30_000:
+        return False
+
+    rails = offer.get("rails", [])
+    supported_rails = {"paper", "paper-htlc", "flop-htlc", "evm-htlc"}
+    if not any(r in supported_rails for r in rails):
+        return False
+
+    # 2. Rate-limiting & concurrency capacity
+    deal_map = deals.setdefault("deals", {})
+    active_jobs = [d for d in deal_map.values() if d.get("isOurJob") and d.get("status") == "accepted"]
+    if len(active_jobs) >= 3:
+        return False
+    if (now - _last_worker_job_time) < 45.0:
+        return False
+
+    # 3. Mint hash lock & accept frame
+    try:
+        secret, statement = generate_hash_lock()
+        accept_frame = make_accept(from_did=did, offer=offer, statement=statement)
+        accept_wire = encode_frame(accept_frame)
+        target_room = "tclk-offers" if room == "tclk-offers" else room
+
+        oid = offer.get("id", "")
+        logger.info(f"[TCLK WORKER] Attempting to accept bounty job {oid[:18]}... ({offer.get('amount')} {offer.get('asset')}) in /r/{target_room}")
+        if send_signed_message(priv, did, accept_wire, room=target_room):
+            _last_worker_job_time = now
+            cid = accept_frame["contract"]
+            deal_room = derive_deal_room(cid)
+            _active_deal_rooms.add(deal_room)
+
+            deal_map[oid] = {
+                "id": oid,
+                "offer": offer,
+                "accept": accept_frame,
+                "contract": cid,
+                "statement": statement,
+                "secretPreimage": secret,
+                "status": "accepted",
+                "isOurJob": True,
+                "dealRoom": deal_room,
+                "acceptedAt": now,
+                "room": target_room,
+            }
+            save_json_atomic(DEAL_STATE_FILE, deals)
+            logger.info(f"[TCLK WORKER] [SUCCESS] TOOK BOUNTY JOB {oid[:18]}...! Contract: {cid[:18]}... Monitoring deal room /r/{deal_room}")
+            return True
+    except Exception as e:
+        logger.error(f"[TCLK WORKER] Error accepting offer: {e}")
+    return False
+
 
 def process_tclk_message(m: dict, room: str, priv: ed25519.Ed25519PrivateKey, did: str):
     text = m.get("text", "")
@@ -371,6 +440,8 @@ def process_tclk_message(m: dict, room: str, priv: ed25519.Ed25519PrivateKey, di
                 }
                 logger.info(f"[TCLK] Discovered new Offer {oid[:18]}... in /r/{room}: {frame.get('amount')} {frame.get('asset')}")
                 save_json_atomic(DEAL_STATE_FILE, deals)
+                # Auto-evaluate offer for worker acceptance
+                maybe_accept_offer(frame, room, priv, did, deals)
         elif ftype in ("accept", "lock", "reveal", "refund", "cancel"):
             cid = frame.get("contract")
             for d in deal_map.values():
@@ -382,6 +453,20 @@ def process_tclk_message(m: dict, room: str, priv: ed25519.Ed25519PrivateKey, di
                     elif ftype == "lock":
                         d["rail"] = frame.get("rail")
                         d["railRef"] = frame.get("ref")
+                        # If this is our job and we have the secret, reveal it immediately to claim escrow!
+                        if d.get("isOurJob") and d.get("secretPreimage"):
+                            secret = d["secretPreimage"]
+                            deal_room = d.get("dealRoom") or derive_deal_room(cid)
+                            reveal_frame = make_reveal(from_did=did, contract=cid, secret=secret)
+                            reveal_wire = encode_frame(reveal_frame)
+                            logger.info(f"[TCLK WORKER] [*] Escrow locked on rail '{d.get('rail')}'! Revealing preimage {secret[:16]}... in /r/{deal_room} to claim payout...")
+                            send_signed_message(priv, did, reveal_wire, room=deal_room)
+                            # Also broadcast to tclk-offers for global settlement confirmation
+                            send_signed_message(priv, did, reveal_wire, room="tclk-offers")
+                            d["status"] = "claimed"
+                            d["secret"] = secret
+                            d["claimedAt"] = time.time()
+                            logger.info(f"[TCLK WORKER] [SUCCESS] ESCROW CLAIMED! Payout secured for contract {cid[:18]}...!")
                     elif ftype == "reveal":
                         d["secret"] = frame.get("secret")
                     logger.info(f"[TCLK] Updated contract {cid[:18] if cid else 'deal'}... to status '{d['status']}'")
@@ -452,6 +537,19 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
     except Exception as e:
         logger.warning(f"[-] Could not publish TCLK capability note: {e}")
 
+    # Load previously accepted active deal rooms
+    try:
+        init_deals = load_json_safe(DEAL_STATE_FILE, {"deals": {}})
+        for d in init_deals.get("deals", {}).values():
+            if d.get("isOurJob") and d.get("status") in ("accepted", "locked"):
+                dr = d.get("dealRoom") or (derive_deal_room(d["contract"]) if d.get("contract") else None)
+                if dr:
+                    _active_deal_rooms.add(dr)
+        if _active_deal_rooms:
+            logger.info(f"[*] Resumed monitoring {len(_active_deal_rooms)} active TCLK deal rooms.")
+    except Exception as e:
+        logger.debug(f"Error resuming deal rooms: {e}")
+
     last_heartbeat_time = 0
     last_discovery_time = 0
     active_rooms = list(CORE_ROOMS)
@@ -480,9 +578,35 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
                 last_heartbeat_time = now
             time.sleep(5)
 
-        # 3. Monitor & Chat across Global Rooms concurrently
+        # 3. Check for and accept available bounties from the board
+        if (now - _last_worker_job_time) >= 60.0:
+            with _state_lock:
+                deals = load_json_safe(DEAL_STATE_FILE, {"deals": {}})
+                deal_map = deals.get("deals", {})
+                now_ms = int(now * 1000)
+                candidates = [
+                    v["offer"] for v in deal_map.values()
+                    if v.get("status") == "proposed"
+                    and v.get("offer", {}).get("role") == "payer"
+                    and v.get("offer", {}).get("from") != did
+                    and v.get("offer", {}).get("expiresMs", 0) > (now_ms + 40_000)
+                ]
+                def _amount_sort(o):
+                    try:
+                        return float(o.get("amount", 0))
+                    except Exception:
+                        return 0
+                candidates.sort(key=_amount_sort, reverse=True)
+                for best_offer in candidates[:3]:
+                    if maybe_accept_offer(best_offer, "tclk-offers", priv, did, deals):
+                        break
+
+        # 4. Monitor & Chat across Global Rooms + Active Deal Rooms concurrently
+        with _state_lock:
+            poll_target_rooms = list(set(active_rooms) | _active_deal_rooms)
+
         with ThreadPoolExecutor(max_workers=16) as executor:
-            futures = [executor.submit(process_room, room, state, priv, did) for room in active_rooms]
+            futures = [executor.submit(process_room, room, state, priv, did) for room in poll_target_rooms]
             for future in as_completed(futures):
                 try:
                     future.result()
