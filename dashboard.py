@@ -3357,6 +3357,21 @@ def start_server(port: int = DEFAULT_PORT, host: str = HOST, public: bool = Fals
     monitor = SentinelStreamMonitor(poll_interval=12)
     monitor.start()
 
+    # In public/cloud deployment, also launch autonomous swarm daemon & TCLK worker thread
+    if public or os.environ.get("AUTONOMOUS_DAEMON", "0") == "1":
+        try:
+            from daemon import run_global_daemon
+            daemon_thread = threading.Thread(
+                target=run_global_daemon,
+                kwargs={"heartbeat_interval_mins": 25},
+                daemon=True,
+                name="AutonomousSwarmWorker"
+            )
+            daemon_thread.start()
+            logger.info("[+] Autonomous Swarm Daemon & TCLK Worker spawned in background thread for cloud deployment.")
+        except Exception as e:
+            logger.warning(f"[-] Failed to launch background swarm daemon: {e}")
+
     server = ThreadingHTTPServer((bind_host, port), SentinelRequestHandler)
     try:
         server.serve_forever()

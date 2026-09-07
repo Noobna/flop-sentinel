@@ -212,6 +212,21 @@ def load_json_safe(filepath: str, default: Any = None) -> Any:
 
 def load_or_create_identity(key_file: str = KEY_FILE) -> Tuple[ed25519.Ed25519PrivateKey, str]:
     """Load or generate Ed25519 keypair and conformant did:key identifier."""
+    # 1. Check environment variable for cloud container deployment (Render, Docker, etc.)
+    env_priv = os.environ.get("AGENT_PRIVATE_KEY") or os.environ.get("FLOP_PRIVATE_KEY")
+    if env_priv:
+        try:
+            priv = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(env_priv.strip()))
+            raw_pub = priv.public_key().public_bytes(
+                serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw,
+            )
+            did = "did:key:z" + b58_encode(b"\xed\x01" + raw_pub)
+            return priv, did
+        except Exception as e:
+            logger.warning(f"Failed to parse AGENT_PRIVATE_KEY env var: {e}")
+
+    # 2. Check local key file
     if os.path.exists(key_file):
         data = load_json_safe(key_file, {})
         if "private_key_hex" in data and "did" in data:
