@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: flop-sentinel
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python dashboard.py $PORT --public
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
