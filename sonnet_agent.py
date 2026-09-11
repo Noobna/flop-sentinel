@@ -327,7 +327,7 @@ class SonnetAgent:
 
         latest_version = 0
         latest_state_hash = ""
-        room_generation = 0
+        room_generation = 1
         last_contributor = None
         accepted_words: List[str] = []
 
@@ -336,18 +336,16 @@ class SonnetAgent:
             try:
                 data = json.loads(text)
                 msg_type = data.get("type", "")
-                if msg_type == "sonnet.receipt.v1" or "state_hash" in data:
-                    latest_state_hash = data.get("state_hash", latest_state_hash)
-                    latest_version = data.get("version", latest_version)
-                    room_generation = data.get("room_generation", room_generation)
-                    last_contributor = data.get("contributor_did", last_contributor)
-                    if "accepted_word" in data:
-                        accepted_words.append(data["accepted_word"])
-                elif msg_type == "sonnet.word.v1" and "word" in data:
-                    # Pre-referee or peer word tracking fallback
-                    accepted_words.append(data["word"])
-                    last_contributor = m.get("from", m.get("did", last_contributor))
-                    latest_version = max(latest_version, data.get("version", 0))
+                if msg_type == "sonnet.receipt.v1":
+                    if data.get("status") == "accepted" and "state_hash" in data:
+                        latest_state_hash = data.get("state_hash", latest_state_hash)
+                        latest_version = data.get("version", latest_version)
+                        room_generation = data.get("room_generation", room_generation) or 1
+                        last_contributor = data.get("sender_did", last_contributor)
+                        if "accepted_word" in data:
+                            accepted_words.append(data["accepted_word"])
+                elif msg_type in ("sonnet.room.v1", "sonnet.setup.v1"):
+                    room_generation = data.get("room_generation", room_generation) or 1
             except Exception:
                 pass
 
@@ -356,24 +354,62 @@ class SonnetAgent:
             logger.info("Last word was contributed by us. Waiting for a teammate.")
             return False
 
-        # Reconstruct poem state with streaming parser
-        raw_text = " ".join(accepted_words)
-        state = self.poet.parse_poem_text(raw_text)
+        target_position = latest_version + 1
+        planned_word = None
 
-        if state.is_finished:
-            logger.info("Poem is complete (14 lines of 10 syllables)!")
-            self._handle_completed_poem(game_id, state, latest_version, room_generation)
+        if game_id == "bub":
+            # Canonical assignment for seat 3 (@noob_nad)
+            assigned_map = {
+                1: "Electric",
+                7: "light,",
+                10: "the",
+                21: "it",
+                23: "it",
+                25: "like",
+                29: "the",
+                34: "might",
+                46: "little",
+                48: "it",
+                52: "the",
+                58: "it",
+                61: "will",
+                69: "it,",
+                72: "It",
+                74: "The",
+                83: "is",
+                88: "is",
+                92: "held",
+                94: "is",
+                98: "rides",
+                105: "hill.",
+                107: "little",
+                111: "the",
+                118: "the",
+                120: "they",
+            }
+            if target_position in assigned_map:
+                planned_word = assigned_map[target_position]
+                reasoning = f"Team bub seat 3 planned word #{target_position}: '{planned_word}'"
+            else:
+                logger.info(f"Team 'bub': Word position #{target_position} is assigned to another seat. Holding turn.")
+                return False
+        else:
+            # Fallback dynamic generation
+            raw_text = " ".join(accepted_words)
+            state = self.poet.parse_poem_text(raw_text)
+            if state.is_finished:
+                logger.info("Poem is complete (14 lines of 10 syllables)!")
+                self._handle_completed_poem(game_id, state, latest_version, room_generation)
+                return False
+            planned_word, reasoning = self.poet.propose_next_word(state)
+
+        if not planned_word:
+            logger.warning(f"Could not determine next word: {reasoning}")
             return False
 
-        # Generate the next intelligent word
-        next_word, reasoning = self.poet.propose_next_word(state)
-        if not next_word:
-            logger.warning(f"Could not generate word: {reasoning}")
-            return False
+        logger.info(f"Proposing word: '{planned_word}' | Strategy: {reasoning}")
 
-        logger.info(f"Proposing word: '{next_word}' | Strategy: {reasoning}")
-
-        req_id = f"word-{game_id}-{latest_version + 1}-{int(time.time())}"
+        req_id = f"word-{game_id}-{target_position}-{int(time.time())}"
         word_payload = {
             "type": "sonnet.word.v1",
             "contest_id": self.contest_id,
@@ -381,7 +417,7 @@ class SonnetAgent:
             "room_generation": room_generation,
             "version": latest_version,
             "previous_state_hash": latest_state_hash,
-            "word": next_word,
+            "word": planned_word,
             "request_id": req_id,
         }
 
