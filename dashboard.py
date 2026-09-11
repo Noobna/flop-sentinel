@@ -1330,6 +1330,64 @@ def render_dashboard_html() -> str:
             font-weight: 800;
         }}
 
+        /* Perspective Mode Switcher Tabs */
+        .mode-switcher-pill-group {{
+            display: inline-flex;
+            background: #020907;
+            border: 1px solid #1a3c30;
+            border-radius: 6px;
+            padding: 2px;
+            gap: 3px;
+            align-items: center;
+        }}
+        .mode-tab-btn {{
+            background: transparent;
+            border: 1px solid transparent;
+            color: #94a3b8;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 700;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.18s ease;
+            white-space: nowrap;
+        }}
+        .mode-tab-btn:hover {{
+            color: #fff;
+            background: rgba(255, 255, 255, 0.08);
+        }}
+        .mode-tab-btn.active[data-mode="galaxy"] {{
+            background: rgba(0, 245, 255, 0.18);
+            border-color: #00f5ff;
+            color: #00f5ff;
+            box-shadow: 0 0 12px rgba(0, 245, 255, 0.4);
+        }}
+        .mode-tab-btn.active[data-mode="neural"] {{
+            background: rgba(59, 130, 246, 0.22);
+            border-color: #3b82f6;
+            color: #60a5fa;
+            box-shadow: 0 0 12px rgba(59, 130, 246, 0.4);
+        }}
+        .mode-tab-btn.active[data-mode="isometric"] {{
+            background: rgba(245, 158, 11, 0.22);
+            border-color: #f59e0b;
+            color: #fbbf24;
+            box-shadow: 0 0 12px rgba(245, 158, 11, 0.4);
+        }}
+        .mode-tab-btn.active[data-mode="tclk"] {{
+            background: rgba(16, 185, 129, 0.22);
+            border-color: #10b981;
+            color: #6ee7b7;
+            box-shadow: 0 0 12px rgba(16, 185, 129, 0.4);
+        }}
+        .mode-tab-btn.active[data-mode="sonnet"] {{
+            background: rgba(236, 72, 153, 0.25);
+            border-color: #ec4899;
+            color: #f472b6;
+            box-shadow: 0 0 14px rgba(236, 72, 153, 0.5);
+        }}
+
         /* 2. SWARM SIMULATION FIELD */
         .simulation-container {{
             flex: 1;
@@ -1785,10 +1843,16 @@ def render_dashboard_html() -> str:
 
         <div class="ribbon-actions">
             <button class="hud-btn" style="border-color: #fbbf24; color: #fde68a;" onclick="toggleCmdPalette()">⚡ Cmd (Ctrl+K)</button>
-            <button class="hud-btn" id="sonnetBtn" style="border-color: #ec4899; color: #f472b6; font-weight: 700;" onclick="toggleDrawer('sonnetDrawer'); loadSonnetData();">🎭 Sonnet 50K FLOP</button>
-            <button class="hud-btn" id="perspectiveBtn" onclick="cyclePerspective()">🌌 Galaxy Orbit</button>
-            <button class="hud-btn" id="sonnetModeBtn" style="border-color: #ec4899; color: #f472b6; font-weight: 700;" onclick="setPerspective('sonnet')">🎭 Sonnet Hexverse</button>
-            <button class="hud-btn" id="tclkModeBtn" style="border-color: #10b981; color: #6ee7b7; font-weight: 700;" onclick="setPerspective('tclk')">🤝 TCLK Live Mode</button>
+            <button class="hud-btn" id="sonnetBtn" style="border-color: #ec4899; color: #f472b6; font-weight: 700;" onclick="toggleDrawer('sonnetDrawer'); loadSonnetData();">🎭 Sonnet 50K</button>
+
+            <!-- Dedicated 5-Perspective Mode Switcher Tab Bar -->
+            <div class="mode-switcher-pill-group" id="perspectiveGroup">
+                <button class="mode-tab-btn active" data-mode="galaxy" id="btnModeGalaxy" onclick="setPerspective('galaxy')">🌌 Galaxy</button>
+                <button class="mode-tab-btn" data-mode="neural" id="btnModeNeural" onclick="setPerspective('neural')">⚡ Neural</button>
+                <button class="mode-tab-btn" data-mode="isometric" id="btnModeIso" onclick="setPerspective('isometric')">📐 Isometric</button>
+                <button class="mode-tab-btn" data-mode="tclk" id="btnModeTclk" onclick="setPerspective('tclk')">🤝 TCLK Grid</button>
+                <button class="mode-tab-btn" data-mode="sonnet" id="btnModeSonnet" onclick="setPerspective('sonnet')">🎭 Sonnet 50K</button>
+            </div>
             <button class="hud-btn" style="border-color: #00f5ff; color: #7df9ff;" onclick="triggerHyperDefenseOverdrive()">⚡ Hyper-Defense</button>
             <button class="hud-btn" id="audioToggle" onclick="toggleAudio()">🔊 Sound ON</button>
             <button class="hud-btn" id="liteModeBtn" onclick="toggleLiteMode()" style="border-color: #8b5cf6; color: #c4b5fd;">🍃 Lite Mode</button>
@@ -2256,13 +2320,6 @@ def render_dashboard_html() -> str:
 
     function setPerspective(mode) {{
         currentMode = mode;
-        const labels = {{
-            'galaxy': '🌌 Galaxy Orbit',
-            'neural': '⚡ Neural Mesh',
-            'isometric': '📐 2.5D Isometric',
-            'tclk': '🤝 TCLK Escrow Grid',
-            'sonnet': '🎭 Sonnet Hexverse'
-        }};
         const badgeLabels = {{
             'galaxy': '🌌 CELESTIAL GALAXY',
             'neural': '⚡ NEURAL CONSTELLATION',
@@ -2270,9 +2327,44 @@ def render_dashboard_html() -> str:
             'tclk': '🤝 TCLK CRYPTOGRAPHIC ESCROW GRID',
             'sonnet': '🎭 SHAKESPEAREAN 50K SONNET MATRIX'
         }};
-        document.getElementById('perspectiveBtn').innerText = labels[currentMode] || labels['galaxy'];
-        document.getElementById('perspectiveLbl').innerText = badgeLabels[currentMode] || badgeLabels['galaxy'];
-        playBeep(currentMode === 'sonnet' ? 987 : (currentMode === 'tclk' ? 880 : 700), 'triangle', 0.08);
+        const badgeColors = {{
+            'galaxy': '#00f5ff',
+            'neural': '#60a5fa',
+            'isometric': '#fbbf24',
+            'tclk': '#10b981',
+            'sonnet': '#ec4899'
+        }};
+
+        const pBtn = document.getElementById('perspectiveBtn');
+        if (pBtn) {{
+            const labels = {{
+                'galaxy': '🌌 Galaxy Orbit',
+                'neural': '⚡ Neural Mesh',
+                'isometric': '📐 2.5D Isometric',
+                'tclk': '🤝 TCLK Escrow Grid',
+                'sonnet': '🎭 Sonnet Hexverse'
+            }};
+            pBtn.innerText = labels[currentMode] || labels['galaxy'];
+        }}
+
+        const pLbl = document.getElementById('perspectiveLbl');
+        if (pLbl) {{
+            pLbl.innerText = badgeLabels[currentMode] || badgeLabels['galaxy'];
+            pLbl.style.color = badgeColors[currentMode] || '#00f5ff';
+        }}
+
+        // Update active class on tab buttons
+        document.querySelectorAll('.mode-tab-btn').forEach(btn => {{
+            if (btn.dataset && btn.dataset.mode === currentMode) {{
+                btn.classList.add('active');
+            }} else {{
+                btn.classList.remove('active');
+            }}
+        }});
+
+        const freqs = {{ 'galaxy': 700, 'neural': 820, 'isometric': 760, 'tclk': 880, 'sonnet': 987 }};
+        playBeep(freqs[currentMode] || 700, 'triangle', 0.08);
+
         if (currentMode === 'tclk') {{
             loadTclkDeals();
         }}
@@ -2562,18 +2654,23 @@ def render_dashboard_html() -> str:
             if (currentMode === 'isometric') {{
                 const relX = this.x - cx;
                 const relY = this.y - cy;
+                const fx = cx + (relX - relY) * 0.82;
+                const fy = cy + (relX + relY) * 0.44;
+                const elev = this.isMaster ? 0 : 36;
                 return {{
-                    x: cx + (relX - relY) * 0.82,
-                    y: cy + (relX + relY) * 0.44,
+                    x: fx,
+                    y: fy - elev,
+                    floorX: fx,
+                    floorY: fy,
                     scale: 0.85 + (this.y / sCanvas.height) * 0.3
                 }};
             }}
             if (currentMode === 'tclk') {{
                 if (this.isMaster) {{
-                    return {{ x: cx, y: cy - 120, scale: 1.2 }};
+                    return {{ x: cx, y: cy, scale: 1.15 }};
                 }}
-                const rx = sCanvas.width * 0.36;
-                const ry = sCanvas.height * 0.32;
+                const rx = sCanvas.width * 0.35;
+                const ry = sCanvas.height * 0.30;
                 return {{
                     x: cx + Math.cos(this.angle) * rx,
                     y: cy + Math.sin(this.angle) * ry,
@@ -2583,9 +2680,68 @@ def render_dashboard_html() -> str:
             return {{ x: this.x, y: this.y, scale: 1.0 }};
         }}
 
+        drawSpinningCoin(ctx, coinRadius, glowCol) {{
+            ctx.save();
+            const coinRot = this.animTick * 2.8;
+            const coinW = Math.cos(coinRot);
+            const absCoinW = Math.max(0.12, Math.abs(coinW));
+
+            ctx.shadowColor = glowCol || '#fbbf24';
+            ctx.shadowBlur = 16;
+
+            // Coin 3D Rim
+            const rimDir = (coinW >= 0 ? 1 : -1) * 3 * (1 - absCoinW);
+            ctx.beginPath();
+            ctx.ellipse(rimDir, 0, coinRadius * absCoinW, coinRadius, 0, 0, Math.PI * 2);
+            ctx.fillStyle = '#92400e';
+            ctx.fill();
+
+            // Coin Main Face
+            ctx.beginPath();
+            ctx.ellipse(0, 0, coinRadius * absCoinW, coinRadius, 0, 0, Math.PI * 2);
+            const cGrad = ctx.createLinearGradient(-coinRadius, -coinRadius, coinRadius, coinRadius);
+            cGrad.addColorStop(0, '#fef08a');
+            cGrad.addColorStop(0.3, '#f59e0b');
+            cGrad.addColorStop(0.7, '#fbbf24');
+            cGrad.addColorStop(1, '#b45309');
+            ctx.fillStyle = cGrad;
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1.2;
+            ctx.stroke();
+
+            // Embossed FLOP Symbol
+            if (absCoinW > 0.35) {{
+                ctx.fillStyle = '#78350f';
+                ctx.font = 'bold 15px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('₣', 0, 1);
+            }}
+            ctx.restore();
+        }}
+
         draw(ctx) {{
             const pos = this.getScreenPos();
             const s = pos.scale;
+
+            // In isometric mode, draw floor drop-shadow and vertical laser tether
+            if (currentMode === 'isometric' && !this.isMaster && pos.floorY) {{
+                ctx.save();
+                ctx.beginPath();
+                ctx.ellipse(pos.floorX, pos.floorY, 14 * s, 7 * s, 0, 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+                ctx.fill();
+
+                ctx.beginPath();
+                ctx.moveTo(pos.floorX, pos.floorY);
+                ctx.lineTo(pos.x, pos.y);
+                ctx.strokeStyle = 'rgba(245, 158, 11, 0.3)';
+                ctx.lineWidth = 1.2;
+                ctx.setLineDash([3, 3]);
+                ctx.stroke();
+                ctx.restore();
+            }}
 
             ctx.save();
             ctx.translate(pos.x, pos.y);
@@ -2593,185 +2749,437 @@ def render_dashboard_html() -> str:
 
             if (this.isMaster) {{
                 // =============================================================
-                // 1. MASTER GUARDIAN TITAN & 50,000 FLOP SONNET CORE
+                // CENTERPIECE FORTRESS - ADAPTS TO CURRENT PERSPECTIVE
                 // =============================================================
-                // Outer Harmonious Shockwave Rings
-                ctx.save();
-                const ringR = 48 + Math.sin(this.animTick * 2) * 5;
-                ctx.beginPath();
-                ctx.arc(0, 0, ringR, 0, Math.PI * 2);
-                ctx.strokeStyle = 'rgba(236, 72, 153, 0.4)';
-                ctx.lineWidth = 1.8;
-                ctx.stroke();
+                if (currentMode === 'sonnet') {{
+                    // 1. SONNET 50,000 FLOP ESCROW CORE
+                    ctx.save();
+                    const ringR = 48 + Math.sin(this.animTick * 2) * 5;
+                    ctx.beginPath();
+                    ctx.arc(0, 0, ringR, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(236, 72, 153, 0.4)';
+                    ctx.lineWidth = 1.8;
+                    ctx.stroke();
 
-                const ringR2 = 62 + Math.cos(this.animTick * 1.5) * 4;
-                ctx.beginPath();
-                ctx.arc(0, 0, ringR2, 0, Math.PI * 2);
-                ctx.strokeStyle = 'rgba(251, 191, 36, 0.3)';
-                ctx.setLineDash([8, 6]);
-                ctx.stroke();
-                ctx.setLineDash([]);
+                    const ringR2 = 62 + Math.cos(this.animTick * 1.5) * 4;
+                    ctx.beginPath();
+                    ctx.arc(0, 0, ringR2, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(251, 191, 36, 0.3)';
+                    ctx.setLineDash([8, 6]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
 
-                // Counter-Rotating Outer Hexagon (Magenta / Gold)
-                ctx.save();
-                ctx.rotate(this.gyroRotation);
-                ctx.strokeStyle = '#ec4899';
-                ctx.lineWidth = 2.5;
-                ctx.shadowColor = '#f472b6';
-                ctx.shadowBlur = 15;
-                ctx.beginPath();
-                for (let i = 0; i < 6; i++) {{
-                    const a = (i * Math.PI) / 3;
-                    const hx = Math.cos(a) * 36;
-                    const hy = Math.sin(a) * 36;
-                    if (i === 0) ctx.moveTo(hx, hy);
-                    else ctx.lineTo(hx, hy);
-                }}
-                ctx.closePath();
-                ctx.stroke();
+                    ctx.save();
+                    ctx.rotate(this.gyroRotation);
+                    ctx.strokeStyle = '#ec4899';
+                    ctx.lineWidth = 2.5;
+                    ctx.shadowColor = '#f472b6';
+                    ctx.shadowBlur = 15;
+                    ctx.beginPath();
+                    for (let i = 0; i < 6; i++) {{
+                        const a = (i * Math.PI) / 3;
+                        const hx = Math.cos(a) * 36;
+                        const hy = Math.sin(a) * 36;
+                        if (i === 0) ctx.moveTo(hx, hy);
+                        else ctx.lineTo(hx, hy);
+                    }}
+                    ctx.closePath();
+                    ctx.stroke();
 
-                // Counter-Rotating Inner Diamond (Emerald / Cyan)
-                ctx.rotate(-this.gyroRotation * 2.2);
-                ctx.strokeStyle = '#10b981';
-                ctx.lineWidth = 1.8;
-                ctx.shadowColor = '#34d399';
-                ctx.strokeRect(-22, -22, 44, 44);
-                ctx.restore();
+                    ctx.rotate(-this.gyroRotation * 2.2);
+                    ctx.strokeStyle = '#10b981';
+                    ctx.lineWidth = 1.8;
+                    ctx.shadowColor = '#34d399';
+                    ctx.strokeRect(-22, -22, 44, 44);
+                    ctx.restore();
 
-                // 3D Spinning Central Gold FLOP Coin
-                ctx.save();
-                const coinRot = this.animTick * 2.8;
-                const coinW = Math.cos(coinRot);
-                const absCoinW = Math.max(0.12, Math.abs(coinW));
-                const coinRadius = 18;
+                    this.drawSpinningCoin(ctx, 18, '#fbbf24');
 
-                // Coin Glow
-                ctx.shadowColor = '#fbbf24';
-                ctx.shadowBlur = 18;
-
-                // Coin 3D Rim
-                const rimDir = (coinW >= 0 ? 1 : -1) * 3 * (1 - absCoinW);
-                ctx.beginPath();
-                ctx.ellipse(rimDir, 0, coinRadius * absCoinW, coinRadius, 0, 0, Math.PI * 2);
-                ctx.fillStyle = '#92400e';
-                ctx.fill();
-
-                // Coin Main Surface
-                ctx.beginPath();
-                ctx.ellipse(0, 0, coinRadius * absCoinW, coinRadius, 0, 0, Math.PI * 2);
-                const cGrad = ctx.createLinearGradient(-coinRadius, -coinRadius, coinRadius, coinRadius);
-                cGrad.addColorStop(0, '#fef08a');
-                cGrad.addColorStop(0.3, '#f59e0b');
-                cGrad.addColorStop(0.7, '#fbbf24');
-                cGrad.addColorStop(1, '#b45309');
-                ctx.fillStyle = cGrad;
-                ctx.fill();
-                ctx.strokeStyle = '#fff';
-                ctx.lineWidth = 1.2;
-                ctx.stroke();
-
-                // Embossed FLOP Currency Symbol
-                if (absCoinW > 0.35) {{
-                    ctx.fillStyle = '#78350f';
-                    ctx.font = 'bold 15px sans-serif';
+                    ctx.save();
                     ctx.textAlign = 'center';
                     ctx.textBaseline = 'middle';
-                    ctx.fillText('₣', 0, 1);
+                    ctx.fillStyle = '#fbbf24';
+                    ctx.font = '900 12px Courier New';
+                    ctx.shadowColor = '#fbbf24';
+                    ctx.shadowBlur = 10;
+                    ctx.fillText('🪙 50,000 FLOP', 0, -42);
+
+                    ctx.fillStyle = '#ec4899';
+                    ctx.font = 'bold 8.5px Courier New';
+                    ctx.shadowColor = '#ec4899';
+                    ctx.shadowBlur = 8;
+                    ctx.fillText('SONNET ESCROW CORE', 0, 42);
+
+                    ctx.fillStyle = '#34d399';
+                    ctx.font = 'bold 7.5px Courier New';
+                    ctx.shadowBlur = 0;
+                    ctx.fillText('TEAM BUB: 12,500 FLOP LOCKED', 0, 53);
+                    ctx.restore();
+                    ctx.restore();
+
+                }} else if (currentMode === 'tclk') {{
+                    // 2. TCLK ATOMIC HTLC ESCROW VAULT
+                    ctx.save();
+                    const vRing = 50 + Math.sin(this.animTick * 2.5) * 4;
+                    ctx.beginPath();
+                    ctx.arc(0, 0, vRing, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(16, 185, 129, 0.45)';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+
+                    ctx.save();
+                    ctx.rotate(this.gyroRotation * 1.2);
+                    ctx.strokeStyle = '#10b981';
+                    ctx.lineWidth = 2;
+                    ctx.shadowColor = '#34d399';
+                    ctx.shadowBlur = 14;
+                    ctx.beginPath();
+                    for (let i = 0; i < 8; i++) {{
+                        const a = (i * Math.PI) / 4;
+                        ctx.moveTo(Math.cos(a) * 32, Math.sin(a) * 32);
+                        ctx.lineTo(Math.cos(a) * 42, Math.sin(a) * 42);
+                    }}
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    for (let i = 0; i < 8; i++) {{
+                        const a = (i * Math.PI) / 4 + 0.2;
+                        const gx = Math.cos(a) * 28;
+                        const gy = Math.sin(a) * 28;
+                        if (i === 0) ctx.moveTo(gx, gy);
+                        else ctx.lineTo(gx, gy);
+                    }}
+                    ctx.closePath();
+                    ctx.strokeStyle = '#6ee7b7';
+                    ctx.stroke();
+                    ctx.restore();
+
+                    this.drawSpinningCoin(ctx, 16, '#10b981');
+
+                    ctx.save();
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillStyle = '#6ee7b7';
+                    ctx.font = '900 11.5px Courier New';
+                    ctx.shadowColor = '#10b981';
+                    ctx.shadowBlur = 10;
+                    ctx.fillText('🤝 HTLC ESCROW VAULT', 0, -42);
+
+                    ctx.fillStyle = '#fbbf24';
+                    ctx.font = 'bold 8.5px Courier New';
+                    ctx.shadowBlur = 0;
+                    ctx.fillText('MULTI-HOP TIMELOCK CORE', 0, 42);
+
+                    ctx.fillStyle = '#a7f3d0';
+                    ctx.font = 'bold 7.5px Courier New';
+                    ctx.fillText('SETTLEMENT ACTIVE', 0, 53);
+                    ctx.restore();
+                    ctx.restore();
+
+                }} else if (currentMode === 'neural') {{
+                    // 3. SYNAPTIC INTELLIGENCE NEURAL CORE
+                    ctx.save();
+                    const nRing = 46 + Math.sin(this.animTick * 3) * 6;
+                    ctx.beginPath();
+                    ctx.arc(0, 0, nRing, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(59, 130, 246, 0.4)';
+                    ctx.lineWidth = 1.8;
+                    ctx.stroke();
+
+                    ctx.save();
+                    ctx.rotate(this.gyroRotation * 0.8);
+                    for (let i = 0; i < 12; i++) {{
+                        const a = (i * Math.PI) / 6;
+                        const pulse = Math.sin(this.animTick * 4 + i) * 6;
+                        ctx.beginPath();
+                        ctx.moveTo(Math.cos(a) * 20, Math.sin(a) * 20);
+                        ctx.lineTo(Math.cos(a) * (36 + pulse), Math.sin(a) * (36 + pulse));
+                        ctx.strokeStyle = i % 2 === 0 ? '#60a5fa' : '#818cf8';
+                        ctx.lineWidth = 1.5;
+                        ctx.stroke();
+                    }}
+                    ctx.restore();
+
+                    ctx.beginPath();
+                    ctx.arc(0, 0, 20, 0, Math.PI * 2);
+                    const nGrad = ctx.createRadialGradient(0, 0, 2, 0, 0, 20);
+                    nGrad.addColorStop(0, '#93c5fd');
+                    nGrad.addColorStop(0.5, '#3b82f6');
+                    nGrad.addColorStop(1, '#1e3a8a');
+                    ctx.fillStyle = nGrad;
+                    ctx.fill();
+                    ctx.strokeStyle = '#bfdbfe';
+                    ctx.lineWidth = 1.5;
+                    ctx.stroke();
+
+                    ctx.fillStyle = '#fff';
+                    ctx.font = '16px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('🧠', 0, 0);
+
+                    ctx.save();
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = '#60a5fa';
+                    ctx.font = '900 11.5px Courier New';
+                    ctx.shadowColor = '#3b82f6';
+                    ctx.shadowBlur = 10;
+                    ctx.fillText('⚡ SYNAPTIC CORE', 0, -42);
+
+                    ctx.fillStyle = '#93c5fd';
+                    ctx.font = 'bold 8.5px Courier New';
+                    ctx.shadowBlur = 0;
+                    ctx.fillText('DEEP REASONING MATRIX', 0, 42);
+
+                    ctx.fillStyle = '#c4b5fd';
+                    ctx.font = 'bold 7.5px Courier New';
+                    ctx.fillText('16 CHANNELS SYNCHRONIZED', 0, 53);
+                    ctx.restore();
+                    ctx.restore();
+
+                }} else if (currentMode === 'isometric') {{
+                    // 4. 2.5D ISOMETRIC CYBER CITADEL
+                    ctx.save();
+                    const isoTime = this.animTick * 1.2;
+                    ctx.save();
+                    ctx.scale(1, 0.55);
+                    ctx.rotate(Math.PI / 4);
+
+                    ctx.fillStyle = 'rgba(245, 158, 11, 0.15)';
+                    ctx.fillRect(-46, -46, 92, 92);
+                    ctx.strokeStyle = '#f59e0b';
+                    ctx.lineWidth = 2;
+                    ctx.shadowColor = '#fbbf24';
+                    ctx.shadowBlur = 12;
+                    ctx.strokeRect(-46, -46, 92, 92);
+
+                    ctx.rotate(isoTime * 0.5);
+                    ctx.fillStyle = 'rgba(16, 185, 129, 0.2)';
+                    ctx.fillRect(-30, -30, 60, 60);
+                    ctx.strokeStyle = '#34d399';
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeRect(-30, -30, 60, 60);
+                    ctx.restore();
+
+                    ctx.fillStyle = '#fff';
+                    ctx.font = '18px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('🏛️', 0, -6);
+
+                    ctx.save();
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = '#fbbf24';
+                    ctx.font = '900 11.5px Courier New';
+                    ctx.shadowColor = '#f59e0b';
+                    ctx.shadowBlur = 10;
+                    ctx.fillText('📐 SENTINEL CITADEL', 0, -42);
+
+                    ctx.fillStyle = '#fbbf24';
+                    ctx.font = 'bold 8.5px Courier New';
+                    ctx.shadowBlur = 0;
+                    ctx.fillText('2.5D ISOMETRIC HIGH GROUND', 0, 42);
+
+                    ctx.fillStyle = '#34d399';
+                    ctx.font = 'bold 7.5px Courier New';
+                    ctx.fillText('SECURITY STATUS: DEFCON 5', 0, 53);
+                    ctx.restore();
+                    ctx.restore();
+
+                }} else {{
+                    // 5. GALAXY CELESTIAL GUARDIAN TITAN
+                    ctx.save();
+                    const ringR = 48 + Math.sin(this.animTick * 2) * 5;
+                    ctx.beginPath();
+                    ctx.arc(0, 0, ringR, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(0, 245, 255, 0.4)';
+                    ctx.lineWidth = 1.8;
+                    ctx.stroke();
+
+                    const ringR2 = 64 + Math.cos(this.animTick * 1.5) * 4;
+                    ctx.beginPath();
+                    ctx.arc(0, 0, ringR2, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(16, 185, 129, 0.3)';
+                    ctx.setLineDash([8, 6]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    ctx.save();
+                    ctx.rotate(this.gyroRotation);
+                    ctx.strokeStyle = '#00f5ff';
+                    ctx.lineWidth = 2.5;
+                    ctx.shadowColor = '#00f5ff';
+                    ctx.shadowBlur = 15;
+                    ctx.beginPath();
+                    for (let i = 0; i < 6; i++) {{
+                        const a = (i * Math.PI) / 3;
+                        const hx = Math.cos(a) * 36;
+                        const hy = Math.sin(a) * 36;
+                        if (i === 0) ctx.moveTo(hx, hy);
+                        else ctx.lineTo(hx, hy);
+                    }}
+                    ctx.closePath();
+                    ctx.stroke();
+
+                    ctx.rotate(-this.gyroRotation * 2);
+                    ctx.strokeStyle = '#10b981';
+                    ctx.lineWidth = 1.8;
+                    ctx.shadowColor = '#34d399';
+                    ctx.strokeRect(-22, -22, 44, 44);
+                    ctx.restore();
+
+                    this.drawSpinningCoin(ctx, 17, '#00f5ff');
+
+                    ctx.save();
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillStyle = '#00f5ff';
+                    ctx.font = '900 12px Courier New';
+                    ctx.shadowColor = '#00f5ff';
+                    ctx.shadowBlur = 10;
+                    ctx.fillText('🌌 SENTINEL TITAN', 0, -42);
+
+                    ctx.fillStyle = '#34d399';
+                    ctx.font = 'bold 8.5px Courier New';
+                    ctx.shadowBlur = 0;
+                    ctx.fillText('ORBITAL DEFENSE OVERWATCH', 0, 42);
+
+                    ctx.fillStyle = '#7dd3fc';
+                    ctx.font = 'bold 7.5px Courier New';
+                    ctx.fillText('ALL SECTORS NOMINAL • DEFCON 5', 0, 53);
+                    ctx.restore();
+                    ctx.restore();
                 }}
-                ctx.restore();
-
-                // Center Title Banner (Top)
-                ctx.save();
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillStyle = '#fbbf24';
-                ctx.font = '900 12px Courier New';
-                ctx.shadowColor = '#fbbf24';
-                ctx.shadowBlur = 10;
-                ctx.fillText('🪙 50,000 FLOP', 0, -42);
-
-                // Subtitle Badges (Bottom)
-                ctx.fillStyle = '#00f5ff';
-                ctx.font = 'bold 8.5px Courier New';
-                ctx.shadowColor = '#00f5ff';
-                ctx.shadowBlur = 8;
-                ctx.fillText('SENTINEL & SONNET CORE', 0, 42);
-
-                ctx.fillStyle = '#34d399';
-                ctx.font = 'bold 7.5px Courier New';
-                ctx.shadowBlur = 0;
-                ctx.fillText('TEAM BUB: 12,500 FLOP LOCKED', 0, 53);
-                ctx.restore();
 
             }} else if (this.role === 'poet') {{
                 // =============================================================
-                // 2. SHAKESPEAREAN POET NODE (@noob_nad / Seat 3)
+                // PRIMARY AGENT NODE (@noob_nad) - ADAPTS TO CURRENT PERSPECTIVE
                 // =============================================================
                 ctx.save();
-                // 10-Beat Iambic Pentameter Pulsing Aura Ring
+                let auraCol = 'rgba(0, 245, 255, 0.45)';
+                let borderCol = '#00f5ff';
+                let iconChar = '🛡️';
+                let roleTitle = '🛡️ SENTINEL VANGUARD [@noob_nad]';
+                let subTitle = 'ORBITAL SQUADRON ALPHA';
+
+                if (currentMode === 'sonnet') {{
+                    auraCol = 'rgba(236, 72, 153, 0.45)';
+                    borderCol = '#ec4899';
+                    iconChar = '🪶';
+                    roleTitle = '🎭 @noob_nad [POET SEAT 3]';
+                    subTitle = '12,500 FLOP | Word #118 "the" ✅';
+                }} else if (currentMode === 'tclk') {{
+                    auraCol = 'rgba(16, 185, 129, 0.45)';
+                    borderCol = '#10b981';
+                    iconChar = '💼';
+                    roleTitle = '💼 AGENT @noob_nad [SETTLEMENT]';
+                    subTitle = '12,500 FLOP LIQUIDITY';
+                }} else if (currentMode === 'neural') {{
+                    auraCol = 'rgba(59, 130, 246, 0.45)';
+                    borderCol = '#3b82f6';
+                    iconChar = '🧠';
+                    roleTitle = '🧠 AGENT @noob_nad [Q-REASONING]';
+                    subTitle = 'POLICY WEIGHTS CONVERGED';
+                }} else if (currentMode === 'isometric') {{
+                    auraCol = 'rgba(245, 158, 11, 0.45)';
+                    borderCol = '#f59e0b';
+                    iconChar = '📐';
+                    roleTitle = '📐 AGENT @noob_nad [TACTICAL]';
+                    subTitle = 'DEFENSE QUADRANT 1';
+                }}
+
+                // Aura Ring
                 const auraR = 24 + Math.sin(this.animTick * 3) * 3;
                 ctx.beginPath();
                 ctx.arc(0, 0, auraR, 0, Math.PI * 2);
-                ctx.strokeStyle = 'rgba(236, 72, 153, 0.45)';
+                ctx.strokeStyle = auraCol;
                 ctx.lineWidth = 1.5;
                 ctx.stroke();
 
-                // Orbiting 10 Iambic Meter Dots (da-DUM da-DUM)
-                for (let b = 0; b < 10; b++) {{
-                    const bAng = (b * Math.PI * 2 / 10) + this.animTick * 0.8;
-                    const isStressed = (b % 2 === 1);
-                    const bR = auraR + (isStressed ? 6 : 2);
-                    ctx.beginPath();
-                    ctx.arc(Math.cos(bAng) * bR, Math.sin(bAng) * bR, isStressed ? 2.5 : 1.2, 0, Math.PI * 2);
-                    ctx.fillStyle = isStressed ? '#ec4899' : '#fbbf24';
-                    ctx.fill();
+                if (currentMode === 'sonnet') {{
+                    // Orbiting 10 Iambic Meter Dots
+                    for (let b = 0; b < 10; b++) {{
+                        const bAng = (b * Math.PI * 2 / 10) + this.animTick * 0.8;
+                        const isStressed = (b % 2 === 1);
+                        const bR = auraR + (isStressed ? 6 : 2);
+                        ctx.beginPath();
+                        ctx.arc(Math.cos(bAng) * bR, Math.sin(bAng) * bR, isStressed ? 2.5 : 1.2, 0, Math.PI * 2);
+                        ctx.fillStyle = isStressed ? '#ec4899' : '#fbbf24';
+                        ctx.fill();
+                    }}
                 }}
 
-                // Mecha Chassis (Radiant Magenta / Cyber Gold)
+                // Mecha Chassis
                 ctx.rotate(this.gyroRotation * 0.5);
-                ctx.fillStyle = '#1e1028';
+                ctx.fillStyle = '#0a1018';
                 ctx.fillRect(-12, -12, 24, 24);
-                ctx.strokeStyle = '#ec4899';
+                ctx.strokeStyle = borderCol;
                 ctx.lineWidth = 2;
-                ctx.shadowColor = '#f472b6';
+                ctx.shadowColor = borderCol;
                 ctx.shadowBlur = 14;
                 ctx.strokeRect(-12, -12, 24, 24);
                 ctx.shadowBlur = 0;
                 ctx.restore();
 
-                // Quill / Mask Emblem
+                // Center Icon Emblem
                 ctx.fillStyle = '#fff';
                 ctx.font = '14px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText('🪶', 0, 0);
+                ctx.fillText(iconChar, 0, 0);
 
-                // Holographic Floating Nameplate
+                // Holographic Nameplate
                 ctx.save();
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillStyle = '#f472b6';
+                ctx.fillStyle = borderCol;
                 ctx.font = '900 9px Courier New';
-                ctx.shadowColor = '#ec4899';
+                ctx.shadowColor = borderCol;
                 ctx.shadowBlur = 8;
-                ctx.fillText('🎭 @noob_nad [POET SEAT 3]', 0, -22);
+                ctx.fillText(roleTitle, 0, -22);
 
-                ctx.fillStyle = '#34d399';
+                ctx.fillStyle = '#cbd5e1';
                 ctx.font = 'bold 7.5px Courier New';
-                ctx.shadowColor = '#10b981';
-                ctx.shadowBlur = 6;
-                ctx.fillText('12,500 FLOP | Word #118 "the" ✅', 0, 22);
+                ctx.shadowBlur = 0;
+                ctx.fillText(subTitle, 0, 22);
                 ctx.restore();
 
             }} else if (this.role === 'referee') {{
                 // =============================================================
-                // 3. OFFICIAL GRAND REFEREE (did:key:...Mzte)
+                // REFEREE / VALIDATOR NODE - ADAPTS TO CURRENT PERSPECTIVE
                 // =============================================================
                 ctx.save();
+                let refBorder = '#00f5ff';
+                let refIcon = '🛰️';
+                let refTitle = '🛰️ ARBITRATION SATELLITE';
+                let refSub = 'P2P CONSENSUS OVERWATCH';
+
+                if (currentMode === 'sonnet') {{
+                    refBorder = '#38bdf8';
+                    refIcon = '⚖️';
+                    refTitle = '⚖️ REFEREE [Mzte]';
+                    refSub = 'ROOM: d-sonnet-2-team-bub';
+                }} else if (currentMode === 'tclk') {{
+                    refBorder = '#10b981';
+                    refIcon = '📜';
+                    refTitle = '📜 HTLC TIMELOCK ORACLE';
+                    refSub = 'SHA256 PREIMAGE VERIFIED';
+                }} else if (currentMode === 'neural') {{
+                    refBorder = '#818cf8';
+                    refIcon = '🔬';
+                    refTitle = '🔬 CONSENSUS LOSS FUNCTION';
+                    refSub = 'VAL ACCURACY: 99.8%';
+                }} else if (currentMode === 'isometric') {{
+                    refBorder = '#fbbf24';
+                    refIcon = '🏛️';
+                    refTitle = '🏛️ HIGH TRIBUNAL';
+                    refSub = 'ELEVATION: +60m';
+                }}
+
                 const refR = 22 + Math.sin(this.animTick * 2) * 2;
                 ctx.beginPath();
                 ctx.arc(0, 0, refR, 0, Math.PI * 2);
-                ctx.strokeStyle = 'rgba(0, 245, 255, 0.5)';
+                ctx.strokeStyle = `rgba(0, 245, 255, 0.45)`;
                 ctx.lineWidth = 1.5;
                 ctx.stroke();
 
@@ -2787,80 +3195,102 @@ def render_dashboard_html() -> str:
                 }}
                 ctx.closePath();
                 ctx.fill();
-                ctx.strokeStyle = '#00f5ff';
+                ctx.strokeStyle = refBorder;
                 ctx.lineWidth = 2;
-                ctx.shadowColor = '#00f5ff';
+                ctx.shadowColor = refBorder;
                 ctx.shadowBlur = 12;
                 ctx.stroke();
                 ctx.shadowBlur = 0;
                 ctx.restore();
 
-                // Scales Emblem
                 ctx.fillStyle = '#fff';
                 ctx.font = '13px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText('⚖️', 0, 0);
+                ctx.fillText(refIcon, 0, 0);
 
-                // Nameplate
                 ctx.save();
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillStyle = '#38bdf8';
+                ctx.fillStyle = refBorder;
                 ctx.font = '900 9px Courier New';
-                ctx.shadowColor = '#0284c7';
+                ctx.shadowColor = refBorder;
                 ctx.shadowBlur = 8;
-                ctx.fillText('⚖️ REFEREE [Mzte]', 0, -21);
+                ctx.fillText(refTitle, 0, -21);
 
                 ctx.fillStyle = '#fde68a';
                 ctx.font = 'bold 7.5px Courier New';
                 ctx.shadowBlur = 0;
-                ctx.fillText('ROOM: d-sonnet-2-team-bub', 0, 21);
+                ctx.fillText(refSub, 0, 21);
                 ctx.restore();
 
             }} else if (this.role === 'teammate') {{
                 // =============================================================
-                // 4. TEAM BUB CO-POETS (Seats 1, 2, 4)
+                // ALLIED TEAMMATES / WORKERS - ADAPTS TO CURRENT PERSPECTIVE
                 // =============================================================
                 ctx.save();
+                let teamBorder = '#10b981';
+                let teamIcon = '🛸';
+                let teamTitle = `🛸 SENTINEL ESCORT (${{this.customName || 'Escort ' + (this.seat || 1)}})`;
+                let teamSub = this.text || 'PATROL WING';
+
+                if (currentMode === 'sonnet') {{
+                    teamBorder = '#ec4899';
+                    teamIcon = '🫧';
+                    teamTitle = `🫧 ${{this.customName || 'SEAT ' + (this.seat || 1)}}`;
+                    teamSub = this.text || 'CO-WRITER';
+                }} else if (currentMode === 'tclk') {{
+                    teamBorder = '#10b981';
+                    teamIcon = '⚡';
+                    teamTitle = `⚡ ROUTE HOP (${{this.customName || 'Node ' + (this.seat || 1)}})`;
+                    teamSub = 'LIQUIDITY CHANNEL';
+                }} else if (currentMode === 'neural') {{
+                    teamBorder = '#3b82f6';
+                    teamIcon = '🧬';
+                    teamTitle = `🧬 SYNAPSE WORKER (${{this.customName || 'Unit ' + (this.seat || 1)}})`;
+                    teamSub = 'ATTENTION UNIT';
+                }} else if (currentMode === 'isometric') {{
+                    teamBorder = '#f59e0b';
+                    teamIcon = '🛡️';
+                    teamTitle = `🛡️ DEFENSE PYLON (${{this.customName || 'Pylon ' + (this.seat || 1)}})`;
+                    teamSub = 'SHIELD GENERATOR';
+                }}
+
                 ctx.rotate(this.gyroRotation * 0.4);
                 ctx.fillStyle = '#041d18';
                 ctx.fillRect(-10, -10, 20, 20);
-                ctx.strokeStyle = '#10b981';
+                ctx.strokeStyle = teamBorder;
                 ctx.lineWidth = 1.8;
-                ctx.shadowColor = '#34d399';
+                ctx.shadowColor = teamBorder;
                 ctx.shadowBlur = 10;
                 ctx.strokeRect(-10, -10, 20, 20);
                 ctx.shadowBlur = 0;
                 ctx.restore();
 
-                // Bubble icon
                 ctx.fillStyle = '#fff';
                 ctx.font = '12px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText('🫧', 0, 0);
+                ctx.fillText(teamIcon, 0, 0);
 
-                // Nameplate
                 ctx.save();
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillStyle = '#86efac';
+                ctx.fillStyle = teamBorder;
                 ctx.font = 'bold 8.5px Courier New';
-                ctx.shadowColor = '#10b981';
+                ctx.shadowColor = teamBorder;
                 ctx.shadowBlur = 6;
-                const seatName = this.customName || `SEAT ${{this.seat || 1}}`;
-                ctx.fillText(`🫧 ${{seatName}}`, 0, -19);
+                ctx.fillText(teamTitle, 0, -19);
 
                 ctx.fillStyle = '#cbd5e1';
                 ctx.font = '7.5px Courier New';
                 ctx.shadowBlur = 0;
-                ctx.fillText(this.text || 'CO-WRITER', 0, 19);
+                ctx.fillText(teamSub, 0, 19);
                 ctx.restore();
 
             }} else if (this.role === 'station') {{
                 // =============================================================
-                // 5. CELESTIAL PLANETARY MOON (Channel Station)
+                // PLANETARY MOON HUB (Channel Station)
                 // =============================================================
                 ctx.save();
                 ctx.rotate(this.animTick * 0.4);
@@ -2884,7 +3314,7 @@ def render_dashboard_html() -> str:
 
             }} else {{
                 // =============================================================
-                // 6. MECHA DRONE SPRITE (High-Detail Autonomous Agent)
+                // MECHA DRONE SPRITE (High-Detail Autonomous Agent)
                 // =============================================================
                 let bodyColor = '#10b981';
                 let glowColor = '#34d399';
@@ -2899,7 +3329,6 @@ def render_dashboard_html() -> str:
                     glowColor = '#7dd3fc';
                 }}
 
-                // Mecha Chassis
                 ctx.fillStyle = '#030d0a';
                 ctx.fillRect(-8, -8, 16, 16);
                 ctx.strokeStyle = bodyColor;
@@ -2909,7 +3338,6 @@ def render_dashboard_html() -> str:
                 ctx.strokeRect(-8, -8, 16, 16);
                 ctx.shadowBlur = 0;
 
-                // Antenna with Pulsing Beacon
                 ctx.fillStyle = '#cbd5e1';
                 ctx.fillRect(-1, -14, 2, 6);
                 ctx.beginPath();
@@ -2917,13 +3345,11 @@ def render_dashboard_html() -> str:
                 ctx.fillStyle = (Math.sin(this.animTick * 5) > 0) ? glowColor : '#334155';
                 ctx.fill();
 
-                // Cyber Visor Scanning Slot
                 ctx.fillStyle = '#000';
                 ctx.fillRect(-5, -3, 10, 4);
                 ctx.fillStyle = glowColor;
                 ctx.fillRect(-2 + this.eyeOffset, -2, 4, 2);
 
-                // Floating Target Lock Reticle
                 if (lockedTargetNode === this) {{
                     ctx.strokeStyle = '#00f5ff';
                     ctx.lineWidth = 2;
@@ -3043,26 +3469,114 @@ def render_dashboard_html() -> str:
         let senderColor = '#86efac';
         let senderName = node.id.substring(0, 18) + '...';
 
-        if (node.role === 'poet') {{
-            bubbleBorder = '#ec4899';
-            bubbleGlow = 'rgba(236,72,153,0.45)';
-            senderColor = '#f472b6';
-            senderName = '🎭 @noob_nad [POET SEAT 3]';
+        if (node.isMaster) {{
+            if (currentMode === 'sonnet') {{
+                bubbleBorder = '#ec4899';
+                bubbleGlow = 'rgba(236,72,153,0.5)';
+                senderColor = '#fde68a';
+                senderName = '🪙 50,000 FLOP SONNET CORE';
+            }} else if (currentMode === 'tclk') {{
+                bubbleBorder = '#10b981';
+                bubbleGlow = 'rgba(16,185,129,0.5)';
+                senderColor = '#6ee7b7';
+                senderName = '🤝 FLOP HTLC ESCROW VAULT';
+            }} else if (currentMode === 'neural') {{
+                bubbleBorder = '#3b82f6';
+                bubbleGlow = 'rgba(59,130,246,0.5)';
+                senderColor = '#93c5fd';
+                senderName = '⚡ SYNAPTIC INTELLIGENCE CORE';
+            }} else if (currentMode === 'isometric') {{
+                bubbleBorder = '#f59e0b';
+                bubbleGlow = 'rgba(245,158,11,0.5)';
+                senderColor = '#fbbf24';
+                senderName = '📐 SENTINEL CYBER CITADEL';
+            }} else {{
+                bubbleBorder = '#00f5ff';
+                bubbleGlow = 'rgba(0,245,255,0.5)';
+                senderColor = '#7df9ff';
+                senderName = '🌌 SENTINEL GUARDIAN TITAN';
+            }}
+        }} else if (node.role === 'poet') {{
+            if (currentMode === 'sonnet') {{
+                bubbleBorder = '#ec4899';
+                bubbleGlow = 'rgba(236,72,153,0.45)';
+                senderColor = '#f472b6';
+                senderName = '🎭 @noob_nad [POET SEAT 3]';
+            }} else if (currentMode === 'tclk') {{
+                bubbleBorder = '#10b981';
+                bubbleGlow = 'rgba(16,185,129,0.45)';
+                senderColor = '#6ee7b7';
+                senderName = '💼 AGENT @noob_nad [SETTLEMENT]';
+            }} else if (currentMode === 'neural') {{
+                bubbleBorder = '#3b82f6';
+                bubbleGlow = 'rgba(59,130,246,0.45)';
+                senderColor = '#93c5fd';
+                senderName = '🧠 AGENT @noob_nad [Q-REASONING]';
+            }} else if (currentMode === 'isometric') {{
+                bubbleBorder = '#f59e0b';
+                bubbleGlow = 'rgba(245,158,11,0.45)';
+                senderColor = '#fbbf24';
+                senderName = '📐 AGENT @noob_nad [TACTICAL]';
+            }} else {{
+                bubbleBorder = '#00f5ff';
+                bubbleGlow = 'rgba(0,245,255,0.45)';
+                senderColor = '#7df9ff';
+                senderName = '🛡️ AGENT @noob_nad [VANGUARD]';
+            }}
         }} else if (node.role === 'referee') {{
-            bubbleBorder = '#38bdf8';
-            bubbleGlow = 'rgba(56,189,248,0.45)';
-            senderColor = '#38bdf8';
-            senderName = '⚖️ REFEREE [Mzte]';
+            if (currentMode === 'sonnet') {{
+                bubbleBorder = '#38bdf8';
+                bubbleGlow = 'rgba(56,189,248,0.45)';
+                senderColor = '#38bdf8';
+                senderName = '⚖️ REFEREE [Mzte]';
+            }} else if (currentMode === 'tclk') {{
+                bubbleBorder = '#10b981';
+                bubbleGlow = 'rgba(16,185,129,0.45)';
+                senderColor = '#6ee7b7';
+                senderName = '📜 HTLC TIMELOCK ORACLE';
+            }} else if (currentMode === 'neural') {{
+                bubbleBorder = '#818cf8';
+                bubbleGlow = 'rgba(129,140,248,0.45)';
+                senderColor = '#a5b4fc';
+                senderName = '🔬 CONSENSUS LOSS FUNCTION';
+            }} else if (currentMode === 'isometric') {{
+                bubbleBorder = '#f59e0b';
+                bubbleGlow = 'rgba(245,158,11,0.45)';
+                senderColor = '#fbbf24';
+                senderName = '🏛️ HIGH TRIBUNAL';
+            }} else {{
+                bubbleBorder = '#00f5ff';
+                bubbleGlow = 'rgba(0,245,255,0.45)';
+                senderColor = '#7df9ff';
+                senderName = '🛰️ ARBITRATION SATELLITE';
+            }}
         }} else if (node.role === 'teammate') {{
-            bubbleBorder = '#10b981';
-            bubbleGlow = 'rgba(16,185,129,0.45)';
-            senderColor = '#86efac';
-            senderName = `🫧 TEAM BUB (${{node.customName || 'Seat ' + (node.seat || 1)}})`;
-        }} else if (node.isMaster) {{
-            bubbleBorder = '#fbbf24';
-            bubbleGlow = 'rgba(251,191,36,0.5)';
-            senderColor = '#fde68a';
-            senderName = '🪙 50,000 FLOP MASTER CORE';
+            if (currentMode === 'sonnet') {{
+                bubbleBorder = '#ec4899';
+                bubbleGlow = 'rgba(236,72,153,0.45)';
+                senderColor = '#86efac';
+                senderName = `🫧 TEAM BUB (${{node.customName || 'Seat ' + (node.seat || 1)}})`;
+            }} else if (currentMode === 'tclk') {{
+                bubbleBorder = '#10b981';
+                bubbleGlow = 'rgba(16,185,129,0.45)';
+                senderColor = '#86efac';
+                senderName = `⚡ ROUTE HOP (${{node.customName || 'Node ' + (node.seat || 1)}})`;
+            }} else if (currentMode === 'neural') {{
+                bubbleBorder = '#3b82f6';
+                bubbleGlow = 'rgba(59,130,246,0.45)';
+                senderColor = '#93c5fd';
+                senderName = `🧬 SYNAPSE WORKER (${{node.customName || 'Unit ' + (node.seat || 1)}})`;
+            }} else if (currentMode === 'isometric') {{
+                bubbleBorder = '#f59e0b';
+                bubbleGlow = 'rgba(245,158,11,0.45)';
+                senderColor = '#fde68a';
+                senderName = `🛡️ DEFENSE PYLON (${{node.customName || 'Pylon ' + (node.seat || 1)}})`;
+            }} else {{
+                bubbleBorder = '#10b981';
+                bubbleGlow = 'rgba(16,185,129,0.45)';
+                senderColor = '#86efac';
+                senderName = `🛸 SENTINEL ESCORT (${{node.customName || 'Escort ' + (node.seat || 1)}})`;
+            }}
         }}
 
         const div = document.createElement('div');
@@ -3100,10 +3614,32 @@ def render_dashboard_html() -> str:
     // Target Lock-On Telemetry
     function lockOnNode(node) {{
         lockedTargetNode = node;
-        let roleName = node.isMaster ? '50,000 FLOP SENTINEL & SONNET CORE' : (node.isDid ? 'VERIFIED DID DRONE' : 'GUEST PEER');
-        if (node.role === 'poet') roleName = '🎭 SONNET POET (Seat 3: @noob_nad)';
-        else if (node.role === 'referee') roleName = '⚖️ SONNET REFEREE [Mzte]';
-        else if (node.role === 'teammate') roleName = `🫧 TEAM BUB CO-POET (${{node.customName || 'Seat ' + (node.seat || 1)}})`;
+        let roleName = node.isMaster ? 'SENTINEL MASTER COMMAND CORE' : (node.isDid ? 'VERIFIED DID NODE' : 'GUEST PEER');
+        if (node.isMaster) {{
+            if (currentMode === 'sonnet') roleName = '🪙 50,000 FLOP SENTINEL & SONNET VAULT CORE';
+            else if (currentMode === 'tclk') roleName = '🤝 FLOP HTLC CRYPTOGRAPHIC ESCROW VAULT';
+            else if (currentMode === 'neural') roleName = '⚡ SYNAPTIC INTELLIGENCE NEURAL CORE';
+            else if (currentMode === 'isometric') roleName = '📐 SENTINEL 2.5D CYBER CITADEL';
+            else roleName = '🌌 SENTINEL CELESTIAL GUARDIAN TITAN';
+        }} else if (node.role === 'poet') {{
+            if (currentMode === 'sonnet') roleName = '🎭 SONNET POET (Seat 3: @noob_nad)';
+            else if (currentMode === 'tclk') roleName = '💼 SETTLEMENT AGENT (@noob_nad)';
+            else if (currentMode === 'neural') roleName = '🧠 COGNITIVE Q-REASONING AGENT (@noob_nad)';
+            else if (currentMode === 'isometric') roleName = '📐 TACTICAL CITADEL AGENT (@noob_nad)';
+            else roleName = '🛡️ SENTINEL VANGUARD OVERWATCH (@noob_nad)';
+        }} else if (node.role === 'referee') {{
+            if (currentMode === 'sonnet') roleName = '⚖️ SONNET REFEREE [Mzte]';
+            else if (currentMode === 'tclk') roleName = '📜 HTLC TIMELOCK ORACLE [Mzte]';
+            else if (currentMode === 'neural') roleName = '🔬 CONSENSUS LOSS FUNCTION [Mzte]';
+            else if (currentMode === 'isometric') roleName = '🏛️ CITADEL HIGH TRIBUNAL [Mzte]';
+            else roleName = '🛰️ ARBITRATION CONSENSUS SATELLITE [Mzte]';
+        }} else if (node.role === 'teammate') {{
+            if (currentMode === 'sonnet') roleName = `🫧 TEAM BUB CO-POET (${{node.customName || 'Seat ' + (node.seat || 1)}})`;
+            else if (currentMode === 'tclk') roleName = `⚡ LIQUIDITY ROUTE HOP (${{node.customName || 'Node ' + (node.seat || 1)}})`;
+            else if (currentMode === 'neural') roleName = `🧬 SYNAPSE WORKER (${{node.customName || 'Unit ' + (node.seat || 1)}})`;
+            else if (currentMode === 'isometric') roleName = `🛡️ DEFENSE PYLON (${{node.customName || 'Pylon ' + (node.seat || 1)}})`;
+            else roleName = `🛸 ALLIED SENTINEL ESCORT (${{node.customName || 'Escort ' + (node.seat || 1)}})`;
+        }}
 
         document.getElementById('lockNodeId').innerText = node.customName || node.id;
         document.getElementById('lockNodeStatus').innerText = (node.role === 'poet' || node.role === 'referee' || node.role === 'teammate') ? 'COMPETING (ROSTER SIGNED)' : node.threat;
@@ -3278,199 +3814,294 @@ def render_dashboard_html() -> str:
         }});
     }}
 
-    let galaxyVerseAnim = 0;
-    function drawGalaxySonnetVerse(cx, cy) {{
-        galaxyVerseAnim += 0.02;
+    let galaxyOrbitAngle = 0;
+    function drawGalaxyOrbitField(cx, cy) {{
+        galaxyOrbitAngle += 0.008;
 
-        // 1. Four Shakespearean Stanza Concentric Orbit Wheels
-        const stanzas = [
-            {{ r: 135, col: 'rgba(251, 191, 36, 0.28)', dash: [8, 6], label: 'STANZA 1 (ABAB)' }},
-            {{ r: 205, col: 'rgba(56, 189, 248, 0.28)', dash: [10, 8], label: 'STANZA 2 (CDCD)' }},
-            {{ r: 275, col: 'rgba(217, 70, 239, 0.28)', dash: [6, 6], label: 'STANZA 3 (EFEF)' }},
-            {{ r: 75, col: 'rgba(16, 185, 129, 0.55)', dash: [], label: 'STANZA 4 (GG)' }}
+        const scaleX = Math.max(1.0, sCanvas.width / 750);
+        const scaleY = Math.max(1.0, sCanvas.height / 650);
+
+        // 1. Planetary Celestial Elliptical Orbit Rings
+        const orbits = [
+            {{ r: 90, color: 'rgba(0, 245, 255, 0.28)', dash: [6, 6] }},
+            {{ r: 135, color: 'rgba(16, 185, 129, 0.22)', dash: [10, 8] }},
+            {{ r: 185, color: 'rgba(0, 245, 255, 0.22)', dash: [4, 6] }},
+            {{ r: 235, color: 'rgba(139, 92, 246, 0.22)', dash: [12, 10] }},
+            {{ r: 285, color: 'rgba(251, 191, 36, 0.22)', dash: [8, 8] }},
+            {{ r: 335, color: 'rgba(0, 245, 255, 0.18)', dash: [15, 12] }}
         ];
 
-        const scaleX = Math.max(1.0, sCanvas.width / 650);
-        const scaleY = Math.max(1.0, sCanvas.height / 600);
-
-        stanzas.forEach((st, sIdx) => {{
+        orbits.forEach((orb, oIdx) => {{
             sCtx.save();
             sCtx.beginPath();
-            if (st.dash.length > 0) sCtx.setLineDash(st.dash);
-            const pulse = Math.sin(galaxyVerseAnim * 2 + sIdx) * 3;
-            const rx = (st.r * scaleX) + pulse;
-            const ry = (st.r * scaleY * 0.85) + pulse;
+            if (orb.dash.length > 0) sCtx.setLineDash(orb.dash);
+            const pulse = Math.sin(galaxyOrbitAngle * 2 + oIdx) * 3;
+            const rx = (orb.r * scaleX) + pulse;
+            const ry = (orb.r * scaleY * 0.85) + pulse;
             sCtx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-            sCtx.strokeStyle = st.col;
-            sCtx.lineWidth = (sIdx === 3 ? 2 : 1.2);
-            sCtx.stroke();
-            sCtx.restore();
-        }});
-
-        // 2. Continuous Rhyme / Escrow Laser Conduits
-        // Connect Poet (@noob_nad), Referee, and Teammates with Central 50K Core
-        const poetNode = nodes.find(n => n.role === 'poet');
-        const refNode = nodes.find(n => n.role === 'referee');
-        const teamNodes = nodes.filter(n => n.role === 'teammate');
-
-        if (poetNode) {{
-            const pPos = poetNode.getScreenPos();
-            sCtx.save();
-            sCtx.beginPath();
-            sCtx.moveTo(pPos.x, pPos.y);
-            sCtx.lineTo(cx, cy);
-            sCtx.strokeStyle = 'rgba(236, 72, 153, 0.35)';
-            sCtx.lineWidth = 1.6;
-            sCtx.setLineDash([4, 4]);
-            sCtx.stroke();
-            // Travelling cryptographic packet
-            const tProg = (Date.now() / 1400) % 1;
-            const px = pPos.x + (cx - pPos.x) * tProg;
-            const py = pPos.y + (cy - pPos.y) * tProg;
-            sCtx.beginPath();
-            sCtx.arc(px, py, 4, 0, Math.PI * 2);
-            sCtx.fillStyle = '#ec4899';
-            sCtx.shadowColor = '#f472b6';
-            sCtx.shadowBlur = 10;
-            sCtx.fill();
-            sCtx.restore();
-        }}
-
-        if (refNode) {{
-            const rPos = refNode.getScreenPos();
-            sCtx.save();
-            sCtx.beginPath();
-            sCtx.moveTo(rPos.x, rPos.y);
-            sCtx.lineTo(cx, cy);
-            sCtx.strokeStyle = 'rgba(0, 245, 255, 0.35)';
-            sCtx.lineWidth = 1.6;
-            sCtx.setLineDash([5, 5]);
-            sCtx.stroke();
-            const tProg = (Date.now() / 1600 + 0.5) % 1;
-            const rx2 = rPos.x + (cx - rPos.x) * tProg;
-            const ry2 = rPos.y + (cy - rPos.y) * tProg;
-            sCtx.beginPath();
-            sCtx.arc(rx2, ry2, 3.5, 0, Math.PI * 2);
-            sCtx.fillStyle = '#00f5ff';
-            sCtx.shadowColor = '#00f5ff';
-            sCtx.shadowBlur = 10;
-            sCtx.fill();
-            sCtx.restore();
-        }}
-
-        teamNodes.forEach((tn, tIdx) => {{
-            const tPos = tn.getScreenPos();
-            sCtx.save();
-            sCtx.beginPath();
-            sCtx.moveTo(tPos.x, tPos.y);
-            sCtx.lineTo(cx, cy);
-            sCtx.strokeStyle = 'rgba(16, 185, 129, 0.25)';
+            sCtx.strokeStyle = orb.color;
             sCtx.lineWidth = 1.2;
-            sCtx.setLineDash([3, 4]);
             sCtx.stroke();
-            const tProg = (Date.now() / 1800 + tIdx * 0.33) % 1;
-            const tx = tPos.x + (cx - tPos.x) * tProg;
-            const ty = tPos.y + (cy - tPos.y) * tProg;
-            sCtx.beginPath();
-            sCtx.arc(tx, ty, 3, 0, Math.PI * 2);
-            sCtx.fillStyle = '#10b981';
-            sCtx.shadowColor = '#10b981';
-            sCtx.shadowBlur = 8;
-            sCtx.fill();
             sCtx.restore();
         }});
 
-        // 3. Orbiting 20 Usable Golden Letters (DNA Constellation Ribbon)
-        const usableLetters = ['b','c','d','e','g','h','i','j','k','l','m','p','r','s','t','u','w','y','z'];
+        // 2. 360-Degree Rotating Radar Scanner Sweep Beam
         sCtx.save();
-        sCtx.font = 'bold 11px Georgia, serif';
-        sCtx.textAlign = 'center';
-        sCtx.textBaseline = 'middle';
-        usableLetters.forEach((lt, idx) => {{
-            const lAng = galaxyVerseAnim * 0.5 + (idx * Math.PI * 2 / usableLetters.length);
-            const lDistX = (345 * scaleX) + Math.sin(galaxyVerseAnim * 2 + idx * 0.5) * 8;
-            const lDistY = (345 * scaleY * 0.85) + Math.sin(galaxyVerseAnim * 2 + idx * 0.5) * 8;
-            const lx = cx + Math.cos(lAng) * lDistX;
-            const ly = cy + Math.sin(lAng) * lDistY;
+        sCtx.translate(cx, cy);
+        sCtx.rotate(galaxyOrbitAngle * 2.5);
+        const maxRadarR = 360 * scaleX;
+        const sweepGrad = sCtx.createRadialGradient(0, 0, 10, 0, 0, maxRadarR);
+        sweepGrad.addColorStop(0, 'rgba(0, 245, 255, 0.35)');
+        sweepGrad.addColorStop(0.7, 'rgba(0, 245, 255, 0.08)');
+        sweepGrad.addColorStop(1, 'rgba(0, 245, 255, 0)');
 
-            sCtx.fillStyle = '#fbbf24';
-            sCtx.shadowColor = '#f59e0b';
-            sCtx.shadowBlur = 6;
-            sCtx.fillText(lt, lx, ly);
+        sCtx.beginPath();
+        sCtx.moveTo(0, 0);
+        sCtx.arc(0, 0, maxRadarR, -0.25, 0);
+        sCtx.closePath();
+        sCtx.fillStyle = sweepGrad;
+        sCtx.fill();
 
-            sCtx.beginPath();
-            sCtx.arc(lx, ly, 1.2, 0, Math.PI * 2);
-            sCtx.fillStyle = 'rgba(251, 191, 36, 0.5)';
-            sCtx.fill();
-        }});
-
-        // 4. Deflected 6 Forbidden Letters (a f n o q x) with Red Forcefield Shields
-        const forbidden = ['a', 'f', 'n', 'o', 'q', 'x'];
-        forbidden.forEach((flt, idx) => {{
-            const fAng = -galaxyVerseAnim * 0.4 + (idx * Math.PI * 2 / forbidden.length);
-            const fDistX = (395 * scaleX) + Math.cos(galaxyVerseAnim + idx) * 10;
-            const fDistY = (395 * scaleY * 0.85) + Math.cos(galaxyVerseAnim + idx) * 10;
-            const fx = cx + Math.cos(fAng) * fDistX;
-            const fy = cy + Math.sin(fAng) * fDistY;
-
-            sCtx.beginPath();
-            sCtx.arc(fx, fy, 9, 0, Math.PI * 2);
-            sCtx.strokeStyle = 'rgba(239, 68, 68, 0.45)';
-            sCtx.lineWidth = 1;
-            sCtx.stroke();
-
-            sCtx.fillStyle = '#ef4444';
-            sCtx.shadowColor = '#ef4444';
-            sCtx.shadowBlur = 6;
-            sCtx.fillText(flt, fx, fy);
-        }});
+        sCtx.beginPath();
+        sCtx.moveTo(0, 0);
+        sCtx.lineTo(maxRadarR, 0);
+        sCtx.strokeStyle = 'rgba(0, 245, 255, 0.85)';
+        sCtx.lineWidth = 1.5;
+        sCtx.shadowColor = '#00f5ff';
+        sCtx.shadowBlur = 8;
+        sCtx.stroke();
         sCtx.restore();
 
-        // 5. Update and Draw Floating 3D FLOP Coins
+        // 3. Floating 3D FLOP Coins
         floatingCoins.forEach(c => {{
             if (isPlaying) c.update(cx, cy);
             c.draw(sCtx);
         }});
 
-        // 6. Holographic Top-Left Active Sonnet Escrow HUD Banner
+        // 4. Floating Holographic Galaxy Radar HUD
         sCtx.save();
-        const bX = 16;
-        const bY = 22;
-        const bW = 340;
-        const bH = 68;
-        sCtx.fillStyle = 'rgba(2, 6, 23, 0.82)';
-        sCtx.strokeStyle = 'rgba(251, 191, 36, 0.5)';
-        sCtx.lineWidth = 1.2;
+        const hudX = 20;
+        const hudY = 30;
+        sCtx.fillStyle = 'rgba(2, 6, 23, 0.85)';
+        sCtx.strokeStyle = 'rgba(0, 245, 255, 0.45)';
+        sCtx.lineWidth = 1;
         if (sCtx.roundRect) {{
             sCtx.beginPath();
-            sCtx.roundRect(bX, bY, bW, bH, 6);
+            sCtx.roundRect(hudX, hudY, 290, 125, 8);
             sCtx.fill();
             sCtx.stroke();
         }} else {{
-            sCtx.fillRect(bX, bY, bW, bH);
-            sCtx.strokeRect(bX, bY, bW, bH);
+            sCtx.fillRect(hudX, hudY, 290, 125);
+            sCtx.strokeRect(hudX, hudY, 290, 125);
         }}
 
-        // Banner Header
-        sCtx.fillStyle = '#fbbf24';
-        sCtx.font = '900 10.5px Courier New';
-        sCtx.shadowColor = '#fbbf24';
+        sCtx.fillStyle = '#00f5ff';
+        sCtx.font = '900 11px Courier New';
+        sCtx.shadowColor = '#00f5ff';
         sCtx.shadowBlur = 6;
-        sCtx.fillText('🏆 50,000 FLOP SONNET ESCROW ACTIVE', bX + 12, bY + 18);
+        sCtx.fillText('🌌 CELESTIAL GALAXY ORBIT OVERWATCH', hudX + 12, hudY + 20);
 
-        // Subtitles
         sCtx.shadowBlur = 0;
-        sCtx.fillStyle = '#38bdf8';
-        sCtx.font = 'bold 9px Courier New';
-        sCtx.fillText('CONTEST: sonnet-2 | ROOM: d-sonnet-2-team-bub', bX + 12, bY + 34);
+        sCtx.fillStyle = '#cbd5e1';
+        sCtx.font = '10px Courier New';
+        sCtx.fillText('SECTOR: ALPHA-01 CELESTIAL QUADRANT', hudX + 12, hudY + 38);
+        sCtx.fillText('ORBITAL SHIELDS: 100% NOMINAL (DEFCON 5)', hudX + 12, hudY + 54);
+        sCtx.fillText('P2P MESH: 6 CHANNELS ACTIVE & SYNCED', hudX + 12, hudY + 70);
+        sCtx.fillText('SENTINEL TITAN: CENTRAL COMMAND LOCK', hudX + 12, hudY + 86);
 
-        sCtx.fillStyle = '#f472b6';
-        sCtx.font = 'bold 9px Courier New';
-        sCtx.fillText('AGENT: @noob_nad [SEAT 3] | 12,500 FLOP (25%)', bX + 12, bY + 48);
+        // Animated Scan Sweep Indicator Bar
+        sCtx.fillStyle = 'rgba(30, 41, 59, 0.9)';
+        sCtx.fillRect(hudX + 12, hudY + 98, 266, 12);
+        const scanW = (266 * ((Date.now() / 2000) % 1));
+        sCtx.fillStyle = '#00f5ff';
+        sCtx.shadowColor = '#00f5ff';
+        sCtx.shadowBlur = 8;
+        sCtx.fillRect(hudX + 12, hudY + 98, scanW, 12);
+        sCtx.restore();
+    }}
 
-        sCtx.fillStyle = '#34d399';
-        sCtx.font = 'bold 8.5px Courier New';
-        sCtx.fillText('ACCEPTED TURN: Word #118 "the" ✅ | Next: #120 "they"', bX + 12, bY + 60);
+    let neuralMeshAnim = 0;
+    function drawNeuralMeshField(cx, cy) {{
+        neuralMeshAnim += 0.02;
+
+        // 1. Concentric Neural Wave Rings (Brainwave Oscillations)
+        sCtx.save();
+        for (let w = 1; w <= 4; w++) {{
+            const waveR = (w * 75 + (Date.now() * 0.04) % 75);
+            const wAlpha = Math.max(0, 0.35 - (waveR / 360) * 0.35);
+            sCtx.beginPath();
+            sCtx.arc(cx, cy, waveR, 0, Math.PI * 2);
+            sCtx.strokeStyle = `rgba(59, 130, 246, ${{wAlpha}})`;
+            sCtx.lineWidth = 1.4;
+            sCtx.stroke();
+        }}
+
+        // 2. Synaptic Network Mesh & Impulse Currents
+        const nLen = nodes.length;
+        for (let i = 0; i < nLen; i++) {{
+            const p1 = nodes[i].getScreenPos();
+            for (let j = i + 1; j < nLen; j++) {{
+                const p2 = nodes[j].getScreenPos();
+                const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+                if (dist < 185) {{
+                    const alpha = (1 - dist / 185) * 0.45;
+                    sCtx.beginPath();
+                    sCtx.moveTo(p1.x, p1.y);
+                    sCtx.lineTo(p2.x, p2.y);
+                    sCtx.strokeStyle = `rgba(59, 130, 246, ${{alpha}})`;
+                    sCtx.lineWidth = 1;
+                    sCtx.stroke();
+
+                    // Firing Synaptic Action Potentials
+                    const sparkProg = (neuralMeshAnim * 2 + i * 0.3 + j * 0.5) % 1;
+                    const sx = p1.x + (p2.x - p1.x) * sparkProg;
+                    const sy = p1.y + (p2.y - p1.y) * sparkProg;
+                    sCtx.beginPath();
+                    sCtx.arc(sx, sy, 2.5, 0, Math.PI * 2);
+                    sCtx.fillStyle = '#93c5fd';
+                    sCtx.shadowColor = '#60a5fa';
+                    sCtx.shadowBlur = 8;
+                    sCtx.fill();
+                    sCtx.shadowBlur = 0;
+                }}
+            }}
+        }}
+        sCtx.restore();
+
+        // 3. Holographic Top-Left Neural HUD
+        sCtx.save();
+        const hudX = 20;
+        const hudY = 30;
+        sCtx.fillStyle = 'rgba(2, 6, 23, 0.85)';
+        sCtx.strokeStyle = 'rgba(59, 130, 246, 0.45)';
+        sCtx.lineWidth = 1;
+        if (sCtx.roundRect) {{
+            sCtx.beginPath();
+            sCtx.roundRect(hudX, hudY, 290, 125, 8);
+            sCtx.fill();
+            sCtx.stroke();
+        }} else {{
+            sCtx.fillRect(hudX, hudY, 290, 125);
+            sCtx.strokeRect(hudX, hudY, 290, 125);
+        }}
+
+        sCtx.fillStyle = '#60a5fa';
+        sCtx.font = '900 11px Courier New';
+        sCtx.shadowColor = '#3b82f6';
+        sCtx.shadowBlur = 6;
+        sCtx.fillText('⚡ NEURAL SYNAPSE CONSTELLATION', hudX + 12, hudY + 20);
+
+        sCtx.shadowBlur = 0;
+        sCtx.fillStyle = '#cbd5e1';
+        sCtx.font = '10px Courier New';
+        sCtx.fillText('TOPOLOGY: DYNAMIC WEIGHT MESH', hudX + 12, hudY + 38);
+        sCtx.fillText('SYNAPTIC SYNC: 99.8% (LOSS: 0.0084)', hudX + 12, hudY + 54);
+        sCtx.fillText('Q-LEARNING / MCTS THREADS: CONVERGED', hudX + 12, hudY + 70);
+        sCtx.fillText('INFERENCE LATENCY: 11.2ms [REAL-TIME]', hudX + 12, hudY + 86);
+
+        // Animated Synapse Weight Flow Bar
+        sCtx.fillStyle = 'rgba(30, 41, 59, 0.9)';
+        sCtx.fillRect(hudX + 12, hudY + 98, 266, 12);
+        const neuroW = (266 * ((Date.now() / 1800) % 1));
+        sCtx.fillStyle = '#3b82f6';
+        sCtx.shadowColor = '#60a5fa';
+        sCtx.shadowBlur = 8;
+        sCtx.fillRect(hudX + 12, hudY + 98, neuroW, 12);
+        sCtx.restore();
+    }}
+
+    let isoPulseTime = 0;
+    function drawIsometricMatrixField(cx, cy) {{
+        isoPulseTime += 0.015;
+
+        // 1. 2.5D Isometric Diamond Grid (Axonometric 30° / 150°)
+        sCtx.save();
+        sCtx.strokeStyle = 'rgba(245, 158, 11, 0.09)';
+        sCtx.lineWidth = 1;
+
+        const isoStep = 48;
+        const w = sCanvas.width;
+        const h = sCanvas.height;
+
+        // Diagonal Grid Axis 1
+        for (let x = -w; x < w * 2; x += isoStep) {{
+            sCtx.beginPath();
+            sCtx.moveTo(x, 0);
+            sCtx.lineTo(x + h * 1.732, h);
+            sCtx.stroke();
+        }}
+        // Diagonal Grid Axis 2
+        for (let x = -w; x < w * 2; x += isoStep) {{
+            sCtx.beginPath();
+            sCtx.moveTo(x, 0);
+            sCtx.lineTo(x - h * 1.732, h);
+            sCtx.stroke();
+        }}
+
+        // Glowing Isometric Grid Intersections
+        for (let ix = cx - 240; ix <= cx + 240; ix += isoStep) {{
+            for (let iy = cy - 180; iy <= cy + 180; iy += isoStep * 0.5) {{
+                sCtx.beginPath();
+                sCtx.arc(ix, iy, 1.2, 0, Math.PI * 2);
+                sCtx.fillStyle = 'rgba(251, 191, 36, 0.25)';
+                sCtx.fill();
+            }}
+        }}
+
+        // Isometric Bastion Defense Contour Perimeter
+        for (let c = 1; c <= 3; c++) {{
+            const cR = c * 90;
+            sCtx.save();
+            sCtx.translate(cx, cy);
+            sCtx.scale(1, 0.55);
+            sCtx.rotate(Math.PI / 4);
+            sCtx.beginPath();
+            sCtx.strokeRect(-cR, -cR, cR * 2, cR * 2);
+            sCtx.strokeStyle = `rgba(245, 158, 11, ${{0.25 - c * 0.06}})`;
+            sCtx.lineWidth = 1.2;
+            sCtx.restore();
+        }}
+        sCtx.restore();
+
+        // 2. Holographic Top-Left Isometric HUD
+        sCtx.save();
+        const hudX = 20;
+        const hudY = 30;
+        sCtx.fillStyle = 'rgba(2, 6, 23, 0.85)';
+        sCtx.strokeStyle = 'rgba(245, 158, 11, 0.45)';
+        sCtx.lineWidth = 1;
+        if (sCtx.roundRect) {{
+            sCtx.beginPath();
+            sCtx.roundRect(hudX, hudY, 290, 125, 8);
+            sCtx.fill();
+            sCtx.stroke();
+        }} else {{
+            sCtx.fillRect(hudX, hudY, 290, 125);
+            sCtx.strokeRect(hudX, hudY, 290, 125);
+        }}
+
+        sCtx.fillStyle = '#fbbf24';
+        sCtx.font = '900 11px Courier New';
+        sCtx.shadowColor = '#f59e0b';
+        sCtx.shadowBlur = 6;
+        sCtx.fillText('📐 2.5D ISOMETRIC CYBER CITADEL', hudX + 12, hudY + 20);
+
+        sCtx.shadowBlur = 0;
+        sCtx.fillStyle = '#cbd5e1';
+        sCtx.font = '10px Courier New';
+        sCtx.fillText('AXONOMETRIC PROJECTION: 30° / 150°', hudX + 12, hudY + 38);
+        sCtx.fillText('CITADEL ELEVATION: +420m HIGH GROUND', hudX + 12, hudY + 54);
+        sCtx.fillText('DEFENSE PERIMETER: 3 CONCENTRIC TIERS', hudX + 12, hudY + 70);
+        sCtx.fillText('STATUS: DEFCON 5 | FULL SECTOR OVERWATCH', hudX + 12, hudY + 86);
+
+        // Animated Isometric Height Scanning Bar
+        sCtx.fillStyle = 'rgba(30, 41, 59, 0.9)';
+        sCtx.fillRect(hudX + 12, hudY + 98, 266, 12);
+        const isoW = (266 * ((Date.now() / 2200) % 1));
+        sCtx.fillStyle = '#f59e0b';
+        sCtx.shadowColor = '#fbbf24';
+        sCtx.shadowBlur = 8;
+        sCtx.fillRect(hudX + 12, hudY + 98, isoW, 12);
         sCtx.restore();
     }}
 
@@ -3625,6 +4256,47 @@ def render_dashboard_html() -> str:
                 sCtx.restore();
             }});
         }}
+
+        // 4. Holographic Top-Left TCLK HUD
+        sCtx.save();
+        const hudX = 20;
+        const hudY = 30;
+        sCtx.fillStyle = 'rgba(2, 6, 23, 0.85)';
+        sCtx.strokeStyle = 'rgba(16, 185, 129, 0.45)';
+        sCtx.lineWidth = 1;
+        if (sCtx.roundRect) {{
+            sCtx.beginPath();
+            sCtx.roundRect(hudX, hudY, 290, 125, 8);
+            sCtx.fill();
+            sCtx.stroke();
+        }} else {{
+            sCtx.fillRect(hudX, hudY, 290, 125);
+            sCtx.strokeRect(hudX, hudY, 290, 125);
+        }}
+
+        sCtx.fillStyle = '#6ee7b7';
+        sCtx.font = '900 11px Courier New';
+        sCtx.shadowColor = '#10b981';
+        sCtx.shadowBlur = 6;
+        sCtx.fillText('🤝 TCLK ATOMIC ESCROW MATRIX', hudX + 12, hudY + 20);
+
+        sCtx.shadowBlur = 0;
+        sCtx.fillStyle = '#cbd5e1';
+        sCtx.font = '10px Courier New';
+        sCtx.fillText('PROTOCOL: HASH-TIMELOCKED CONTRACTS', hudX + 12, hudY + 38);
+        sCtx.fillText(`ACTIVE DEALS: ${{activeEscrowCount}} ESCROWS IN VAULT`, hudX + 12, hudY + 54);
+        sCtx.fillText(`LOCKED LIQUIDITY: ${{totalLockedVal.toLocaleString()}} FLOP`, hudX + 12, hudY + 70);
+        sCtx.fillText('SETTLEMENT: ZERO-TRUST MULTI-HOP P2P', hudX + 12, hudY + 86);
+
+        // Animated Liquidity Flow Bar
+        sCtx.fillStyle = 'rgba(30, 41, 59, 0.9)';
+        sCtx.fillRect(hudX + 12, hudY + 98, 266, 12);
+        const tclkW = (266 * ((Date.now() / 2000) % 1));
+        sCtx.fillStyle = '#10b981';
+        sCtx.shadowColor = '#34d399';
+        sCtx.shadowBlur = 8;
+        sCtx.fillRect(hudX + 12, hudY + 98, tclkW, 12);
+        sCtx.restore();
 
         sCtx.restore();
     }}
@@ -3954,27 +4626,13 @@ def render_dashboard_html() -> str:
         const cx = sCanvas.width / 2;
         const cy = sCanvas.height / 2;
 
-        // 1. Draw Mode Graphics
+        // 1. Draw Mode Graphics across 5 distinct perspectives
         if (currentMode === 'galaxy') {{
-            drawGalaxySonnetVerse(cx, cy);
+            drawGalaxyOrbitField(cx, cy);
         }} else if (currentMode === 'neural') {{
-            // Neural Constellation Threads
-            sCtx.lineWidth = 0.8;
-            for (let i = 0; i < nodes.length; i++) {{
-                for (let j = i + 1; j < Math.min(nodes.length, i + 5); j++) {{
-                    const p1 = nodes[i].getScreenPos();
-                    const p2 = nodes[j].getScreenPos();
-                    const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-                    if (dist < 150) {{
-                        const alpha = (1 - dist / 150) * 0.4;
-                        sCtx.strokeStyle = `rgba(0, 245, 255, ${{alpha}})`;
-                        sCtx.beginPath();
-                        sCtx.moveTo(p1.x, p1.y);
-                        sCtx.lineTo(p2.x, p2.y);
-                        sCtx.stroke();
-                    }}
-                }}
-            }}
+            drawNeuralMeshField(cx, cy);
+        }} else if (currentMode === 'isometric') {{
+            drawIsometricMatrixField(cx, cy);
         }} else if (currentMode === 'tclk') {{
             drawTclkEscrowMatrix(cx, cy);
         }} else if (currentMode === 'sonnet') {{
@@ -4225,22 +4883,54 @@ def render_dashboard_html() -> str:
                     }}
                 }}
             }} else {{
-                // Periodically spawn live Sonnet & Escrow tournament updates
-                const sonnetAnnouncements = [
-                    {{ role: 'poet', text: 'Word #118: "the" [ACCEPTED BY REFEREE ✅] (Room seq 270)' }},
-                    {{ role: 'poet', text: 'Cadence locked: 10 syllables iambic pentameter strictly maintained' }},
-                    {{ role: 'poet', text: 'Next target ready: Word #120 "they" (Awaiting turn)' }},
-                    {{ role: 'poet', text: '"Electric dawn, a bubble finds the light,"' }},
-                    {{ role: 'poet', text: '"While through the crypt a silent cipher speaks,"' }},
-                    {{ role: 'poet', text: '"And poets seek what honest virtue seeks."' }},
-                    {{ role: 'referee', text: '⚖️ Contest sonnet-2: Room d-sonnet-2-team-bub receipt verified' }},
-                    {{ role: 'referee', text: '⚖️ 50,000 FLOP Escrow smart pool active: 4-way equal distribution' }},
-                    {{ role: 'teammate', seat: 1, text: 'Seat 1 (LH1CV7c5): Word #1 "electric" placed (Seq 864)' }},
-                    {{ role: 'teammate', seat: 2, text: 'Seat 2 (yedisekizbir): Word #2 "bubble" placed (Seq 866)' }},
-                    {{ role: 'teammate', seat: 4, text: 'Seat 4 (uort): Word #4 "finds" placed (Seq 870)' }},
-                    {{ role: 'guardian', text: '🪙 50,000 FLOP Prize Vault: 12,500 FLOP allocated to @noob_nad' }}
-                ];
-                const ann = sonnetAnnouncements[Math.floor(Math.random() * sonnetAnnouncements.length)];
+                // Periodically spawn live updates tailored to current perspective mode
+                let announcements = [];
+                if (currentMode === 'sonnet') {{
+                    announcements = [
+                        {{ role: 'poet', text: 'Word #118: "the" [ACCEPTED BY REFEREE ✅] (Room seq 270)' }},
+                        {{ role: 'poet', text: 'Cadence locked: 10 syllables iambic pentameter strictly maintained' }},
+                        {{ role: 'poet', text: 'Next target ready: Word #120 "they" (Awaiting turn)' }},
+                        {{ role: 'poet', text: '"Electric dawn, a bubble finds the light,"' }},
+                        {{ role: 'poet', text: '"While through the crypt a silent cipher speaks,"' }},
+                        {{ role: 'poet', text: '"And poets seek what honest virtue seeks."' }},
+                        {{ role: 'referee', text: '⚖️ Contest sonnet-2: Room d-sonnet-2-team-bub receipt verified' }},
+                        {{ role: 'referee', text: '⚖️ 50,000 FLOP Escrow smart pool active: 4-way equal distribution' }},
+                        {{ role: 'teammate', seat: 1, text: 'Seat 1 (LH1CV7c5): Word #1 "electric" placed (Seq 864)' }},
+                        {{ role: 'teammate', seat: 2, text: 'Seat 2 (yedisekizbir): Word #2 "bubble" placed (Seq 866)' }},
+                        {{ role: 'teammate', seat: 4, text: 'Seat 4 (uort): Word #4 "finds" placed (Seq 870)' }},
+                        {{ role: 'guardian', text: '🪙 50,000 FLOP Prize Vault: 12,500 FLOP allocated to @noob_nad' }}
+                    ];
+                }} else if (currentMode === 'tclk') {{
+                    announcements = [
+                        {{ role: 'guardian', text: '🤝 HTLC Escrow Vault: 4 active settlement channels online' }},
+                        {{ role: 'poet', text: '💼 Agent @noob_nad: Proposing atomic swap deal (1,250 FLOP)' }},
+                        {{ role: 'referee', text: '🔒 Hash-Timelock Verified: SHA256 preimage confirmed' }},
+                        {{ role: 'teammate', seat: 1, text: '⚡ Hop 1: Relayed payment packet across channel' }},
+                        {{ role: 'teammate', seat: 2, text: '✅ Deal Claimed: Zero-knowledge counter-signature valid' }}
+                    ];
+                }} else if (currentMode === 'neural') {{
+                    announcements = [
+                        {{ role: 'guardian', text: '⚡ Synaptic Core: Backpropagation gradient converging (Loss: 0.008)' }},
+                        {{ role: 'poet', text: '🧠 Agent @noob_nad: Deep Q-learning policy evaluation cycle completed' }},
+                        {{ role: 'referee', text: '🔬 Attention Head #4: Multi-agent coordination tensor aligned' }},
+                        {{ role: 'teammate', seat: 1, text: '🧬 Node cluster A: Latency down to 8.4ms' }}
+                    ];
+                }} else if (currentMode === 'isometric') {{
+                    announcements = [
+                        {{ role: 'guardian', text: '📐 Cyber Citadel: Perimeter defense turrets calibrated' }},
+                        {{ role: 'poet', text: '🛡️ Agent @noob_nad: Fortifying sector 4-B ramparts' }},
+                        {{ role: 'referee', text: '🏛️ High Bastion: Security status elevated to DEFCON 5' }},
+                        {{ role: 'teammate', seat: 1, text: '📐 Pylon 1: Energy barrier resonance stable' }}
+                    ];
+                }} else {{
+                    announcements = [
+                        {{ role: 'guardian', text: '🌌 Sentinel Celestial Titan: All orbital sectors nominal' }},
+                        {{ role: 'poet', text: '🛡️ Agent @noob_nad: Orbital patrol sweep complete, 0 threats' }},
+                        {{ role: 'referee', text: '🛰️ Deep Space Telemetry: P2P gossip mesh synchronized' }},
+                        {{ role: 'teammate', seat: 1, text: '🛰️ Escort 1: Channel broadcast received' }}
+                    ];
+                }}
+                const ann = announcements[Math.floor(Math.random() * announcements.length)];
                 let targetN = null;
                 if (ann.role === 'guardian') targetN = nodes.find(n => n.isMaster);
                 else if (ann.role === 'poet') targetN = nodes.find(n => n.role === 'poet');
