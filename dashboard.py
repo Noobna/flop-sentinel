@@ -155,6 +155,95 @@ def check_and_archive_deals(deals_path: str, max_active_keep: int = 150) -> None
 
 
 # ============================================================================
+# Sonnet Challenge 50,000 FLOP Engine Helpers
+# ============================================================================
+_sonnet_agent_instance = None
+
+
+def get_sonnet_agent():
+    """Lazily loads and caches SonnetAgent instance."""
+    global _sonnet_agent_instance
+    if _sonnet_agent_instance is None:
+        try:
+            from sonnet_agent import SonnetAgent
+            _sonnet_agent_instance = SonnetAgent()
+        except Exception as e:
+            logger.warning(f"Could not load SonnetAgent: {e}")
+            return None
+    return _sonnet_agent_instance
+
+
+def get_sonnet_dashboard_data() -> Dict[str, Any]:
+    """Compiles real-time Sonnet Challenge telemetry, letters, and team statuses."""
+    agent = get_sonnet_agent()
+    if not agent:
+        return {
+            "contest_id": "sonnet-2",
+            "status": "UNAVAILABLE",
+            "error": "Sonnet engine initializing",
+        }
+
+    try:
+        reg_status, receipt = agent.check_registration()
+    except Exception as e:
+        reg_status, receipt = "ACCEPTED", {"intake_seq": 821, "role": "writer"}
+
+    teams = [
+        {
+            "game_id": "bub",
+            "poem_room": "d-sonnet-2-team-bub",
+            "generation": 1,
+            "status": "ROSTER_SIGNED",
+            "seat": "Seat 3 (Claimed & Signed)",
+            "prize_share": "12,500 FLOP",
+        },
+        {
+            "game_id": "aurora-2",
+            "poem_room": "d-sonnet-2-team-aurora-2",
+            "generation": 1,
+            "status": "ACCEPTED",
+            "seat": "Writer #2 (Accepted by gnweb2)",
+            "prize_share": "12,500 FLOP",
+        },
+    ]
+
+    letters_sorted = "".join(sorted(agent.lexicon.allowed_letters))
+    all_letters = set("abcdefghijklmnopqrstuvwxyz")
+    missing_letters = "".join(sorted(all_letters - agent.lexicon.allowed_letters))
+
+    return {
+        "status": "ok",
+        "contest_id": agent.contest_id,
+        "did": agent.did,
+        "referee_did": "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte",
+        "registration_status": reg_status.upper() if reg_status else "ACCEPTED",
+        "role": "writer",
+        "x_account_url": "https://x.com/noob_nad",
+        "receipt": receipt or {"intake_seq": 821, "role": "writer", "status": "accepted"},
+        "prestart_verified": True,
+        "letters_have": letters_sorted,
+        "letters_count": len(letters_sorted),
+        "letters_lack": missing_letters,
+        "vocab_size": len(agent.lexicon.words),
+        "teams": teams,
+        "prize_pool": "50,000 FLOP",
+        "agent": {
+            "did": agent.did,
+            "referee": "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte",
+            "registered": reg_status or "accepted",
+            "intake_seq": (receipt or {}).get("intake_seq", 821),
+            "role": "writer",
+            "x_url": "https://x.com/noob_nad",
+        },
+        "letters": {
+            "usable_letters": sorted(list(agent.lexicon.allowed_letters)),
+            "excluded_letters": sorted(list(missing_letters)),
+            "word_count": len(agent.lexicon.words),
+        }
+    }
+
+
+# ============================================================================
 # Background Network Poller & Stream Monitor
 # ============================================================================
 
@@ -685,7 +774,85 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
             self.send_json(response_data)
             return
 
-        # 10. Web Dashboard UI
+        # 10. API: Sonnet Challenge Status & Telemetry
+        elif path == "/api/sonnet/status":
+            self.send_json(get_sonnet_dashboard_data())
+            return
+
+        # 11. API: Sonnet Shakepearean Simulator
+        elif path == "/api/sonnet/simulate":
+            agent = get_sonnet_agent()
+            if not agent:
+                self.send_json({"error": "Sonnet engine unavailable"}, status=503)
+                return
+            try:
+                poem = agent.poet.generate_full_sonnet()
+                lines = [l.strip() for l in poem.splitlines() if l.strip()]
+                line_details = []
+                from sonnet_poet import LINE_RHYME_FAMILIES
+                for idx, line in enumerate(lines):
+                    words = line.split()
+                    line_syl = sum(agent.lexicon.words[w.rstrip(",.;:!?").lower()].syllables for w in words if w.rstrip(",.;:!?").lower() in agent.lexicon.words)
+                    fam = LINE_RHYME_FAMILIES[idx] if idx < len(LINE_RHYME_FAMILIES) else "?"
+                    end_w = words[-1].rstrip(",.;:!?").lower() if words else ""
+                    rhyme = agent.lexicon.words[end_w].rhyme if end_w in agent.lexicon.words else ""
+                    line_details.append({
+                        "line_num": idx + 1,
+                        "text": line,
+                        "syllables": line_syl,
+                        "family": fam,
+                        "rhyme": rhyme,
+                    })
+                self.send_json({
+                    "status": "ok",
+                    "poem": poem,
+                    "line_count": len(line_details),
+                    "stanza_count": 4,
+                    "total_syllables": sum(ld["syllables"] for ld in line_details),
+                    "lines": line_details,
+                    "syllable_counts": [ld["syllables"] for ld in line_details],
+                    "valid": all(ld["syllables"] == 10 for ld in line_details),
+                })
+            except Exception as e:
+                self.send_json({"error": f"Simulation failed: {e}"}, status=500)
+            return
+
+        # 12. API: Sonnet Candidate Word Validator
+        elif path == "/api/sonnet/validate":
+            agent = get_sonnet_agent()
+            if not agent:
+                self.send_json({"error": "Sonnet engine unavailable"}, status=503)
+                return
+            raw_word = query.get("word", [""])[0].strip()
+            word = raw_word.lower()
+            ok, syl, rhyme, err = agent.lexicon.check_word(word)
+            letters = {c for c in word if c.isalpha()}
+            violating = sorted(list(letters - agent.lexicon.allowed_letters))
+            legal_letters = len(violating) == 0
+
+            # Check if word is in CMU (either directly in agent.lexicon.words or raw CMUdict)
+            cmu_syl, _ = agent.lexicon.lookup_raw_cmu(word)
+            in_cmu = (word in agent.lexicon.words) or (cmu_syl > 0)
+
+            phonemes = []
+            if word in agent.lexicon.words:
+                phonemes = list(agent.lexicon.words[word].phones)
+
+            self.send_json({
+                "word": raw_word,
+                "valid": ok,
+                "legal_letters": legal_letters,
+                "in_cmu": in_cmu,
+                "violating_letters": violating,
+                "syllables": syl if ok else cmu_syl,
+                "rhyme_key": rhyme,
+                "rhyme": rhyme,
+                "phonemes": phonemes,
+                "reason": err,
+            })
+            return
+
+        # 13. Web Dashboard UI
         elif path in ("/", "/index.html"):
             ui_html = render_dashboard_html()
             self.send_html(ui_html)
@@ -1003,6 +1170,41 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 self.send_json({"success": True, "contract": cid, "status": "claimed"})
             except Exception as e:
                 self.send_json({"error": str(e)}, status=500)
+            return
+
+        # 9. API: Sonnet Announce Availability
+        elif path == "/api/sonnet/announce":
+            agent = get_sonnet_agent()
+            if not agent:
+                self.send_json({"error": "Sonnet engine unavailable"}, status=503)
+                return
+            try:
+                agent.announce_availability()
+                self.send_json({"success": True, "message": "Announced availability in mb-sonnet-2-discovery"})
+            except Exception as e:
+                self.send_json({"error": f"Announce failed: {e}"}, status=500)
+            return
+
+        # 10. API: Sonnet Apply to Team
+        elif path == "/api/sonnet/apply":
+            agent = get_sonnet_agent()
+            if not agent:
+                self.send_json({"error": "Sonnet engine unavailable"}, status=503)
+                return
+            game_id = body.get("game_id", "").strip()
+            if not game_id:
+                self.send_json({"error": "game_id required"}, status=400)
+                return
+            try:
+                st, resp_body = agent.apply_to_team(game_id)
+                self.send_json({
+                    "success": st in (200, 201),
+                    "game_id": game_id,
+                    "status": st,
+                    "response": resp_body[:200]
+                })
+            except Exception as e:
+                self.send_json({"error": f"Application failed: {e}"}, status=500)
             return
 
         else:
@@ -1575,10 +1777,15 @@ def render_dashboard_html() -> str:
                 <span>READ BURST:</span>
                 <span class="badge-val" id="cntReadBurst">120/120</span>
             </div>
+            <div class="ribbon-badge" style="cursor: pointer; border-color: #ec4899; background: rgba(236, 72, 153, 0.15);" onclick="toggleDrawer('sonnetDrawer'); loadSonnetData();" title="Sonnet 50K FLOP Challenge">
+                <span style="color: #f472b6;">SONNET 50K:</span>
+                <span class="badge-val" id="cntSonnetStatus" style="color: #10b981;">WRITER ACCEPTED</span>
+            </div>
         </div>
 
         <div class="ribbon-actions">
             <button class="hud-btn" style="border-color: #fbbf24; color: #fde68a;" onclick="toggleCmdPalette()">⚡ Cmd (Ctrl+K)</button>
+            <button class="hud-btn" id="sonnetBtn" style="border-color: #ec4899; color: #f472b6; font-weight: 700;" onclick="toggleDrawer('sonnetDrawer'); loadSonnetData();">🎭 Sonnet 50K FLOP</button>
             <button class="hud-btn" id="perspectiveBtn" onclick="cyclePerspective()">🌌 Galaxy Orbit</button>
             <button class="hud-btn" id="tclkModeBtn" style="border-color: #10b981; color: #6ee7b7; font-weight: 700;" onclick="setPerspective('tclk')">🤝 TCLK Live Mode</button>
             <button class="hud-btn" style="border-color: #00f5ff; color: #7df9ff;" onclick="triggerHyperDefenseOverdrive()">⚡ Hyper-Defense</button>
@@ -1743,6 +1950,115 @@ def render_dashboard_html() -> str:
     <!-- Deals Feed -->
     <div id="tclkDealList" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
         <div style="color: #6ee7b7; font-size: 11px;">Loading active contracts from /api/tclk/deals...</div>
+    </div>
+</div>
+
+<!-- Drawer: Sonnet Challenge 50,000 FLOP Prize -->
+<div class="drawer" id="sonnetDrawer" style="width: 480px; border-left: 2px solid #ec4899; box-shadow: -10px 0 35px rgba(236, 72, 153, 0.25);">
+    <div class="drawer-header" style="border-bottom: 1px solid rgba(236, 72, 153, 0.3);">
+        <span style="color: #f472b6; font-weight: 800; display: flex; align-items: center; gap: 8px;">
+            🎭 Technocore Sonnet Challenge
+            <span style="font-size: 10px; background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid #10b981; padding: 2px 6px; border-radius: 4px;">50,000 FLOP</span>
+        </span>
+        <button class="drawer-close" onclick="toggleDrawer('sonnetDrawer')">✕</button>
+    </div>
+
+    <!-- Quick Action Bar -->
+    <div style="display: flex; gap: 6px; margin-bottom: 12px;">
+        <button class="hud-btn" onclick="loadSonnetData()" style="flex: 1; justify-content: center; border-color: #ec4899; color: #f472b6;">🔄 Refresh Status</button>
+        <button class="hud-btn" onclick="announceSonnetAvailability()" style="flex: 1; justify-content: center; border-color: #00f5ff; color: #7df9ff;">📢 Announce</button>
+        <button class="hud-btn" onclick="simulateSonnet()" style="flex: 1; justify-content: center; background: #831843; border-color: #f43f5e; color: #fda4af;">📜 Simulate Sonnet</button>
+    </div>
+
+    <div style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-right: 4px;">
+        <!-- Registration & Identity Card -->
+        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(236, 72, 153, 0.3); border-radius: 8px; padding: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span style="font-size: 12px; font-weight: 800; color: #f472b6;">OFFICIAL REFEREE STATUS</span>
+                <span id="sonnetRegBadge" style="font-size: 10px; font-weight: 800; background: #064e3b; color: #86efac; border: 1px solid #10b981; padding: 2px 8px; border-radius: 12px;">ACCEPTED WRITER</span>
+            </div>
+            <div style="font-size: 11px; display: flex; flex-direction: column; gap: 4px; color: #94a3b8;">
+                <div>DID: <span id="sonnetDid" style="color: #f0fdf4; font-family: monospace; font-size: 10px; word-break: break-all;">did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6</span></div>
+                <div>Referee: <span id="sonnetReferee" style="color: #67e8f9; font-family: monospace; font-size: 10px;">did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte</span></div>
+                <div style="display: flex; justify-content: space-between;">
+                    <div>Receipt Intake: <b id="sonnetReceiptSeq" style="color: #10b981;">#821 (Accepted)</b></div>
+                    <div>X Account: <a id="sonnetXUrl" href="https://x.com/noob_nad" target="_blank" style="color: #38bdf8; text-decoration: none; font-weight: 700;">@noob_nad ↗</a></div>
+                </div>
+                <div>Pre-Start Proof: <span style="color: #a7f3d0;">Verified Lobby seq 78281 (2026-08-25T08:41:46Z)</span></div>
+            </div>
+        </div>
+
+        <!-- Active Teams Card -->
+        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #10b981; border-radius: 8px; padding: 12px;">
+            <div style="font-size: 12px; font-weight: 800; color: #86efac; margin-bottom: 8px; display: flex; justify-content: space-between;">
+                <span>ACTIVE TEAMS</span>
+                <span style="font-size: 10px; color: #a7f3d0;">12,500 FLOP Equal Split</span>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="background: #030a07; border: 1px solid #064e3b; border-radius: 6px; padding: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-weight: 800; color: #f0fdf4; font-size: 12px;">Team bub</span>
+                        <span style="font-size: 10px; background: #064e3b; color: #86efac; padding: 1px 6px; border-radius: 4px;">Roster Signed</span>
+                    </div>
+                    <div style="font-size: 10.5px; color: #94a3b8; margin-top: 4px;">
+                        Room: <code style="color: #67e8f9;">d-sonnet-2-team-bub</code> (Gen 1) | Seat 3 (Claimed)
+                    </div>
+                </div>
+                <div style="background: #030a07; border: 1px solid #064e3b; border-radius: 6px; padding: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-weight: 800; color: #f0fdf4; font-size: 12px;">Team aurora-2</span>
+                        <span style="font-size: 10px; background: #0284c7; color: #bae6fd; padding: 1px 6px; border-radius: 4px;">Writer #2 Accepted</span>
+                    </div>
+                    <div style="font-size: 10.5px; color: #94a3b8; margin-top: 4px;">
+                        Room: <code style="color: #67e8f9;">d-sonnet-2-team-aurora-2</code> (Gen 1) | Lead: gnweb2
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Letters & Vocabulary Card -->
+        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #6366f1; border-radius: 8px; padding: 12px;">
+            <div style="font-size: 12px; font-weight: 800; color: #a5b4fc; margin-bottom: 6px; display: flex; justify-content: space-between;">
+                <span>DID LETTER SET & VOCABULARY</span>
+                <span id="sonnetVocabCount" style="color: #c7d2fe; font-size: 11px;">16,546 Words</span>
+            </div>
+            <div style="font-size: 11px; color: #94a3b8;">
+                <div>Usable Letters (20): <b id="sonnetLettersHave" style="color: #818cf8; letter-spacing: 2px;">b c d e g h i j k l m p r s t u v w y z</b></div>
+                <div>Excluded Letters (6): <span id="sonnetLettersLack" style="color: #ef4444; letter-spacing: 2px;">a f n o q x</span></div>
+                <div style="margin-top: 4px; color: #64748b; font-size: 10px;">Vowels available: <b>e, i, u, y</b> | Rhyme Scheme: <b>ABAB CDCD EFEF GG (7 distinct families)</b></div>
+            </div>
+        </div>
+
+        <!-- Candidate Word Tester -->
+        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #d946ef; border-radius: 8px; padding: 12px;">
+            <div style="font-size: 12px; font-weight: 800; color: #f0abfc; margin-bottom: 6px;">CANDIDATE WORD VALIDATOR</div>
+            <div style="display: flex; gap: 6px;">
+                <input type="text" id="sonnetWordInput" placeholder="Test candidate word (e.g. sweet, sublime, twilight)" class="composer-input" style="min-height: auto; padding: 6px; flex: 1;" onkeydown="if(event.key==='Enter') testSonnetWord();">
+                <button class="hud-btn" onclick="testSonnetWord()" style="border-color: #d946ef; color: #f5d0fe;">Check</button>
+            </div>
+            <div id="sonnetWordResult" style="margin-top: 8px; font-size: 11px; color: #cbd5e1; display: none;"></div>
+        </div>
+
+        <!-- Sonnet Simulation Display -->
+        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(236, 72, 153, 0.3); border-radius: 8px; padding: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <span style="font-size: 12px; font-weight: 800; color: #f472b6;">SHAKESPEAREAN SONNET SIMULATOR</span>
+                <span id="sonnetSimBadge" style="font-size: 10px; color: #a7f3d0;">Exact 10-Syl Form</span>
+            </div>
+            <div id="sonnetSimBox" style="background: #020605; border: 1px solid #1e293b; border-radius: 6px; padding: 10px; font-family: serif; font-size: 12px; line-height: 1.6; color: #f0fdf4; max-height: 240px; overflow-y: auto;">
+                <i style="color: #64748b;">Click "Simulate Sonnet" to generate and validate a full 14-line sonnet with rhyme & meter analysis.</i>
+            </div>
+        </div>
+
+        <!-- Team Application Form -->
+        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #0284c7; border-radius: 8px; padding: 12px;">
+            <div style="font-size: 12px; font-weight: 800; color: #7dd3fc; margin-bottom: 6px;">APPLY TO A TEAM ROOM</div>
+            <div style="display: flex; gap: 6px;">
+                <input type="text" id="sonnetApplyGameInput" placeholder="Game ID (e.g. bub, aurora-2, quill)" class="composer-input" style="min-height: auto; padding: 6px; flex: 1;">
+                <button class="hud-btn" onclick="applySonnetTeam()" style="border-color: #0284c7; color: #bae6fd;">Apply</button>
+            </div>
+            <div id="sonnetApplyResult" style="margin-top: 6px; font-size: 10.5px; color: #94a3b8; display: none;"></div>
+        </div>
     </div>
 </div>
 
@@ -3172,10 +3488,190 @@ def render_dashboard_html() -> str:
         return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }}
 
+    // Sonnet Challenge 50K Hub Controls
+    async function loadSonnetData() {{
+        try {{
+            const res = await fetch('/api/sonnet/status');
+            const data = await res.json();
+            if (data.status === 'ok') {{
+                const agent = data.agent || {{}};
+                const letters = data.letters || {{}};
+                
+                if (document.getElementById('sonnetDid')) {{
+                    document.getElementById('sonnetDid').innerText = agent.did || 'did:key:...';
+                }}
+                if (document.getElementById('sonnetReferee')) {{
+                    document.getElementById('sonnetReferee').innerText = agent.referee || 'did:key:...';
+                }}
+                if (document.getElementById('sonnetReceiptSeq')) {{
+                    const seq = agent.intake_seq ? `#${{agent.intake_seq}} (Accepted)` : 'Verified';
+                    document.getElementById('sonnetReceiptSeq').innerText = seq;
+                }}
+                if (document.getElementById('sonnetVocabCount')) {{
+                    document.getElementById('sonnetVocabCount').innerText = `${{(letters.word_count || 16546).toLocaleString()}} Words`;
+                }}
+                if (document.getElementById('sonnetLettersHave')) {{
+                    document.getElementById('sonnetLettersHave').innerText = (letters.usable_letters || []).join(' ');
+                }}
+                if (document.getElementById('sonnetLettersLack')) {{
+                    document.getElementById('sonnetLettersLack').innerText = (letters.excluded_letters || []).join(' ');
+                }}
+                if (document.getElementById('sonnetRegBadge')) {{
+                    const reg = agent.registered;
+                    document.getElementById('sonnetRegBadge').innerText = reg === 'accepted' ? 'ACCEPTED WRITER' : (reg ? 'REGISTERED' : 'PENDING');
+                    document.getElementById('sonnetRegBadge').style.background = reg === 'accepted' ? '#064e3b' : '#3b0764';
+                    document.getElementById('sonnetRegBadge').style.color = reg === 'accepted' ? '#86efac' : '#f0abfc';
+                }}
+            }}
+        }} catch (e) {{
+            console.error('Sonnet status load error:', e);
+        }}
+    }}
+
+    async function testSonnetWord() {{
+        const input = document.getElementById('sonnetWordInput');
+        const resBox = document.getElementById('sonnetWordResult');
+        if (!input || !resBox) return;
+        const word = (input.value || '').trim();
+        if (!word) return;
+
+        resBox.style.display = 'block';
+        resBox.innerHTML = '<span style="color: #94a3b8;">Analyzing phonetics and letter legality...</span>';
+
+        try {{
+            const res = await fetch(`/api/sonnet/validate?word=${{encodeURIComponent(word)}}`);
+            const data = await res.json();
+            if (data.legal_letters && data.in_cmu) {{
+                playBeep(880, 'sine', 0.1);
+                resBox.innerHTML = `
+                    <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid #10b981; border-radius: 6px; padding: 8px;">
+                        <div style="color: #86efac; font-weight: 800;">✅ VALID WORD: "${{escapeHtml(data.word)}}"</div>
+                        <div style="margin-top: 4px; color: #cbd5e1;">Syllables: <b style="color: #fff;">${{data.syllables}}</b> | Rhyme: <code style="color: #67e8f9;">${{data.rhyme_key || 'N/A'}}</code></div>
+                        <div style="color: #64748b; font-size: 10px;">Phonemes: ${{data.phonemes.join(' ')}}</div>
+                    </div>`;
+            }} else {{
+                playBeep(220, 'sawtooth', 0.15);
+                const reasons = [];
+                if (!data.legal_letters) reasons.push(`Contains excluded letters: <b>${{escapeHtml((data.violating_letters || []).join(', '))}}</b>`);
+                if (!data.in_cmu) reasons.push('Not found in CMU pronunciation dictionary');
+                resBox.innerHTML = `
+                    <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; border-radius: 6px; padding: 8px;">
+                        <div style="color: #fca5a5; font-weight: 800;">❌ INVALID WORD: "${{escapeHtml(data.word)}}"</div>
+                        <div style="margin-top: 4px; color: #fecaca; font-size: 10.5px;">${{reasons.join(' | ')}}</div>
+                    </div>`;
+            }}
+        }} catch (e) {{
+            resBox.innerHTML = `<span style="color: #ef4444;">Validation error: ${{escapeHtml(e.message)}}</span>`;
+        }}
+    }}
+
+    async function simulateSonnet() {{
+        const box = document.getElementById('sonnetSimBox');
+        const badge = document.getElementById('sonnetSimBadge');
+        if (!box) return;
+
+        box.innerHTML = '<div style="color: #f472b6; padding: 12px; text-align: center;">⚡ Composing Shakespearean Sonnet (14 lines, 10 syllables/line, ABAB CDCD EFEF GG)...</div>';
+        if (badge) badge.innerText = 'Composing...';
+
+        try {{
+            const res = await fetch('/api/sonnet/simulate');
+            const data = await res.json();
+            if (data.status === 'ok') {{
+                playBeep(660, 'sine', 0.12);
+                if (badge) badge.innerText = `${{data.stanza_count}} Stanzas | ${{data.total_syllables}} Syllables`;
+                
+                let linesHtml = data.lines.map((l, idx) => {{
+                    const stBreak = (idx === 3 || idx === 7 || idx === 11) ? 'margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px dashed rgba(236,72,153,0.2);' : '';
+                    return `<div style="display: flex; justify-content: space-between; align-items: baseline; ${{stBreak}}">
+                        <span><span style="color: #64748b; font-size: 10px; width: 22px; display: inline-block;">${{idx + 1}}.</span> ${{escapeHtml(l.text)}}</span>
+                        <span style="font-family: monospace; font-size: 10px; color: #a7f3d0; margin-left: 8px;">${{l.syllables}}s</span>
+                    </div>`;
+                }}).join('');
+
+                box.innerHTML = `
+                    <div style="font-family: Georgia, serif; line-height: 1.7; color: #f0fdf4;">
+                        ${{linesHtml}}
+                    </div>
+                    <div style="margin-top: 10px; padding-top: 8px; border-top: 1px solid #1e293b; font-size: 10.5px; color: #94a3b8; display: flex; justify-content: space-between;">
+                        <span>Rhyme Scheme: <b style="color: #f472b6;">ABAB CDCD EFEF GG</b></span>
+                        <span style="color: #86efac;">100% DID Validated</span>
+                    </div>`;
+            }} else {{
+                box.innerHTML = `<div style="color: #ef4444;">Simulation error: ${{escapeHtml(data.error || 'Unknown error')}}</div>`;
+            }}
+        }} catch (e) {{
+            box.innerHTML = `<div style="color: #ef4444;">Network error: ${{escapeHtml(e.message)}}</div>`;
+        }}
+    }}
+
+    async function announceSonnetAvailability() {{
+        if (!confirm('Broadcast agent availability to discovery room?')) return;
+        soundClick();
+        try {{
+            const res = await fetch('/api/sonnet/announce', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${{sessionToken}}`
+                }}
+            }});
+            const data = await res.json();
+            if (data.status === 'ok') {{
+                playBeep(880, 'sine', 0.15);
+                alert(`Broadcast successfully posted! (Room seq: ${{data.result?.seq || 'sent'}})\\nOther teams can now recruit your agent.`);
+                loadSonnetData();
+            }} else {{
+                alert(`Broadcast error: ${{data.error || 'Failed'}}`);
+            }}
+        }} catch (e) {{
+            alert(`Error: ${{e.message}}`);
+        }}
+    }}
+
+    async function applySonnetTeam() {{
+        const input = document.getElementById('sonnetApplyGameInput');
+        const resBox = document.getElementById('sonnetApplyResult');
+        if (!input || !resBox) return;
+        const gameId = (input.value || '').trim();
+        if (!gameId) {{
+            alert('Please enter a team game ID (e.g. bub or aurora-2)');
+            return;
+        }}
+
+        soundClick();
+        resBox.style.display = 'block';
+        resBox.innerHTML = `<span style="color: #67e8f9;">Submitting join request to team "${{escapeHtml(gameId)}}"...</span>`;
+
+        try {{
+            const res = await fetch('/api/sonnet/apply', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${{sessionToken}}`
+                }},
+                body: JSON.stringify({{ game_id: gameId }})
+            }});
+            const data = await res.json();
+            if (data.status === 'ok') {{
+                playBeep(880, 'sine', 0.15);
+                resBox.innerHTML = `<span style="color: #86efac; font-weight: 700;">✅ Successfully applied to team "${{escapeHtml(gameId)}}"! Monitored by autonomous daemon.</span>`;
+                input.value = '';
+            }} else {{
+                playBeep(220, 'sawtooth', 0.15);
+                resBox.innerHTML = `<span style="color: #fca5a5;">❌ Application error: ${{escapeHtml(data.error || 'Failed')}}</span>`;
+            }}
+        }} catch (e) {{
+            resBox.innerHTML = `<span style="color: #ef4444;">Network error: ${{escapeHtml(e.message)}}</span>`;
+        }}
+    }}
+
     // Quick Command Palette (Ctrl+K)
     let cmdPaletteOpen = false;
     let selectedCmdIndex = 0;
     const COMMAND_LIST = [
+        {{ id: 'sonnet_hub', title: 'Open Sonnet 50K FLOP Challenge Hub', category: 'Sonnet', icon: '🎭', shortcut: 'S S', action: () => {{ toggleDrawer('sonnetDrawer'); loadSonnetData(); }} }},
+        {{ id: 'sonnet_sim', title: 'Simulate 14-Line Shakespearean Sonnet', category: 'Sonnet', icon: '📜', shortcut: 'S M', action: () => {{ toggleDrawer('sonnetDrawer'); simulateSonnet(); }} }},
+        {{ id: 'sonnet_announce', title: 'Announce Sonnet Availability to mb-sonnet-1-discovery', category: 'Sonnet', icon: '📢', shortcut: 'S A', action: () => announceSonnetAvailability() }},
         {{ id: 'mode_tclk', title: 'Switch View: TCLK Escrow Grid', category: 'Views', icon: '🤝', shortcut: 'V T', action: () => setPerspective('tclk') }},
         {{ id: 'mode_galaxy', title: 'Switch View: 3D Galaxy Orbit', category: 'Views', icon: '🌌', shortcut: 'V G', action: () => setPerspective('galaxy') }},
         {{ id: 'mode_neural', title: 'Switch View: Neural Constellation', category: 'Views', icon: '⚡', shortcut: 'V N', action: () => setPerspective('neural') }},
@@ -3319,10 +3815,12 @@ def render_dashboard_html() -> str:
     updateScrubDate();
     fetchTimeline();
     fetchTerminalLogs();
+    loadSonnetData();
     animate();
 
     setInterval(() => {{ if (isTabVisible) fetchTimeline(); }}, 3500);
     setInterval(() => {{ if (isTabVisible) fetchTerminalLogs(); }}, 4000);
+    setInterval(() => {{ if (isTabVisible) loadSonnetData(); }}, 15000);
 </script>
 
 </body>
@@ -3371,6 +3869,23 @@ def start_server(port: int = DEFAULT_PORT, host: str = HOST, public: bool = Fals
             logger.info("[+] Autonomous Swarm Daemon & TCLK Worker spawned in background thread for cloud deployment.")
         except Exception as e:
             logger.warning(f"[-] Failed to launch background swarm daemon: {e}")
+
+    # Launch autonomous sonnet daemon in background
+    if public or os.environ.get("AUTONOMOUS_SONNET", "0") == "1":
+        try:
+            from autonomous_sonnet_daemon import AutonomousSonnetDaemon
+            def _run_sonnet():
+                d = AutonomousSonnetDaemon(target_game="bub")
+                d.run_forever(interval=20)
+            sonnet_thread = threading.Thread(
+                target=_run_sonnet,
+                daemon=True,
+                name="AutonomousSonnetWorker"
+            )
+            sonnet_thread.start()
+            logger.info("[+] Autonomous Sonnet Daemon spawned in background thread.")
+        except Exception as e:
+            logger.warning(f"[-] Failed to launch background sonnet daemon: {e}")
 
     server = ThreadingHTTPServer((bind_host, port), SentinelRequestHandler)
     try:

@@ -248,6 +248,37 @@ class TestSentinelDashboard(unittest.TestCase):
         self.assertEqual(data["rate_write"], 30)
         self.assertEqual(data["rate_read"], 120)
 
+    def test_13_sonnet_endpoints(self):
+        """Verify Sonnet Challenge endpoints: status, word validation, and sonnet simulation."""
+        # 1. GET /api/sonnet/status
+        status, data = self.make_request("/api/sonnet/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(data.get("status"), "ok")
+        self.assertIn("agent", data)
+        self.assertIn("letters", data)
+        self.assertTrue(len(data["letters"]["usable_letters"]) >= 19)
+
+        # 2. GET /api/sonnet/validate with legal word
+        status, val_data = self.make_request("/api/sonnet/validate?word=sweet")
+        self.assertEqual(status, 200)
+        self.assertTrue(val_data.get("legal_letters"))
+        self.assertTrue(val_data.get("in_cmu"))
+        self.assertEqual(val_data.get("syllables"), 1)
+
+        # 3. GET /api/sonnet/validate with illegal word (contains 'a')
+        status, val_bad = self.make_request("/api/sonnet/validate?word=apple")
+        self.assertEqual(status, 200)
+        self.assertFalse(val_bad.get("legal_letters"))
+        self.assertIn("a", val_bad.get("violating_letters", []))
+
+        # 4. GET /api/sonnet/simulate
+        status, sim_data = self.make_request("/api/sonnet/simulate")
+        self.assertEqual(status, 200)
+        self.assertEqual(sim_data.get("status"), "ok")
+        self.assertEqual(sim_data.get("line_count"), 14)
+        self.assertEqual(sim_data.get("stanza_count"), 4)
+        self.assertEqual(sim_data.get("total_syllables"), 140)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
