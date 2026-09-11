@@ -1787,6 +1787,7 @@ def render_dashboard_html() -> str:
             <button class="hud-btn" style="border-color: #fbbf24; color: #fde68a;" onclick="toggleCmdPalette()">⚡ Cmd (Ctrl+K)</button>
             <button class="hud-btn" id="sonnetBtn" style="border-color: #ec4899; color: #f472b6; font-weight: 700;" onclick="toggleDrawer('sonnetDrawer'); loadSonnetData();">🎭 Sonnet 50K FLOP</button>
             <button class="hud-btn" id="perspectiveBtn" onclick="cyclePerspective()">🌌 Galaxy Orbit</button>
+            <button class="hud-btn" id="sonnetModeBtn" style="border-color: #ec4899; color: #f472b6; font-weight: 700;" onclick="setPerspective('sonnet')">🎭 Sonnet Hexverse</button>
             <button class="hud-btn" id="tclkModeBtn" style="border-color: #10b981; color: #6ee7b7; font-weight: 700;" onclick="setPerspective('tclk')">🤝 TCLK Live Mode</button>
             <button class="hud-btn" style="border-color: #00f5ff; color: #7df9ff;" onclick="triggerHyperDefenseOverdrive()">⚡ Hyper-Defense</button>
             <button class="hud-btn" id="audioToggle" onclick="toggleAudio()">🔊 Sound ON</button>
@@ -2259,24 +2260,29 @@ def render_dashboard_html() -> str:
             'galaxy': '🌌 Galaxy Orbit',
             'neural': '⚡ Neural Mesh',
             'isometric': '📐 2.5D Isometric',
-            'tclk': '🤝 TCLK Escrow Grid'
+            'tclk': '🤝 TCLK Escrow Grid',
+            'sonnet': '🎭 Sonnet Hexverse'
         }};
         const badgeLabels = {{
             'galaxy': '🌌 CELESTIAL GALAXY',
             'neural': '⚡ NEURAL CONSTELLATION',
             'isometric': '📐 2.5D ISOMETRIC MATRIX',
-            'tclk': '🤝 TCLK CRYPTOGRAPHIC ESCROW GRID'
+            'tclk': '🤝 TCLK CRYPTOGRAPHIC ESCROW GRID',
+            'sonnet': '🎭 SHAKESPEAREAN 50K SONNET MATRIX'
         }};
         document.getElementById('perspectiveBtn').innerText = labels[currentMode] || labels['galaxy'];
         document.getElementById('perspectiveLbl').innerText = badgeLabels[currentMode] || badgeLabels['galaxy'];
-        playBeep(currentMode === 'tclk' ? 880 : 700, 'triangle', 0.08);
+        playBeep(currentMode === 'sonnet' ? 987 : (currentMode === 'tclk' ? 880 : 700), 'triangle', 0.08);
         if (currentMode === 'tclk') {{
             loadTclkDeals();
+        }}
+        if (currentMode === 'sonnet') {{
+            loadSonnetData();
         }}
     }}
 
     function cyclePerspective() {{
-        const modes = ['galaxy', 'neural', 'isometric', 'tclk'];
+        const modes = ['galaxy', 'neural', 'isometric', 'tclk', 'sonnet'];
         const idx = (modes.indexOf(currentMode) + 1) % modes.length;
         setPerspective(modes[idx]);
     }}
@@ -2944,6 +2950,325 @@ def render_dashboard_html() -> str:
         sCtx.restore();
     }}
 
+    let sonnetAnimTime = 0;
+    window.sonnetActivePoemLines = [];
+
+    function drawSonnetHexverse(cx, cy) {{
+        sonnetAnimTime += 0.022;
+
+        // 1. Cosmic Parchment & Rhyme Constellation Floor Grid
+        sCtx.save();
+        sCtx.strokeStyle = 'rgba(236, 72, 153, 0.07)';
+        sCtx.lineWidth = 1;
+        const gStep = 45;
+        for (let x = 0; x < sCanvas.width; x += gStep) {{
+            sCtx.beginPath();
+            sCtx.moveTo(x, 0);
+            sCtx.lineTo(x, sCanvas.height);
+            sCtx.stroke();
+        }}
+        for (let y = 0; y < sCanvas.height; y += gStep) {{
+            sCtx.beginPath();
+            sCtx.moveTo(0, y);
+            sCtx.lineTo(sCanvas.width, y);
+            sCtx.stroke();
+        }}
+
+        // 2. Concentric Shakespearean Stanza Orbit Wheels
+        const stanzaConfigs = [
+            {{ r: 120, color: 'rgba(245, 158, 11, 0.4)', dash: [8, 6], label: 'STANZA 1 (ABAB)' }},
+            {{ r: 190, color: 'rgba(14, 165, 233, 0.4)', dash: [10, 8], label: 'STANZA 2 (CDCD)' }},
+            {{ r: 265, color: 'rgba(217, 70, 239, 0.4)', dash: [6, 6], label: 'STANZA 3 (EFEF)' }},
+            {{ r: 70, color: 'rgba(16, 185, 129, 0.65)', dash: [], label: 'STANZA 4 (GG)' }}
+        ];
+
+        stanzaConfigs.forEach((st, sIdx) => {{
+            sCtx.save();
+            sCtx.beginPath();
+            if (st.dash && st.dash.length > 0) sCtx.setLineDash(st.dash);
+            const pulse = Math.sin(sonnetAnimTime * 2 + sIdx) * 3;
+            sCtx.arc(cx, cy, st.r + pulse, 0, Math.PI * 2);
+            sCtx.strokeStyle = st.color;
+            sCtx.lineWidth = sIdx === 3 ? 2.5 : 1.5;
+            sCtx.shadowColor = st.color;
+            sCtx.shadowBlur = sIdx === 3 ? 12 : 6;
+            sCtx.stroke();
+            sCtx.restore();
+        }});
+
+        // 3. Compute 14 Line Node Positions (Shakespearean Sonnet 4/4/4/2 Form)
+        const lineNodes = [];
+        const rhymeColors = {{
+            'A': '#fbbf24',
+            'B': '#38bdf8',
+            'C': '#a855f7',
+            'D': '#f43f5e',
+            'E': '#60a5fa',
+            'F': '#2dd4bf',
+            'G': '#10b981'
+        }};
+        const lineRhymes = ['A', 'B', 'A', 'B', 'C', 'D', 'C', 'D', 'E', 'F', 'E', 'F', 'G', 'G'];
+
+        // Stanza 1: lines 0..3 (r = 120)
+        for (let i = 0; i < 4; i++) {{
+            const ang = sonnetAnimTime * 0.4 + (i * Math.PI / 2);
+            lineNodes.push({{
+                line: i + 1,
+                x: cx + Math.cos(ang) * 120,
+                y: cy + Math.sin(ang) * 120,
+                rhyme: lineRhymes[i],
+                color: rhymeColors[lineRhymes[i]],
+                stanza: 1
+            }});
+        }}
+        // Stanza 2: lines 4..7 (r = 190)
+        for (let i = 0; i < 4; i++) {{
+            const ang = -sonnetAnimTime * 0.3 + (i * Math.PI / 2) + Math.PI / 4;
+            lineNodes.push({{
+                line: i + 5,
+                x: cx + Math.cos(ang) * 190,
+                y: cy + Math.sin(ang) * 190,
+                rhyme: lineRhymes[i + 4],
+                color: rhymeColors[lineRhymes[i + 4]],
+                stanza: 2
+            }});
+        }}
+        // Stanza 3: lines 8..11 (r = 265)
+        for (let i = 0; i < 4; i++) {{
+            const ang = sonnetAnimTime * 0.25 + (i * Math.PI / 2) + Math.PI / 8;
+            lineNodes.push({{
+                line: i + 9,
+                x: cx + Math.cos(ang) * 265,
+                y: cy + Math.sin(ang) * 265,
+                rhyme: lineRhymes[i + 8],
+                color: rhymeColors[lineRhymes[i + 8]],
+                stanza: 3
+            }});
+        }}
+        // Stanza 4 Couplet: lines 12..13 (r = 70)
+        for (let i = 0; i < 2; i++) {{
+            const ang = -sonnetAnimTime * 0.6 + (i * Math.PI);
+            lineNodes.push({{
+                line: i + 13,
+                x: cx + Math.cos(ang) * 70,
+                y: cy + Math.sin(ang) * 70,
+                rhyme: 'G',
+                color: rhymeColors['G'],
+                stanza: 4
+            }});
+        }}
+
+        // 4. Resonant Harmonic Rhyme Beams (connecting rhyming lines)
+        const rhymePairs = [
+            [0, 2], [1, 3], // Stanza 1 ABAB
+            [4, 6], [5, 7], // Stanza 2 CDCD
+            [8, 10], [9, 11], // Stanza 3 EFEF
+            [12, 13] // Stanza 4 GG Couplet
+        ];
+
+        rhymePairs.forEach(([idx1, idx2]) => {{
+            const n1 = lineNodes[idx1];
+            const n2 = lineNodes[idx2];
+            if (!n1 || !n2) return;
+
+            sCtx.save();
+            sCtx.beginPath();
+            sCtx.moveTo(n1.x, n1.y);
+            sCtx.lineTo(n2.x, n2.y);
+            sCtx.strokeStyle = n1.color;
+            sCtx.lineWidth = (n1.rhyme === 'G') ? 3 : 1.8;
+            sCtx.shadowColor = n1.color;
+            sCtx.shadowBlur = (n1.rhyme === 'G') ? 16 : 8;
+            sCtx.stroke();
+
+            // Animated Phonetic Resonance Packet along the conduit
+            const tProg = (Date.now() / 1200 + idx1 * 0.2) % 1;
+            const px = n1.x + (n2.x - n1.x) * tProg;
+            const py = n1.y + (n2.y - n1.y) * tProg;
+            sCtx.beginPath();
+            sCtx.arc(px, py, (n1.rhyme === 'G') ? 5 : 3.5, 0, Math.PI * 2);
+            sCtx.fillStyle = '#fff';
+            sCtx.shadowColor = n1.color;
+            sCtx.shadowBlur = 14;
+            sCtx.fill();
+            sCtx.restore();
+        }});
+
+        // 5. Draw 14 Line Nodes with 10 Iambic Meter Beat Pulses
+        lineNodes.forEach(ln => {{
+            sCtx.save();
+            sCtx.beginPath();
+            sCtx.arc(ln.x, ln.y, 11, 0, Math.PI * 2);
+            sCtx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+            sCtx.strokeStyle = ln.color;
+            sCtx.lineWidth = 2;
+            sCtx.shadowColor = ln.color;
+            sCtx.shadowBlur = 12;
+            sCtx.fill();
+            sCtx.stroke();
+
+            // Line Text (e.g. L1, L14)
+            sCtx.fillStyle = '#fff';
+            sCtx.font = 'bold 8.5px Courier New';
+            sCtx.textAlign = 'center';
+            sCtx.textBaseline = 'middle';
+            sCtx.fillText(`L${{ln.line}}`, ln.x, ln.y);
+
+            // Rhyme Family Badge
+            sCtx.fillStyle = ln.color;
+            sCtx.font = '900 8px Courier New';
+            sCtx.fillText(`[${{ln.rhyme}}]`, ln.x, ln.y - 17);
+
+            // 10 Iambic Meter Beat Pulses (da-DUM da-DUM da-DUM da-DUM da-DUM)
+            for (let b = 0; b < 10; b++) {{
+                const bAng = (b * Math.PI * 2 / 10) + sonnetAnimTime * 0.5;
+                const isStressed = (b % 2 === 1);
+                const bDist = 18 + (isStressed ? 4 : 1) + Math.sin(sonnetAnimTime * 4 + b) * 2;
+                const bx = ln.x + Math.cos(bAng) * bDist;
+                const by = ln.y + Math.sin(bAng) * bDist;
+
+                sCtx.beginPath();
+                sCtx.arc(bx, by, isStressed ? 2.2 : 1.2, 0, Math.PI * 2);
+                sCtx.fillStyle = isStressed ? ln.color : 'rgba(255, 255, 255, 0.5)';
+                if (isStressed) {{
+                    sCtx.shadowColor = ln.color;
+                    sCtx.shadowBlur = 6;
+                }}
+                sCtx.fill();
+            }}
+            sCtx.restore();
+        }});
+
+        // 6. Central 50,000 FLOP Crown Vault & Rotating Hexagon Shield
+        sCtx.save();
+        sCtx.translate(cx, cy);
+
+        // Counter-rotating central shield
+        sCtx.rotate(sonnetAnimTime * 0.8);
+        sCtx.strokeStyle = '#ec4899';
+        sCtx.lineWidth = 2.5;
+        sCtx.shadowColor = '#f472b6';
+        sCtx.shadowBlur = 15;
+        sCtx.beginPath();
+        for (let i = 0; i < 6; i++) {{
+            const a = (i * Math.PI) / 3;
+            const hx = Math.cos(a) * 42;
+            const hy = Math.sin(a) * 42;
+            if (i === 0) sCtx.moveTo(hx, hy);
+            else sCtx.lineTo(hx, hy);
+        }}
+        sCtx.closePath();
+        sCtx.stroke();
+
+        // Inner Rotating Diamond
+        sCtx.rotate(-sonnetAnimTime * 1.6);
+        sCtx.strokeStyle = '#fbbf24';
+        sCtx.lineWidth = 1.8;
+        sCtx.strokeRect(-18, -18, 36, 36);
+        sCtx.restore();
+
+        // Central Text & Prize Pool
+        sCtx.save();
+        sCtx.textAlign = 'center';
+        sCtx.fillStyle = '#fff';
+        sCtx.font = '900 12px Courier New';
+        sCtx.shadowColor = '#ec4899';
+        sCtx.shadowBlur = 8;
+        sCtx.fillText('50,000 FLOP', cx, cy - 8);
+
+        sCtx.fillStyle = '#10b981';
+        sCtx.font = 'bold 9px Courier New';
+        sCtx.shadowColor = '#10b981';
+        sCtx.fillText('SONNET MATRIX', cx, cy + 6);
+
+        sCtx.font = '8px Courier New';
+        sCtx.fillStyle = '#f472b6';
+        sCtx.fillText('TEAM BUB [12.5K]', cx, cy + 20);
+        sCtx.restore();
+
+        // 7. Orbiting 20 Usable Golden Letters (DNA Constellation Spiral)
+        const usableLetters = ['b','c','d','e','g','h','i','j','k','l','m','p','r','s','t','u','v','w','y','z'];
+        sCtx.save();
+        sCtx.font = 'bold 11px Georgia, serif';
+        sCtx.textAlign = 'center';
+        sCtx.textBaseline = 'middle';
+        usableLetters.forEach((lt, idx) => {{
+            const lAng = sonnetAnimTime * 0.7 + (idx * Math.PI * 2 / usableLetters.length);
+            const lDist = 325 + Math.sin(sonnetAnimTime * 2 + idx * 0.5) * 12;
+            const lx = cx + Math.cos(lAng) * lDist;
+            const ly = cy + Math.sin(lAng) * lDist * 0.85;
+
+            sCtx.fillStyle = '#fbbf24';
+            sCtx.shadowColor = '#f59e0b';
+            sCtx.shadowBlur = 8;
+            sCtx.fillText(lt, lx, ly);
+
+            sCtx.beginPath();
+            sCtx.arc(lx, ly, 1.2, 0, Math.PI * 2);
+            sCtx.fillStyle = 'rgba(251, 191, 36, 0.4)';
+            sCtx.fill();
+        }});
+
+        // 8. Deflected 6 Forbidden Letters (a f n o q x) with Red Forcefield Shields
+        const forbidden = ['a', 'f', 'n', 'o', 'q', 'x'];
+        forbidden.forEach((flt, idx) => {{
+            const fAng = -sonnetAnimTime * 0.5 + (idx * Math.PI * 2 / forbidden.length);
+            const fDist = 380 + Math.cos(sonnetAnimTime + idx) * 15;
+            const fx = cx + Math.cos(fAng) * fDist;
+            const fy = cy + Math.sin(fAng) * fDist * 0.85;
+
+            sCtx.beginPath();
+            sCtx.arc(fx, fy, 10, 0, Math.PI * 2);
+            sCtx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
+            sCtx.lineWidth = 1;
+            sCtx.stroke();
+
+            sCtx.fillStyle = '#ef4444';
+            sCtx.shadowColor = '#ef4444';
+            sCtx.shadowBlur = 6;
+            sCtx.fillText(flt, fx, fy);
+        }});
+        sCtx.restore();
+
+        // 9. Floating Holographic Sonnet Live Telemetry HUD Panel
+        sCtx.save();
+        const hudX = 20;
+        const hudY = 30;
+        sCtx.fillStyle = 'rgba(2, 6, 23, 0.85)';
+        sCtx.strokeStyle = 'rgba(236, 72, 153, 0.45)';
+        sCtx.lineWidth = 1;
+        if (sCtx.roundRect) {{
+            sCtx.beginPath();
+            sCtx.roundRect(hudX, hudY, 280, 125, 8);
+            sCtx.fill();
+            sCtx.stroke();
+        }} else {{
+            sCtx.fillRect(hudX, hudY, 280, 125);
+            sCtx.strokeRect(hudX, hudY, 280, 125);
+        }}
+
+        sCtx.fillStyle = '#f472b6';
+        sCtx.font = '900 11px Courier New';
+        sCtx.fillText('🎭 SONNET POETIC HEXVERSE (sonnet-2)', hudX + 12, hudY + 20);
+
+        sCtx.fillStyle = '#cbd5e1';
+        sCtx.font = '10px Courier New';
+        sCtx.fillText('FORM: 14 Lines (4/4/4/2 Stanzas)', hudX + 12, hudY + 38);
+        sCtx.fillText('RHYME: ABAB CDCD EFEF GG (7 Families)', hudX + 12, hudY + 54);
+        sCtx.fillText('METER: 10-Syllable Iambic Pentameter', hudX + 12, hudY + 70);
+        sCtx.fillText('STATUS: TEAM BUB [SEAT 3 SYNCHRONIZED]', hudX + 12, hudY + 86);
+
+        // Animated Meter Flow Indicator
+        sCtx.fillStyle = 'rgba(30, 41, 59, 0.9)';
+        sCtx.fillRect(hudX + 12, hudY + 98, 256, 12);
+        const flowW = (256 * ((Date.now() / 2500) % 1));
+        sCtx.fillStyle = '#10b981';
+        sCtx.shadowColor = '#10b981';
+        sCtx.shadowBlur = 8;
+        sCtx.fillRect(hudX + 12, hudY + 98, flowW, 12);
+        sCtx.restore();
+    }}
+
     // Animation Loop
     function animate() {{
         sCtx.clearRect(0, 0, sCanvas.width, sCanvas.height);
@@ -2979,6 +3304,8 @@ def render_dashboard_html() -> str:
             }}
         }} else if (currentMode === 'tclk') {{
             drawTclkEscrowMatrix(cx, cy);
+        }} else if (currentMode === 'sonnet') {{
+            drawSonnetHexverse(cx, cy);
         }}
 
         // 2. Draw Shockwaves
@@ -3543,6 +3870,21 @@ def render_dashboard_html() -> str:
             const data = await res.json();
             if (data.legal_letters && data.in_cmu) {{
                 playBeep(880, 'sine', 0.1);
+                // Trigger celebratory canvas particles at center
+                const cx = sCanvas.width / 2;
+                const cy = sCanvas.height / 2;
+                shockwaves.push({{ x: cx, y: cy, radius: 8, maxRadius: 180, alpha: 0.8 }});
+                for (let k = 0; k < 25; k++) {{
+                    const ang = Math.random() * Math.PI * 2;
+                    const spd = 1.5 + Math.random() * 4;
+                    particles.push({{
+                        x: cx, y: cy,
+                        vx: Math.cos(ang) * spd,
+                        vy: Math.sin(ang) * spd,
+                        life: 0.9,
+                        color: '#10b981'
+                    }});
+                }}
                 resBox.innerHTML = `
                     <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid #10b981; border-radius: 6px; padding: 8px;">
                         <div style="color: #86efac; font-weight: 800;">✅ VALID WORD: "${{escapeHtml(data.word)}}"</div>
@@ -3570,6 +3912,9 @@ def render_dashboard_html() -> str:
         const badge = document.getElementById('sonnetSimBadge');
         if (!box) return;
 
+        // Auto-switch to Sonnet Hexverse animated perspective
+        setPerspective('sonnet');
+
         box.innerHTML = '<div style="color: #f472b6; padding: 12px; text-align: center;">⚡ Composing Shakespearean Sonnet (14 lines, 10 syllables/line, ABAB CDCD EFEF GG)...</div>';
         if (badge) badge.innerText = 'Composing...';
 
@@ -3580,6 +3925,22 @@ def render_dashboard_html() -> str:
                 playBeep(660, 'sine', 0.12);
                 if (badge) badge.innerText = `${{data.stanza_count}} Stanzas | ${{data.total_syllables}} Syllables`;
                 
+                // Trigger poetic cosmic plasma burst on canvas!
+                const cx = sCanvas.width / 2;
+                const cy = sCanvas.height / 2;
+                shockwaves.push({{ x: cx, y: cy, radius: 12, maxRadius: 360, alpha: 1.0 }});
+                for (let k = 0; k < 50; k++) {{
+                    const ang = Math.random() * Math.PI * 2;
+                    const spd = 2 + Math.random() * 6;
+                    particles.push({{
+                        x: cx, y: cy,
+                        vx: Math.cos(ang) * spd,
+                        vy: Math.sin(ang) * spd,
+                        life: 1.0,
+                        color: ['#f472b6', '#fbbf24', '#10b981', '#38bdf8', '#c084fc'][k % 5]
+                    }});
+                }}
+
                 let linesHtml = data.lines.map((l, idx) => {{
                     const stBreak = (idx === 3 || idx === 7 || idx === 11) ? 'margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px dashed rgba(236,72,153,0.2);' : '';
                     return `<div style="display: flex; justify-content: space-between; align-items: baseline; ${{stBreak}}">
@@ -3672,6 +4033,7 @@ def render_dashboard_html() -> str:
         {{ id: 'sonnet_hub', title: 'Open Sonnet 50K FLOP Challenge Hub', category: 'Sonnet', icon: '🎭', shortcut: 'S S', action: () => {{ toggleDrawer('sonnetDrawer'); loadSonnetData(); }} }},
         {{ id: 'sonnet_sim', title: 'Simulate 14-Line Shakespearean Sonnet', category: 'Sonnet', icon: '📜', shortcut: 'S M', action: () => {{ toggleDrawer('sonnetDrawer'); simulateSonnet(); }} }},
         {{ id: 'sonnet_announce', title: 'Announce Sonnet Availability to mb-sonnet-1-discovery', category: 'Sonnet', icon: '📢', shortcut: 'S A', action: () => announceSonnetAvailability() }},
+        {{ id: 'mode_sonnet', title: 'Switch View: Sonnet 50K Poetic Hexverse', category: 'Views', icon: '🎭', shortcut: 'V S', action: () => setPerspective('sonnet') }},
         {{ id: 'mode_tclk', title: 'Switch View: TCLK Escrow Grid', category: 'Views', icon: '🤝', shortcut: 'V T', action: () => setPerspective('tclk') }},
         {{ id: 'mode_galaxy', title: 'Switch View: 3D Galaxy Orbit', category: 'Views', icon: '🌌', shortcut: 'V G', action: () => setPerspective('galaxy') }},
         {{ id: 'mode_neural', title: 'Switch View: Neural Constellation', category: 'Views', icon: '⚡', shortcut: 'V N', action: () => setPerspective('neural') }},
