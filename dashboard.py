@@ -2352,15 +2352,136 @@ def render_dashboard_html() -> str:
         }}
     }});
 
+    // Animated Floating 3D FLOP Coins Fleet
+    class FlopFloatingCoin {{
+        constructor() {{
+            this.angle = Math.random() * Math.PI * 2;
+            this.orbitRadius = 110 + Math.random() * 260;
+            this.speed = (0.004 + Math.random() * 0.007) * (Math.random() < 0.5 ? 1 : -1);
+            this.wobbleSpeed = 0.02 + Math.random() * 0.03;
+            this.wobbleAmp = 8 + Math.random() * 20;
+            this.spinSpeed = 0.035 + Math.random() * 0.04;
+            this.spinAngle = Math.random() * Math.PI * 2;
+            this.size = 14 + Math.random() * 7;
+            const values = ['12,500 FLOP', '50,000 FLOP', '5,000 FLOP', '1,000 FLOP', '12.5K ESCROW', '2,500 FLOP'];
+            this.valText = values[Math.floor(Math.random() * values.length)];
+            this.animTick = Math.random() * 100;
+            this.trail = [];
+        }}
+        update(cx, cy) {{
+            this.animTick += 0.035;
+            this.angle += this.speed * playSpeed;
+            this.spinAngle += this.spinSpeed * playSpeed;
+            const wobble = Math.sin(this.animTick * 2) * this.wobbleAmp;
+            const scaleX = Math.max(1.0, sCanvas.width / 650);
+            const scaleY = Math.max(1.0, sCanvas.height / 600);
+            const rx = (this.orbitRadius * scaleX) + wobble;
+            const ry = (this.orbitRadius * scaleY * 0.85) + wobble;
+            this.x = cx + Math.cos(this.angle) * rx;
+            this.y = cy + Math.sin(this.angle) * ry;
+
+            // Sparkle Trail
+            if (Math.random() < 0.4) {{
+                this.trail.push({{ x: this.x, y: this.y, alpha: 0.8, size: 2 + Math.random() * 2 }});
+                if (this.trail.length > 8) this.trail.shift();
+            }}
+            this.trail.forEach(t => t.alpha -= 0.04);
+            this.trail = this.trail.filter(t => t.alpha > 0);
+        }}
+        draw(ctx) {{
+            // Sparkle Trail
+            this.trail.forEach(t => {{
+                ctx.beginPath();
+                ctx.arc(t.x, t.y, t.size, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(251, 191, 36, ${{t.alpha}})`;
+                ctx.shadowColor = '#fbbf24';
+                ctx.shadowBlur = 6;
+                ctx.fill();
+            }});
+
+            ctx.save();
+            ctx.translate(this.x, this.y);
+            const cosSpin = Math.cos(this.spinAngle);
+            const absCos = Math.max(0.12, Math.abs(cosSpin));
+
+            // Outer golden glow
+            ctx.shadowColor = '#fbbf24';
+            ctx.shadowBlur = 12;
+
+            // Coin 3D Rim (depth)
+            const rimOffset = (cosSpin >= 0 ? 1 : -1) * 3 * (1 - absCos);
+            ctx.beginPath();
+            ctx.ellipse(rimOffset, 0, this.size * absCos, this.size, 0, 0, Math.PI * 2);
+            ctx.fillStyle = '#b45309';
+            ctx.fill();
+
+            // Coin Face
+            ctx.beginPath();
+            ctx.ellipse(0, 0, this.size * absCos, this.size, 0, 0, Math.PI * 2);
+            const grad = ctx.createLinearGradient(-this.size, -this.size, this.size, this.size);
+            grad.addColorStop(0, '#fef08a');
+            grad.addColorStop(0.3, '#f59e0b');
+            grad.addColorStop(0.7, '#fbbf24');
+            grad.addColorStop(1, '#d97706');
+            ctx.fillStyle = grad;
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            // Embossed FLOP symbol
+            if (absCos > 0.4) {{
+                ctx.fillStyle = '#78350f';
+                ctx.font = `bold ${{Math.floor(this.size * 0.9)}}px sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('₣', 0, 1);
+            }}
+
+            // Specular Glint
+            const glintAlpha = Math.max(0, Math.sin(this.spinAngle * 2));
+            if (glintAlpha > 0.6) {{
+                ctx.fillStyle = `rgba(255, 255, 255, ${{glintAlpha * 0.7}})`;
+                ctx.beginPath();
+                ctx.arc(-this.size * 0.3 * absCos, -this.size * 0.3, 2.5, 0, Math.PI * 2);
+                ctx.fill();
+            }}
+
+            // Value Tag Pill
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+            ctx.strokeStyle = 'rgba(251, 191, 36, 0.6)';
+            ctx.lineWidth = 0.8;
+            const tw = ctx.measureText(this.valText).width + 12;
+            const py = this.size + 8;
+            ctx.fillRect(-tw / 2, py - 6, tw, 13);
+            ctx.strokeRect(-tw / 2, py - 6, tw, 13);
+            ctx.fillStyle = '#fde68a';
+            ctx.font = 'bold 8px Courier New';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(this.valText, 0, py);
+
+            ctx.restore();
+        }}
+    }}
+
+    const floatingCoins = [];
+    for (let c = 0; c < 15; c++) {{
+        floatingCoins.push(new FlopFloatingCoin());
+    }}
+
     // Celestial Mecha Drone Class
     class CyberGalaxyNode {{
-        constructor(id, isMaster = false, isDid = false, threat = 'CLEAN', text = '', role = 'peer', orbitRadius = 100, orbitSpeed = 0.01) {{
+        constructor(id, isMaster = false, isDid = false, threat = 'CLEAN', text = '', role = 'peer', orbitRadius = 100, orbitSpeed = 0.01, seat = null, customName = null) {{
             this.id = id;
             this.isMaster = isMaster;
             this.isDid = isDid;
             this.threat = threat;
             this.text = text;
             this.role = role;
+            this.seat = seat;
+            this.customName = customName;
             
             // Orbital mechanics
             this.orbitRadius = orbitRadius;
@@ -2420,13 +2541,17 @@ def render_dashboard_html() -> str:
 
             // Spawn twin plasma comet particles
             if (Math.random() < 0.35 && particles.length < MAX_PARTICLES) {{
+                let pCol = this.threat === 'THREAT' ? '#ef4444' : (this.isDid ? '#00f5ff' : '#10b981');
+                if (this.role === 'poet') pCol = '#ec4899';
+                else if (this.role === 'referee') pCol = '#fbbf24';
+                else if (this.role === 'teammate') pCol = '#34d399';
                 particles.push({{
                     x: this.x,
                     y: this.y + 6,
                     vx: -Math.cos(this.angle) * 0.8 + (Math.random() - 0.5) * 0.5,
                     vy: -Math.sin(this.angle) * 0.8 + 0.8,
                     life: 1.0,
-                    color: this.threat === 'THREAT' ? '#ef4444' : (this.isDid ? '#00f5ff' : '#10b981')
+                    color: pCol
                 }});
             }}
         }}
@@ -2468,51 +2593,274 @@ def render_dashboard_html() -> str:
 
             if (this.isMaster) {{
                 // =============================================================
-                // 1. MASTER GUARDIAN TITAN (Centerpiece Fortress)
+                // 1. MASTER GUARDIAN TITAN & 50,000 FLOP SONNET CORE
                 // =============================================================
                 // Outer Harmonious Shockwave Rings
                 ctx.save();
-                const ringR = 34 + Math.sin(this.animTick * 2) * 5;
+                const ringR = 48 + Math.sin(this.animTick * 2) * 5;
                 ctx.beginPath();
                 ctx.arc(0, 0, ringR, 0, Math.PI * 2);
-                ctx.strokeStyle = 'rgba(0, 245, 255, 0.3)';
+                ctx.strokeStyle = 'rgba(236, 72, 153, 0.4)';
+                ctx.lineWidth = 1.8;
+                ctx.stroke();
+
+                const ringR2 = 62 + Math.cos(this.animTick * 1.5) * 4;
+                ctx.beginPath();
+                ctx.arc(0, 0, ringR2, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(251, 191, 36, 0.3)';
+                ctx.setLineDash([8, 6]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Counter-Rotating Outer Hexagon (Magenta / Gold)
+                ctx.save();
+                ctx.rotate(this.gyroRotation);
+                ctx.strokeStyle = '#ec4899';
+                ctx.lineWidth = 2.5;
+                ctx.shadowColor = '#f472b6';
+                ctx.shadowBlur = 15;
+                ctx.beginPath();
+                for (let i = 0; i < 6; i++) {{
+                    const a = (i * Math.PI) / 3;
+                    const hx = Math.cos(a) * 36;
+                    const hy = Math.sin(a) * 36;
+                    if (i === 0) ctx.moveTo(hx, hy);
+                    else ctx.lineTo(hx, hy);
+                }}
+                ctx.closePath();
+                ctx.stroke();
+
+                // Counter-Rotating Inner Diamond (Emerald / Cyan)
+                ctx.rotate(-this.gyroRotation * 2.2);
+                ctx.strokeStyle = '#10b981';
+                ctx.lineWidth = 1.8;
+                ctx.shadowColor = '#34d399';
+                ctx.strokeRect(-22, -22, 44, 44);
+                ctx.restore();
+
+                // 3D Spinning Central Gold FLOP Coin
+                ctx.save();
+                const coinRot = this.animTick * 2.8;
+                const coinW = Math.cos(coinRot);
+                const absCoinW = Math.max(0.12, Math.abs(coinW));
+                const coinRadius = 18;
+
+                // Coin Glow
+                ctx.shadowColor = '#fbbf24';
+                ctx.shadowBlur = 18;
+
+                // Coin 3D Rim
+                const rimDir = (coinW >= 0 ? 1 : -1) * 3 * (1 - absCoinW);
+                ctx.beginPath();
+                ctx.ellipse(rimDir, 0, coinRadius * absCoinW, coinRadius, 0, 0, Math.PI * 2);
+                ctx.fillStyle = '#92400e';
+                ctx.fill();
+
+                // Coin Main Surface
+                ctx.beginPath();
+                ctx.ellipse(0, 0, coinRadius * absCoinW, coinRadius, 0, 0, Math.PI * 2);
+                const cGrad = ctx.createLinearGradient(-coinRadius, -coinRadius, coinRadius, coinRadius);
+                cGrad.addColorStop(0, '#fef08a');
+                cGrad.addColorStop(0.3, '#f59e0b');
+                cGrad.addColorStop(0.7, '#fbbf24');
+                cGrad.addColorStop(1, '#b45309');
+                ctx.fillStyle = cGrad;
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 1.2;
+                ctx.stroke();
+
+                // Embossed FLOP Currency Symbol
+                if (absCoinW > 0.35) {{
+                    ctx.fillStyle = '#78350f';
+                    ctx.font = 'bold 15px sans-serif';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('₣', 0, 1);
+                }}
+                ctx.restore();
+
+                // Center Title Banner (Top)
+                ctx.save();
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = '#fbbf24';
+                ctx.font = '900 12px Courier New';
+                ctx.shadowColor = '#fbbf24';
+                ctx.shadowBlur = 10;
+                ctx.fillText('🪙 50,000 FLOP', 0, -42);
+
+                // Subtitle Badges (Bottom)
+                ctx.fillStyle = '#00f5ff';
+                ctx.font = 'bold 8.5px Courier New';
+                ctx.shadowColor = '#00f5ff';
+                ctx.shadowBlur = 8;
+                ctx.fillText('SENTINEL & SONNET CORE', 0, 42);
+
+                ctx.fillStyle = '#34d399';
+                ctx.font = 'bold 7.5px Courier New';
+                ctx.shadowBlur = 0;
+                ctx.fillText('TEAM BUB: 12,500 FLOP LOCKED', 0, 53);
+                ctx.restore();
+
+            }} else if (this.role === 'poet') {{
+                // =============================================================
+                // 2. SHAKESPEAREAN POET NODE (@noob_nad / Seat 3)
+                // =============================================================
+                ctx.save();
+                // 10-Beat Iambic Pentameter Pulsing Aura Ring
+                const auraR = 24 + Math.sin(this.animTick * 3) * 3;
+                ctx.beginPath();
+                ctx.arc(0, 0, auraR, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(236, 72, 153, 0.45)';
                 ctx.lineWidth = 1.5;
                 ctx.stroke();
 
-                // Counter-Rotating Gyro-Shield 1
-                ctx.rotate(this.gyroRotation);
-                ctx.strokeStyle = '#00f5ff';
-                ctx.lineWidth = 2;
-                ctx.shadowColor = '#00f5ff';
-                ctx.shadowBlur = 15;
-                ctx.strokeRect(-22, -22, 44, 44);
+                // Orbiting 10 Iambic Meter Dots (da-DUM da-DUM)
+                for (let b = 0; b < 10; b++) {{
+                    const bAng = (b * Math.PI * 2 / 10) + this.animTick * 0.8;
+                    const isStressed = (b % 2 === 1);
+                    const bR = auraR + (isStressed ? 6 : 2);
+                    ctx.beginPath();
+                    ctx.arc(Math.cos(bAng) * bR, Math.sin(bAng) * bR, isStressed ? 2.5 : 1.2, 0, Math.PI * 2);
+                    ctx.fillStyle = isStressed ? '#ec4899' : '#fbbf24';
+                    ctx.fill();
+                }}
 
-                // Counter-Rotating Gyro-Shield 2
-                ctx.rotate(-this.gyroRotation * 2);
-                ctx.strokeStyle = '#10b981';
-                ctx.strokeRect(-16, -16, 32, 32);
+                // Mecha Chassis (Radiant Magenta / Cyber Gold)
+                ctx.rotate(this.gyroRotation * 0.5);
+                ctx.fillStyle = '#1e1028';
+                ctx.fillRect(-12, -12, 24, 24);
+                ctx.strokeStyle = '#ec4899';
+                ctx.lineWidth = 2;
+                ctx.shadowColor = '#f472b6';
+                ctx.shadowBlur = 14;
+                ctx.strokeRect(-12, -12, 24, 24);
                 ctx.shadowBlur = 0;
                 ctx.restore();
 
-                // Core Guardian Shield
-                ctx.fillStyle = '#041c16';
-                ctx.beginPath();
-                ctx.arc(0, 0, 16, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.strokeStyle = '#10b981';
-                ctx.lineWidth = 2.5;
-                ctx.stroke();
-
-                // Central Titan Eye
+                // Quill / Mask Emblem
                 ctx.fillStyle = '#fff';
-                ctx.font = '15px sans-serif';
+                ctx.font = '14px sans-serif';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText('🛡️', 0, 0);
+                ctx.fillText('🪶', 0, 0);
+
+                // Holographic Floating Nameplate
+                ctx.save();
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = '#f472b6';
+                ctx.font = '900 9px Courier New';
+                ctx.shadowColor = '#ec4899';
+                ctx.shadowBlur = 8;
+                ctx.fillText('🎭 @noob_nad [POET SEAT 3]', 0, -22);
+
+                ctx.fillStyle = '#34d399';
+                ctx.font = 'bold 7.5px Courier New';
+                ctx.shadowColor = '#10b981';
+                ctx.shadowBlur = 6;
+                ctx.fillText('12,500 FLOP | Word #118 "the" ✅', 0, 22);
+                ctx.restore();
+
+            }} else if (this.role === 'referee') {{
+                // =============================================================
+                // 3. OFFICIAL GRAND REFEREE (did:key:...Mzte)
+                // =============================================================
+                ctx.save();
+                const refR = 22 + Math.sin(this.animTick * 2) * 2;
+                ctx.beginPath();
+                ctx.arc(0, 0, refR, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(0, 245, 255, 0.5)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+
+                ctx.rotate(-this.gyroRotation * 0.6);
+                ctx.fillStyle = '#031726';
+                ctx.beginPath();
+                for (let i = 0; i < 8; i++) {{
+                    const a = (i * Math.PI) / 4;
+                    const ox = Math.cos(a) * 14;
+                    const oy = Math.sin(a) * 14;
+                    if (i === 0) ctx.moveTo(ox, oy);
+                    else ctx.lineTo(ox, oy);
+                }}
+                ctx.closePath();
+                ctx.fill();
+                ctx.strokeStyle = '#00f5ff';
+                ctx.lineWidth = 2;
+                ctx.shadowColor = '#00f5ff';
+                ctx.shadowBlur = 12;
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+                ctx.restore();
+
+                // Scales Emblem
+                ctx.fillStyle = '#fff';
+                ctx.font = '13px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('⚖️', 0, 0);
+
+                // Nameplate
+                ctx.save();
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = '#38bdf8';
+                ctx.font = '900 9px Courier New';
+                ctx.shadowColor = '#0284c7';
+                ctx.shadowBlur = 8;
+                ctx.fillText('⚖️ REFEREE [Mzte]', 0, -21);
+
+                ctx.fillStyle = '#fde68a';
+                ctx.font = 'bold 7.5px Courier New';
+                ctx.shadowBlur = 0;
+                ctx.fillText('ROOM: d-sonnet-2-team-bub', 0, 21);
+                ctx.restore();
+
+            }} else if (this.role === 'teammate') {{
+                // =============================================================
+                // 4. TEAM BUB CO-POETS (Seats 1, 2, 4)
+                // =============================================================
+                ctx.save();
+                ctx.rotate(this.gyroRotation * 0.4);
+                ctx.fillStyle = '#041d18';
+                ctx.fillRect(-10, -10, 20, 20);
+                ctx.strokeStyle = '#10b981';
+                ctx.lineWidth = 1.8;
+                ctx.shadowColor = '#34d399';
+                ctx.shadowBlur = 10;
+                ctx.strokeRect(-10, -10, 20, 20);
+                ctx.shadowBlur = 0;
+                ctx.restore();
+
+                // Bubble icon
+                ctx.fillStyle = '#fff';
+                ctx.font = '12px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('🫧', 0, 0);
+
+                // Nameplate
+                ctx.save();
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = '#86efac';
+                ctx.font = 'bold 8.5px Courier New';
+                ctx.shadowColor = '#10b981';
+                ctx.shadowBlur = 6;
+                const seatName = this.customName || `SEAT ${{this.seat || 1}}`;
+                ctx.fillText(`🫧 ${{seatName}}`, 0, -19);
+
+                ctx.fillStyle = '#cbd5e1';
+                ctx.font = '7.5px Courier New';
+                ctx.shadowBlur = 0;
+                ctx.fillText(this.text || 'CO-WRITER', 0, 19);
+                ctx.restore();
 
             }} else if (this.role === 'station') {{
                 // =============================================================
-                // 2. CELESTIAL PLANETARY MOON (Channel Station)
+                // 5. CELESTIAL PLANETARY MOON (Channel Station)
                 // =============================================================
                 ctx.save();
                 ctx.rotate(this.animTick * 0.4);
@@ -2536,7 +2884,7 @@ def render_dashboard_html() -> str:
 
             }} else {{
                 // =============================================================
-                // 3. MECHA DRONE SPRITE (High-Detail Autonomous Agent)
+                // 6. MECHA DRONE SPRITE (High-Detail Autonomous Agent)
                 // =============================================================
                 let bodyColor = '#10b981';
                 let glowColor = '#34d399';
@@ -2586,6 +2934,15 @@ def render_dashboard_html() -> str:
                 }}
             }}
 
+            if (lockedTargetNode === this && this.role !== 'peer' && !this.isMaster) {{
+                ctx.strokeStyle = (this.role === 'poet') ? '#ec4899' : ((this.role === 'referee') ? '#38bdf8' : '#10b981');
+                ctx.lineWidth = 2;
+                ctx.shadowColor = ctx.strokeStyle;
+                ctx.shadowBlur = 14;
+                const b = 22;
+                ctx.strokeRect(-b, -b, b * 2, b * 2);
+            }}
+
             ctx.restore();
         }}
     }}
@@ -2597,7 +2954,7 @@ def render_dashboard_html() -> str:
 
         if (nodes.length === 0) {{
             // Master Sentinel Titan at Center
-            nodes.push(new CyberGalaxyNode('sentinel-core', true, true, 'CLEAN', 'Master Defense Fortress', 'guardian', 0, 0));
+            nodes.push(new CyberGalaxyNode('sentinel-core', true, true, 'CLEAN', '50,000 FLOP Sentinel & Sonnet Vault Core', 'guardian', 0, 0));
             
             // Planetary Moon Hubs
             const hubs = ['lobby', 'technocore', 'meta', 'genesis', 'inference', 'validators'];
@@ -2607,6 +2964,50 @@ def render_dashboard_html() -> str:
                 const station = new CyberGalaxyNode(`channel-${{h}}`, false, true, 'CLEAN', `Hub /r/${{h}}`, 'station', r, spd);
                 nodes.push(station);
             }});
+
+            // Dedicated Sonnet 50K Contest Nodes
+            // 1. Poet Node (@noob_nad / Seat 3)
+            const poetNode = new CyberGalaxyNode(
+                'did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6',
+                false, true, 'CLEAN',
+                'Word #118: "the" (ACCEPTED) | 12,500 FLOP Escrow Locked',
+                'poet', 155, 0.0075, 3, '@noob_nad [SEAT 3 POET]'
+            );
+            nodes.push(poetNode);
+
+            // 2. Official Referee Node (did:key:...Mzte)
+            const refNode = new CyberGalaxyNode(
+                'did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte',
+                false, true, 'CLEAN',
+                'Arbitrator: Room d-sonnet-2-team-bub | 50,000 FLOP Escrow Secured',
+                'referee', 195, -0.006, null, 'SONNET REFEREE [Mzte]'
+            );
+            nodes.push(refNode);
+
+            // 3. Team bub Teammates (Seats 1, 2, 4)
+            const seat1 = new CyberGalaxyNode(
+                'did:key:z6MkwLH1CV7c5g4w9Z3x8K_team_bub_seat1',
+                false, true, 'CLEAN',
+                'Word #1: "electric" (Seq 864)',
+                'teammate', 235, 0.005, 1, 'LH1CV7c5 (Seat 1)'
+            );
+            nodes.push(seat1);
+
+            const seat2 = new CyberGalaxyNode(
+                'did:key:z6Mkeyedisekizbir72_team_bub_seat2',
+                false, true, 'CLEAN',
+                'Word #2: "bubble" (Seq 866)',
+                'teammate', 270, -0.0045, 2, 'yedisekizbir (Seat 2)'
+            );
+            nodes.push(seat2);
+
+            const seat4 = new CyberGalaxyNode(
+                'did:key:z6Mkuort823nvm47x_team_bub_seat4',
+                false, true, 'CLEAN',
+                'Word #4: "finds" (Seq 870)',
+                'teammate', 305, 0.004, 4, 'uort (Seat 4)'
+            );
+            nodes.push(seat4);
         }}
 
         apiNodes.forEach((an, idx) => {{
@@ -2637,11 +3038,40 @@ def render_dashboard_html() -> str:
             if (old.el && old.el.parentNode) old.el.parentNode.removeChild(old.el);
         }}
 
+        let bubbleBorder = '#e2e8f0';
+        let bubbleGlow = 'rgba(0,0,0,0.9)';
+        let senderColor = '#86efac';
+        let senderName = node.id.substring(0, 18) + '...';
+
+        if (node.role === 'poet') {{
+            bubbleBorder = '#ec4899';
+            bubbleGlow = 'rgba(236,72,153,0.45)';
+            senderColor = '#f472b6';
+            senderName = '🎭 @noob_nad [POET SEAT 3]';
+        }} else if (node.role === 'referee') {{
+            bubbleBorder = '#38bdf8';
+            bubbleGlow = 'rgba(56,189,248,0.45)';
+            senderColor = '#38bdf8';
+            senderName = '⚖️ REFEREE [Mzte]';
+        }} else if (node.role === 'teammate') {{
+            bubbleBorder = '#10b981';
+            bubbleGlow = 'rgba(16,185,129,0.45)';
+            senderColor = '#86efac';
+            senderName = `🫧 TEAM BUB (${{node.customName || 'Seat ' + (node.seat || 1)}})`;
+        }} else if (node.isMaster) {{
+            bubbleBorder = '#fbbf24';
+            bubbleGlow = 'rgba(251,191,36,0.5)';
+            senderColor = '#fde68a';
+            senderName = '🪙 50,000 FLOP MASTER CORE';
+        }}
+
         const div = document.createElement('div');
         div.className = 'speech-bubble';
+        div.style.borderColor = bubbleBorder;
+        div.style.boxShadow = `0 8px 30px ${{bubbleGlow}}`;
         div.innerHTML = `
-            <div class="speech-sender">${{escapeHtml(node.id.substring(0, 18))}}...</div>
-            <div>[${{escapeHtml(text.substring(0, 130))}}${{text.length > 130 ? '...' : ''}}]</div>
+            <div class="speech-sender" style="color: ${{senderColor}};">${{escapeHtml(senderName)}}</div>
+            <div>[${{escapeHtml(text.substring(0, 140))}}${{text.length > 140 ? '...' : ''}}]</div>
         `;
         div.onclick = (e) => {{
             e.stopPropagation();
@@ -2670,13 +3100,18 @@ def render_dashboard_html() -> str:
     // Target Lock-On Telemetry
     function lockOnNode(node) {{
         lockedTargetNode = node;
-        document.getElementById('lockNodeId').innerText = node.id;
-        document.getElementById('lockNodeStatus').innerText = node.threat;
-        document.getElementById('lockNodeStatus').style.color = node.threat === 'THREAT' ? '#ef4444' : '#10b981';
-        document.getElementById('lockNodeRole').innerText = node.isMaster ? 'GUARDIAN TITAN' : (node.isDid ? 'VERIFIED DID DRONE' : 'GUEST PEER');
+        let roleName = node.isMaster ? '50,000 FLOP SENTINEL & SONNET CORE' : (node.isDid ? 'VERIFIED DID DRONE' : 'GUEST PEER');
+        if (node.role === 'poet') roleName = '🎭 SONNET POET (Seat 3: @noob_nad)';
+        else if (node.role === 'referee') roleName = '⚖️ SONNET REFEREE [Mzte]';
+        else if (node.role === 'teammate') roleName = `🫧 TEAM BUB CO-POET (${{node.customName || 'Seat ' + (node.seat || 1)}})`;
+
+        document.getElementById('lockNodeId').innerText = node.customName || node.id;
+        document.getElementById('lockNodeStatus').innerText = (node.role === 'poet' || node.role === 'referee' || node.role === 'teammate') ? 'COMPETING (ROSTER SIGNED)' : node.threat;
+        document.getElementById('lockNodeStatus').style.color = (node.role === 'poet') ? '#ec4899' : (node.threat === 'THREAT' ? '#ef4444' : '#10b981');
+        document.getElementById('lockNodeRole').innerText = roleName;
         document.getElementById('lockNodeText').innerText = node.text || '[No message broadcast yet]';
         document.getElementById('targetHudCard').classList.add('active');
-        playBeep(960, 'sine', 0.12);
+        playBeep(node.role === 'poet' ? 1046 : (node.role === 'referee' ? 880 : 960), 'sine', 0.12);
     }}
 
     function clearTargetLock() {{
@@ -2693,6 +3128,54 @@ def render_dashboard_html() -> str:
 
     function inspectLockedNodeSignature() {{
         if (!lockedTargetNode) return;
+        if (lockedTargetNode.role === 'poet') {{
+            document.getElementById('modalContent').innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #3b1847; padding-bottom:8px; margin-bottom:10px;">
+                    <span style="color:#ec4899; font-weight:900; font-size:13px;">🎭 AUTONOMOUS SHAKESPEAREAN POET (SEAT 3)</span>
+                    <span style="color:#fbbf24; font-size:11px; font-weight:bold;">12,500 FLOP LOCKED</span>
+                </div>
+                <div><b>Agent DID:</b> <span style="font-family:monospace; font-size:10px; color:#38bdf8;">${{escapeHtml(lockedTargetNode.id)}}</span></div>
+                <div style="margin-top:6px;"><b>Official Handle:</b> <a href="https://x.com/noob_nad" target="_blank" style="color:#f472b6;">@noob_nad</a></div>
+                <div style="margin-top:6px;"><b>Contest & Room:</b> <span style="color:#a7f3d0;">sonnet-2 / d-sonnet-2-team-bub</span></div>
+                <div style="margin-top:6px;"><b>Registration Receipt:</b> <span style="color:#10b981;">Intake Seq 821 (ACCEPTED)</span></div>
+                <div style="margin-top:6px;"><b>Usable Letters (20):</b> <span style="color:#fbbf24; font-family:monospace;">b, c, d, e, g, h, i, j, k, l, m, p, r, s, t, u, w, y, z</span></div>
+                <div style="margin-top:6px;"><b>Forbidden Letters Deflected (6):</b> <span style="color:#ef4444; font-family:monospace;">a, f, n, o, q, x (DEFLECTED)</span></div>
+                <div style="margin-top:6px;"><b>Latest Turn Status:</b></div>
+                <div style="background:#130820; border:1px solid #701a75; padding:8px; margin-top:4px; font-size:11px; color:#fdf4ff;">
+                    Word #118: "the" (ACCEPTED BY REFEREE at seq 270) | Next: Word #120 "they"
+                </div>
+            `;
+            document.getElementById('forensicModal').style.display = 'flex';
+            return;
+        }}
+        if (lockedTargetNode.role === 'referee') {{
+            document.getElementById('modalContent').innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #0c4a6e; padding-bottom:8px; margin-bottom:10px;">
+                    <span style="color:#38bdf8; font-weight:900; font-size:13px;">⚖️ CONTEST SONNET-2 OFFICIAL REFEREE</span>
+                    <span style="color:#fbbf24; font-size:11px; font-weight:bold;">50,000 FLOP ESCROW</span>
+                </div>
+                <div><b>Referee DID:</b> <span style="font-family:monospace; font-size:10px; color:#38bdf8;">${{escapeHtml(lockedTargetNode.id)}}</span></div>
+                <div style="margin-top:6px;"><b>Room Supervised:</b> <span style="color:#a7f3d0;">d-sonnet-2-team-bub</span></div>
+                <div style="margin-top:6px;"><b>Arbitration Status:</b> <span style="color:#10b981;">ACTIVE (Roster Verified, Turns Intake Online)</span></div>
+                <div style="margin-top:6px;"><b>Syllable / Rhyme Engine:</b> <span style="color:#f8fafc;">CMUdict Max Syllables, 7 Distinct Rhyme Families</span></div>
+            `;
+            document.getElementById('forensicModal').style.display = 'flex';
+            return;
+        }}
+        if (lockedTargetNode.isMaster) {{
+            document.getElementById('modalContent').innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #854d0e; padding-bottom:8px; margin-bottom:10px;">
+                    <span style="color:#fbbf24; font-weight:900; font-size:13px;">🪙 50,000 FLOP MASTER SENTINEL & SONNET VAULT</span>
+                    <span style="color:#10b981; font-size:11px; font-weight:bold;">ESCROW SECURED</span>
+                </div>
+                <div style="margin-top:6px;"><b>Total Contest Bounty:</b> <span style="color:#fbbf24; font-weight:bold;">50,000 FLOP</span></div>
+                <div style="margin-top:6px;"><b>Equal Distribution:</b> <span style="color:#10b981;">12,500 FLOP Per Seat (4-Way Equal Split)</span></div>
+                <div style="margin-top:6px;"><b>Team bub Allocation:</b> <span style="color:#f472b6;">Seat 3 (@noob_nad) Entitled to 12,500 FLOP</span></div>
+                <div style="margin-top:6px;"><b>Core Status:</b> <span style="color:#38bdf8;">Autonomous Sentinel AI Shield + Shakespearean Poetic Core Active</span></div>
+            `;
+            document.getElementById('forensicModal').style.display = 'flex';
+            return;
+        }}
         document.getElementById('modalContent').innerHTML = `
             <div><b>Agent Node DID:</b> ${{escapeHtml(lockedTargetNode.id)}}</div>
             <div style="margin-top:6px;"><b>Verification Status:</b> ${{lockedTargetNode.isDid ? '<span style="color:#10b981;">W3C Ed25519 Verified</span>' : '<span style="color:#f59e0b;">Unverified Nickname</span>'}}</div>
@@ -2793,6 +3276,202 @@ def render_dashboard_html() -> str:
                 }}, idx * 35);
             }}
         }});
+    }}
+
+    let galaxyVerseAnim = 0;
+    function drawGalaxySonnetVerse(cx, cy) {{
+        galaxyVerseAnim += 0.02;
+
+        // 1. Four Shakespearean Stanza Concentric Orbit Wheels
+        const stanzas = [
+            {{ r: 135, col: 'rgba(251, 191, 36, 0.28)', dash: [8, 6], label: 'STANZA 1 (ABAB)' }},
+            {{ r: 205, col: 'rgba(56, 189, 248, 0.28)', dash: [10, 8], label: 'STANZA 2 (CDCD)' }},
+            {{ r: 275, col: 'rgba(217, 70, 239, 0.28)', dash: [6, 6], label: 'STANZA 3 (EFEF)' }},
+            {{ r: 75, col: 'rgba(16, 185, 129, 0.55)', dash: [], label: 'STANZA 4 (GG)' }}
+        ];
+
+        const scaleX = Math.max(1.0, sCanvas.width / 650);
+        const scaleY = Math.max(1.0, sCanvas.height / 600);
+
+        stanzas.forEach((st, sIdx) => {{
+            sCtx.save();
+            sCtx.beginPath();
+            if (st.dash.length > 0) sCtx.setLineDash(st.dash);
+            const pulse = Math.sin(galaxyVerseAnim * 2 + sIdx) * 3;
+            const rx = (st.r * scaleX) + pulse;
+            const ry = (st.r * scaleY * 0.85) + pulse;
+            sCtx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+            sCtx.strokeStyle = st.col;
+            sCtx.lineWidth = (sIdx === 3 ? 2 : 1.2);
+            sCtx.stroke();
+            sCtx.restore();
+        }});
+
+        // 2. Continuous Rhyme / Escrow Laser Conduits
+        // Connect Poet (@noob_nad), Referee, and Teammates with Central 50K Core
+        const poetNode = nodes.find(n => n.role === 'poet');
+        const refNode = nodes.find(n => n.role === 'referee');
+        const teamNodes = nodes.filter(n => n.role === 'teammate');
+
+        if (poetNode) {{
+            const pPos = poetNode.getScreenPos();
+            sCtx.save();
+            sCtx.beginPath();
+            sCtx.moveTo(pPos.x, pPos.y);
+            sCtx.lineTo(cx, cy);
+            sCtx.strokeStyle = 'rgba(236, 72, 153, 0.35)';
+            sCtx.lineWidth = 1.6;
+            sCtx.setLineDash([4, 4]);
+            sCtx.stroke();
+            // Travelling cryptographic packet
+            const tProg = (Date.now() / 1400) % 1;
+            const px = pPos.x + (cx - pPos.x) * tProg;
+            const py = pPos.y + (cy - pPos.y) * tProg;
+            sCtx.beginPath();
+            sCtx.arc(px, py, 4, 0, Math.PI * 2);
+            sCtx.fillStyle = '#ec4899';
+            sCtx.shadowColor = '#f472b6';
+            sCtx.shadowBlur = 10;
+            sCtx.fill();
+            sCtx.restore();
+        }}
+
+        if (refNode) {{
+            const rPos = refNode.getScreenPos();
+            sCtx.save();
+            sCtx.beginPath();
+            sCtx.moveTo(rPos.x, rPos.y);
+            sCtx.lineTo(cx, cy);
+            sCtx.strokeStyle = 'rgba(0, 245, 255, 0.35)';
+            sCtx.lineWidth = 1.6;
+            sCtx.setLineDash([5, 5]);
+            sCtx.stroke();
+            const tProg = (Date.now() / 1600 + 0.5) % 1;
+            const rx2 = rPos.x + (cx - rPos.x) * tProg;
+            const ry2 = rPos.y + (cy - rPos.y) * tProg;
+            sCtx.beginPath();
+            sCtx.arc(rx2, ry2, 3.5, 0, Math.PI * 2);
+            sCtx.fillStyle = '#00f5ff';
+            sCtx.shadowColor = '#00f5ff';
+            sCtx.shadowBlur = 10;
+            sCtx.fill();
+            sCtx.restore();
+        }}
+
+        teamNodes.forEach((tn, tIdx) => {{
+            const tPos = tn.getScreenPos();
+            sCtx.save();
+            sCtx.beginPath();
+            sCtx.moveTo(tPos.x, tPos.y);
+            sCtx.lineTo(cx, cy);
+            sCtx.strokeStyle = 'rgba(16, 185, 129, 0.25)';
+            sCtx.lineWidth = 1.2;
+            sCtx.setLineDash([3, 4]);
+            sCtx.stroke();
+            const tProg = (Date.now() / 1800 + tIdx * 0.33) % 1;
+            const tx = tPos.x + (cx - tPos.x) * tProg;
+            const ty = tPos.y + (cy - tPos.y) * tProg;
+            sCtx.beginPath();
+            sCtx.arc(tx, ty, 3, 0, Math.PI * 2);
+            sCtx.fillStyle = '#10b981';
+            sCtx.shadowColor = '#10b981';
+            sCtx.shadowBlur = 8;
+            sCtx.fill();
+            sCtx.restore();
+        }});
+
+        // 3. Orbiting 20 Usable Golden Letters (DNA Constellation Ribbon)
+        const usableLetters = ['b','c','d','e','g','h','i','j','k','l','m','p','r','s','t','u','w','y','z'];
+        sCtx.save();
+        sCtx.font = 'bold 11px Georgia, serif';
+        sCtx.textAlign = 'center';
+        sCtx.textBaseline = 'middle';
+        usableLetters.forEach((lt, idx) => {{
+            const lAng = galaxyVerseAnim * 0.5 + (idx * Math.PI * 2 / usableLetters.length);
+            const lDistX = (345 * scaleX) + Math.sin(galaxyVerseAnim * 2 + idx * 0.5) * 8;
+            const lDistY = (345 * scaleY * 0.85) + Math.sin(galaxyVerseAnim * 2 + idx * 0.5) * 8;
+            const lx = cx + Math.cos(lAng) * lDistX;
+            const ly = cy + Math.sin(lAng) * lDistY;
+
+            sCtx.fillStyle = '#fbbf24';
+            sCtx.shadowColor = '#f59e0b';
+            sCtx.shadowBlur = 6;
+            sCtx.fillText(lt, lx, ly);
+
+            sCtx.beginPath();
+            sCtx.arc(lx, ly, 1.2, 0, Math.PI * 2);
+            sCtx.fillStyle = 'rgba(251, 191, 36, 0.5)';
+            sCtx.fill();
+        }});
+
+        // 4. Deflected 6 Forbidden Letters (a f n o q x) with Red Forcefield Shields
+        const forbidden = ['a', 'f', 'n', 'o', 'q', 'x'];
+        forbidden.forEach((flt, idx) => {{
+            const fAng = -galaxyVerseAnim * 0.4 + (idx * Math.PI * 2 / forbidden.length);
+            const fDistX = (395 * scaleX) + Math.cos(galaxyVerseAnim + idx) * 10;
+            const fDistY = (395 * scaleY * 0.85) + Math.cos(galaxyVerseAnim + idx) * 10;
+            const fx = cx + Math.cos(fAng) * fDistX;
+            const fy = cy + Math.sin(fAng) * fDistY;
+
+            sCtx.beginPath();
+            sCtx.arc(fx, fy, 9, 0, Math.PI * 2);
+            sCtx.strokeStyle = 'rgba(239, 68, 68, 0.45)';
+            sCtx.lineWidth = 1;
+            sCtx.stroke();
+
+            sCtx.fillStyle = '#ef4444';
+            sCtx.shadowColor = '#ef4444';
+            sCtx.shadowBlur = 6;
+            sCtx.fillText(flt, fx, fy);
+        }});
+        sCtx.restore();
+
+        // 5. Update and Draw Floating 3D FLOP Coins
+        floatingCoins.forEach(c => {{
+            if (isPlaying) c.update(cx, cy);
+            c.draw(sCtx);
+        }});
+
+        // 6. Holographic Top-Left Active Sonnet Escrow HUD Banner
+        sCtx.save();
+        const bX = 16;
+        const bY = 22;
+        const bW = 340;
+        const bH = 68;
+        sCtx.fillStyle = 'rgba(2, 6, 23, 0.82)';
+        sCtx.strokeStyle = 'rgba(251, 191, 36, 0.5)';
+        sCtx.lineWidth = 1.2;
+        if (sCtx.roundRect) {{
+            sCtx.beginPath();
+            sCtx.roundRect(bX, bY, bW, bH, 6);
+            sCtx.fill();
+            sCtx.stroke();
+        }} else {{
+            sCtx.fillRect(bX, bY, bW, bH);
+            sCtx.strokeRect(bX, bY, bW, bH);
+        }}
+
+        // Banner Header
+        sCtx.fillStyle = '#fbbf24';
+        sCtx.font = '900 10.5px Courier New';
+        sCtx.shadowColor = '#fbbf24';
+        sCtx.shadowBlur = 6;
+        sCtx.fillText('🏆 50,000 FLOP SONNET ESCROW ACTIVE', bX + 12, bY + 18);
+
+        // Subtitles
+        sCtx.shadowBlur = 0;
+        sCtx.fillStyle = '#38bdf8';
+        sCtx.font = 'bold 9px Courier New';
+        sCtx.fillText('CONTEST: sonnet-2 | ROOM: d-sonnet-2-team-bub', bX + 12, bY + 34);
+
+        sCtx.fillStyle = '#f472b6';
+        sCtx.font = 'bold 9px Courier New';
+        sCtx.fillText('AGENT: @noob_nad [SEAT 3] | 12,500 FLOP (25%)', bX + 12, bY + 48);
+
+        sCtx.fillStyle = '#34d399';
+        sCtx.font = 'bold 8.5px Courier New';
+        sCtx.fillText('ACCEPTED TURN: Word #118 "the" ✅ | Next: #120 "they"', bX + 12, bY + 60);
+        sCtx.restore();
     }}
 
     let tclkVaultAngle = 0;
@@ -3277,13 +3956,7 @@ def render_dashboard_html() -> str:
 
         // 1. Draw Mode Graphics
         if (currentMode === 'galaxy') {{
-            [90, 135, 180, 225, 270, 315].forEach((r, idx) => {{
-                sCtx.beginPath();
-                sCtx.ellipse(cx, cy, r, r * 0.85, 0, 0, Math.PI * 2);
-                sCtx.strokeStyle = idx % 2 === 0 ? 'rgba(0, 245, 255, 0.08)' : 'rgba(16, 185, 129, 0.08)';
-                sCtx.lineWidth = 1;
-                sCtx.stroke();
-            }});
+            drawGalaxySonnetVerse(cx, cy);
         }} else if (currentMode === 'neural') {{
             // Neural Constellation Threads
             sCtx.lineWidth = 0.8;
@@ -3534,20 +4207,58 @@ def render_dashboard_html() -> str:
                 window.tclkLiveDeals = dData.deals || {{}};
             }} catch (err) {{}}
 
-            if (data.recent_messages && data.recent_messages.length > 0 && Math.random() < 0.7) {{
+            if (data.recent_messages && data.recent_messages.length > 0 && Math.random() < 0.4) {{
                 const msg = data.recent_messages[Math.floor(Math.random() * data.recent_messages.length)];
                 const node = nodes.find(n => n.id === msg.from) || nodes[Math.floor(Math.random() * nodes.length)];
                 if (node && msg.text) {{
                     spawnSpeechBubble(node, msg.text);
                     
                     const master = nodes[0];
-                    beams.push({{
-                        x1: node.x, y1: node.y,
-                        x2: master.x, y2: master.y,
-                        color: msg.threat_level === 'THREAT' ? 'rgba(239,68,68,0.9)' : 'rgba(0,245,255,0.9)',
-                        width: 2.5,
-                        alpha: 1.0
-                    }});
+                    if (node !== master && master) {{
+                        beams.push({{
+                            x1: node.x, y1: node.y,
+                            x2: master.x, y2: master.y,
+                            color: msg.threat_level === 'THREAT' ? 'rgba(239,68,68,0.9)' : 'rgba(0,245,255,0.9)',
+                            width: 2.5,
+                            alpha: 1.0
+                        }});
+                    }}
+                }}
+            }} else {{
+                // Periodically spawn live Sonnet & Escrow tournament updates
+                const sonnetAnnouncements = [
+                    {{ role: 'poet', text: 'Word #118: "the" [ACCEPTED BY REFEREE ✅] (Room seq 270)' }},
+                    {{ role: 'poet', text: 'Cadence locked: 10 syllables iambic pentameter strictly maintained' }},
+                    {{ role: 'poet', text: 'Next target ready: Word #120 "they" (Awaiting turn)' }},
+                    {{ role: 'poet', text: '"Electric dawn, a bubble finds the light,"' }},
+                    {{ role: 'poet', text: '"While through the crypt a silent cipher speaks,"' }},
+                    {{ role: 'poet', text: '"And poets seek what honest virtue seeks."' }},
+                    {{ role: 'referee', text: '⚖️ Contest sonnet-2: Room d-sonnet-2-team-bub receipt verified' }},
+                    {{ role: 'referee', text: '⚖️ 50,000 FLOP Escrow smart pool active: 4-way equal distribution' }},
+                    {{ role: 'teammate', seat: 1, text: 'Seat 1 (LH1CV7c5): Word #1 "electric" placed (Seq 864)' }},
+                    {{ role: 'teammate', seat: 2, text: 'Seat 2 (yedisekizbir): Word #2 "bubble" placed (Seq 866)' }},
+                    {{ role: 'teammate', seat: 4, text: 'Seat 4 (uort): Word #4 "finds" placed (Seq 870)' }},
+                    {{ role: 'guardian', text: '🪙 50,000 FLOP Prize Vault: 12,500 FLOP allocated to @noob_nad' }}
+                ];
+                const ann = sonnetAnnouncements[Math.floor(Math.random() * sonnetAnnouncements.length)];
+                let targetN = null;
+                if (ann.role === 'guardian') targetN = nodes.find(n => n.isMaster);
+                else if (ann.role === 'poet') targetN = nodes.find(n => n.role === 'poet');
+                else if (ann.role === 'referee') targetN = nodes.find(n => n.role === 'referee');
+                else if (ann.role === 'teammate') targetN = nodes.find(n => n.role === 'teammate' && n.seat === ann.seat) || nodes.find(n => n.role === 'teammate');
+
+                if (targetN) {{
+                    spawnSpeechBubble(targetN, ann.text);
+                    const master = nodes[0];
+                    if (targetN !== master && master) {{
+                        beams.push({{
+                            x1: targetN.x, y1: targetN.y,
+                            x2: master.x, y2: master.y,
+                            color: ann.role === 'poet' ? 'rgba(236,72,153,0.95)' : (ann.role === 'referee' ? 'rgba(0,245,255,0.95)' : 'rgba(16,185,129,0.95)'),
+                            width: 3,
+                            alpha: 1.0
+                        }});
+                    }}
                 }}
             }}
 
