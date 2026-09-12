@@ -50,8 +50,11 @@ class AutonomousSonnetDaemon:
         self.did = self.agent.did
         self.short_did = self.did[-8:]
         self.signed_rosters: Set[str] = set()
+        self.forbidden_games: Set[str] = {"ej-v1"}
+        self.registration_verified: bool = True
         self.last_announce_time = 0.0
         self.last_discovery_seq = 0
+        self.last_vote_tally_time = 0.0
         self.active_team_room: Optional[str] = None
         self.room_generation: int = 1
 
@@ -60,10 +63,12 @@ class AutonomousSonnetDaemon:
 
     def ensure_registered(self) -> bool:
         """Verifies accepted writer receipt, or submits registration."""
+        if self.registration_verified:
+            return True
         reg_status, receipt = self.agent.check_registration()
         if reg_status == "accepted":
-            intake = receipt.get("intake_seq") if receipt else "?"
-            logger.info(f"[+] Agent is verified ACCEPTED writer by referee (intake_seq: {intake}).")
+            self.registration_verified = True
+            logger.info("[+] Agent is verified ACCEPTED writer by referee.")
             return True
 
         logger.info("[-] Registration not yet accepted. Posting writer registration...")
@@ -100,6 +105,9 @@ class AutonomousSonnetDaemon:
         msg_type = data.get("type", "")
         game_id = data.get("game_id", "").lower().strip()
 
+        if game_id in self.forbidden_games:
+            return
+
         if msg_type == "sonnet.roster.v1" or "members" in data:
             members = data.get("members", [])
             gen = data.get("room_generation", 1)
@@ -124,11 +132,40 @@ class AutonomousSonnetDaemon:
 
     def check_and_play_team(self, game_id: str) -> bool:
         """Polls team room and takes a poetic turn if it's our turn."""
-        try:
-            return self.agent.play_turn(game_id)
-        except Exception as e:
-            logger.warning(f"Error checking turn in {game_id}: {e}")
+        if game_id in self.forbidden_games:
             return False
+        try:
+            res = self.agent.play_turn(game_id)
+            return res
+        except Exception as e:
+            if "403" in str(e):
+                self.forbidden_games.add(game_id)
+                logger.warning(f"Room {game_id} returned 403 Forbidden. Adding to ignore list.")
+            else:
+                logger.warning(f"Error checking turn in {game_id}: {e}")
+            return False
+
+    def check_live_votes(self) -> None:
+        """Polls voting room to monitor standings and competition movements."""
+        try:
+            status, msgs, _ = self.client.get_room_messages(f"mb-{self.contest_id}-votes", limit=100)
+            if status == 200:
+                from collections import Counter
+                voter_latest = {}
+                for m in msgs:
+                    try:
+                        p = json.loads(m.get("text", ""))
+                        if p.get("type") == "sonnet.receipt.v1" and p.get("status") == "accepted":
+                            v = p.get("sender_did")
+                            e = p.get("entry_id")
+                            if v and e:
+                                voter_latest[v] = e
+                    except Exception:
+                        pass
+                tally = Counter(voter_latest.values())
+                logger.info(f"[Live Votes] Verified voters in window: {len(voter_latest)} | Standings: {tally.most_common(5)}")
+        except Exception as e:
+            logger.warning(f"Error checking live votes: {e}")
 
     def run_cycle(self) -> None:
         """Single autonomous evaluation tick."""
@@ -148,6 +185,11 @@ class AutonomousSonnetDaemon:
         # Step 4: Check turn in target team room
         if self.target_game:
             self.check_and_play_team(self.target_game)
+
+        # Step 5: Monitor live votes periodically
+        if now - self.last_vote_tally_time > 300:
+            self.check_live_votes()
+            self.last_vote_tally_time = now
 
     def run_forever(self, interval: int = 15) -> None:
         """Continuous execution loop."""

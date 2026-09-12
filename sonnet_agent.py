@@ -344,6 +344,9 @@ class SonnetAgent:
                         last_contributor = data.get("sender_did", last_contributor)
                         if "accepted_word" in data:
                             accepted_words.append(data["accepted_word"])
+                        if data.get("complete") is True:
+                            logger.info(f"Poem for '{game_id}' is officially COMPLETE (14 lines, 10 syllables)! Awaiting judging.")
+                            return False
                 elif msg_type in ("sonnet.room.v1", "sonnet.setup.v1"):
                     room_generation = data.get("room_generation", room_generation) or 1
             except Exception:
