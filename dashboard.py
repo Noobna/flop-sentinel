@@ -1594,8 +1594,10 @@ def render_dashboard_html() -> str:
         .drawer {{
             position: fixed;
             top: 50px;
-            right: -420px;
-            width: 400px;
+            right: 0;
+            transform: translateX(115%);
+            width: 440px;
+            max-width: 90vw;
             height: calc(100vh - 170px);
             background: rgba(5, 14, 11, 0.97);
             backdrop-filter: blur(18px);
@@ -1607,10 +1609,16 @@ def render_dashboard_html() -> str:
             flex-direction: column;
             gap: 14px;
             z-index: 100;
-            transition: right 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), visibility 0.3s;
             box-shadow: -10px 0 45px rgba(0,0,0,0.9);
+            visibility: hidden;
+            pointer-events: none;
         }}
-        .drawer.open {{ right: 0; }}
+        .drawer.open {{
+            transform: translateX(0);
+            visibility: visible;
+            pointer-events: auto;
+        }}
         .drawer-header {{
             display: flex;
             justify-content: space-between;
@@ -1954,7 +1962,7 @@ def render_dashboard_html() -> str:
 <div class="drawer" id="composerDrawer">
     <div class="drawer-header">
         <span>✍️ 1-Click Ed25519 Signed Broadcaster</span>
-        <button class="drawer-close" onclick="toggleDrawer('composerDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('composerDrawer')">✕</button>
     </div>
 
     <div>
@@ -1984,7 +1992,7 @@ def render_dashboard_html() -> str:
 <div class="drawer" id="tclkDrawer" style="width: 440px;">
     <div class="drawer-header">
         <span>🤝 TCLK Escrow & Bounty Deals</span>
-        <button class="drawer-close" onclick="toggleDrawer('tclkDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('tclkDrawer')">✕</button>
     </div>
     <div style="display: flex; gap: 8px; margin-bottom: 8px;">
         <button class="hud-btn" onclick="const f=document.getElementById('tclkOfferForm'); f.style.display = f.style.display === 'none' ? 'block' : 'none';" style="flex: 1; justify-content: center; background: #064e3b; border-color: #10b981; color: #a7f3d0;">+ Propose Bounty</button>
@@ -2025,7 +2033,7 @@ def render_dashboard_html() -> str:
             🎭 Technocore Sonnet Challenge
             <span style="font-size: 10px; background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid #10b981; padding: 2px 6px; border-radius: 4px;">50,000 FLOP</span>
         </span>
-        <button class="drawer-close" onclick="toggleDrawer('sonnetDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('sonnetDrawer')">✕</button>
     </div>
 
     <!-- Quick Action Bar -->
@@ -2131,7 +2139,7 @@ def render_dashboard_html() -> str:
 <div class="drawer" id="terminalDrawer">
     <div class="drawer-header">
         <span>🖥️ LIVE STREAM CONSOLE (/api/logs)</span>
-        <button class="drawer-close" onclick="toggleDrawer('terminalDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('terminalDrawer')">✕</button>
     </div>
     <div class="terminal-box" id="terminalLogBox">
         [Loading live activity logs...]
@@ -2142,7 +2150,7 @@ def render_dashboard_html() -> str:
 <div class="drawer" id="toolsDrawer">
     <div class="drawer-header">
         <span>🔐 ROOM & IDENTITY TOOLS</span>
-        <button class="drawer-close" onclick="toggleDrawer('toolsDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('toolsDrawer')">✕</button>
     </div>
     <div>
         <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Claim Gated Room:</div>
@@ -2380,13 +2388,48 @@ def render_dashboard_html() -> str:
     }}
 
     function toggleDrawer(id) {{
-        document.querySelectorAll('.drawer').forEach(d => {{
-            if (d.id !== id) d.classList.remove('open');
-        }});
         const target = document.getElementById(id);
-        target.classList.toggle('open');
-        playBeep(600, 'triangle', 0.05);
+        const willOpen = target && !target.classList.contains('open');
+        document.querySelectorAll('.drawer').forEach(d => {{
+            d.classList.remove('open');
+        }});
+        if (willOpen && target) {{
+            target.classList.add('open');
+            playBeep(600, 'triangle', 0.05);
+        }} else {{
+            playBeep(450, 'triangle', 0.04);
+        }}
     }}
+
+    function closeDrawer(id) {{
+        const target = id ? document.getElementById(id) : null;
+        if (target) {{
+            target.classList.remove('open');
+            playBeep(450, 'triangle', 0.04);
+        }} else {{
+            closeAllDrawers();
+        }}
+    }}
+
+    function closeAllDrawers() {{
+        document.querySelectorAll('.drawer.open').forEach(d => d.classList.remove('open'));
+    }}
+
+    // Global Key Listener: Escape closes any active drawer or modal
+    document.addEventListener('keydown', (e) => {{
+        if (e.key === 'Escape') {{
+            closeAllDrawers();
+            closeCmdPalette();
+            clearTargetLock();
+        }}
+    }});
+
+    // Global Click Listener: clicking outside open drawer closes it
+    document.addEventListener('click', (e) => {{
+        if (!e.target.closest('.drawer') && !e.target.closest('.hud-btn') && !e.target.closest('.ribbon-badge') && !e.target.closest('.macro-pill')) {{
+            closeAllDrawers();
+        }}
+    }});
 
     // Canvas Initializations
     const sCanvas = document.getElementById('swarmCanvas');
