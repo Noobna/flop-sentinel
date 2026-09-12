@@ -2887,27 +2887,23 @@ def render_dashboard_html() -> str:
 
                     ctx.save();
                     ctx.rotate(this.gyroRotation * 0.8);
+                    ctx.beginPath();
                     for (let i = 0; i < 12; i++) {{
                         const a = (i * Math.PI) / 6;
                         const pulse = Math.sin(this.animTick * 4 + i) * 6;
-                        ctx.beginPath();
                         ctx.moveTo(Math.cos(a) * 20, Math.sin(a) * 20);
                         ctx.lineTo(Math.cos(a) * (36 + pulse), Math.sin(a) * (36 + pulse));
-                        ctx.strokeStyle = i % 2 === 0 ? '#60a5fa' : '#818cf8';
-                        ctx.lineWidth = 1.5;
-                        ctx.stroke();
                     }}
+                    ctx.strokeStyle = '#60a5fa';
+                    ctx.lineWidth = 1.5;
+                    ctx.stroke();
                     ctx.restore();
 
                     ctx.beginPath();
                     ctx.arc(0, 0, 20, 0, Math.PI * 2);
-                    const nGrad = ctx.createRadialGradient(0, 0, 2, 0, 0, 20);
-                    nGrad.addColorStop(0, '#93c5fd');
-                    nGrad.addColorStop(0.5, '#3b82f6');
-                    nGrad.addColorStop(1, '#1e3a8a');
-                    ctx.fillStyle = nGrad;
+                    ctx.fillStyle = '#1e3a8a';
                     ctx.fill();
-                    ctx.strokeStyle = '#bfdbfe';
+                    ctx.strokeStyle = '#60a5fa';
                     ctx.lineWidth = 1.5;
                     ctx.stroke();
 
@@ -2921,13 +2917,10 @@ def render_dashboard_html() -> str:
                     ctx.textAlign = 'center';
                     ctx.fillStyle = '#60a5fa';
                     ctx.font = '900 11.5px Courier New';
-                    ctx.shadowColor = '#3b82f6';
-                    ctx.shadowBlur = 10;
                     ctx.fillText('⚡ SYNAPTIC CORE', 0, -42);
 
                     ctx.fillStyle = '#93c5fd';
                     ctx.font = 'bold 8.5px Courier New';
-                    ctx.shadowBlur = 0;
                     ctx.fillText('DEEP REASONING MATRIX', 0, 42);
 
                     ctx.fillStyle = '#c4b5fd';
@@ -3926,54 +3919,53 @@ def render_dashboard_html() -> str:
     function drawNeuralMeshField(cx, cy) {{
         neuralMeshAnim += 0.02;
 
-        // 1. Concentric Neural Wave Rings (Brainwave Oscillations)
+        // 1. Concentric Neural Wave Rings (Brainwave Oscillations) - Single Batched Path
         sCtx.save();
+        sCtx.beginPath();
         for (let w = 1; w <= 3; w++) {{
             const waveR = (w * 80 + (Date.now() * 0.04) % 80);
-            const wAlpha = Math.max(0, 0.3 - (waveR / 360) * 0.3);
-            sCtx.beginPath();
+            sCtx.moveTo(cx + waveR, cy);
             sCtx.arc(cx, cy, waveR, 0, Math.PI * 2);
-            sCtx.strokeStyle = `rgba(59, 130, 246, ${{wAlpha}})`;
-            sCtx.lineWidth = 1.4;
-            sCtx.stroke();
         }}
+        sCtx.strokeStyle = 'rgba(59, 130, 246, 0.22)';
+        sCtx.lineWidth = 1.4;
+        sCtx.stroke();
 
         // Precompute screen positions once per frame to eliminate O(N^2) method overhead
         const nLen = nodes.length;
         const sPositions = nodes.map(n => n.getScreenPos());
 
-        // 2. Synaptic Network Mesh - Batched into a single stroke call
+        // 2. Synaptic Network Mesh - Connect each node to nearest 2 neighbors (authentic neural constellation)
         sCtx.beginPath();
+        const activePairs = [];
         for (let i = 0; i < nLen; i++) {{
             const p1 = sPositions[i];
-            for (let j = i + 1; j < nLen; j++) {{
+            let connections = 0;
+            for (let j = i + 1; j < Math.min(nLen, i + 6); j++) {{
                 const p2 = sPositions[j];
-                const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-                if (dist < 175) {{
+                const dx = p1.x - p2.x;
+                const dy = p1.y - p2.y;
+                if (dx * dx + dy * dy < 24000) {{
                     sCtx.moveTo(p1.x, p1.y);
                     sCtx.lineTo(p2.x, p2.y);
+                    activePairs.push({{ p1, p2, i, j }});
+                    connections++;
+                    if (connections >= 2) break;
                 }}
             }}
         }}
-        sCtx.strokeStyle = 'rgba(59, 130, 246, 0.25)';
-        sCtx.lineWidth = 1.1;
+        sCtx.strokeStyle = 'rgba(59, 130, 246, 0.35)';
+        sCtx.lineWidth = 1.2;
         sCtx.stroke();
 
-        // 3. Firing Synaptic Action Potentials - Batched into a single fill call (zero GPU state thrashing)
+        // 3. Firing Synaptic Action Potentials - Single pass using fast integer rects
         sCtx.beginPath();
-        for (let i = 0; i < nLen; i++) {{
-            const p1 = sPositions[i];
-            for (let j = i + 1; j < nLen; j++) {{
-                const p2 = sPositions[j];
-                const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-                if (dist < 175) {{
-                    const sparkProg = (neuralMeshAnim * 2 + i * 0.3 + j * 0.5) % 1;
-                    const sx = p1.x + (p2.x - p1.x) * sparkProg;
-                    const sy = p1.y + (p2.y - p1.y) * sparkProg;
-                    sCtx.moveTo(sx + 2.5, sy);
-                    sCtx.arc(sx, sy, 2.5, 0, Math.PI * 2);
-                }}
-            }}
+        for (let k = 0; k < activePairs.length; k++) {{
+            const pair = activePairs[k];
+            const sparkProg = (neuralMeshAnim * 2.2 + pair.i * 0.4 + pair.j * 0.6) % 1;
+            const sx = pair.p1.x + (pair.p2.x - pair.p1.x) * sparkProg;
+            const sy = pair.p1.y + (pair.p2.y - pair.p1.y) * sparkProg;
+            sCtx.rect(sx - 2, sy - 2, 4, 4);
         }}
         sCtx.fillStyle = '#93c5fd';
         sCtx.fill();
@@ -3998,11 +3990,8 @@ def render_dashboard_html() -> str:
 
         sCtx.fillStyle = '#60a5fa';
         sCtx.font = '900 11px Courier New';
-        sCtx.shadowColor = '#3b82f6';
-        sCtx.shadowBlur = 6;
         sCtx.fillText('⚡ NEURAL SYNAPSE CONSTELLATION', hudX + 12, hudY + 20);
 
-        sCtx.shadowBlur = 0;
         sCtx.fillStyle = '#cbd5e1';
         sCtx.font = '10px Courier New';
         sCtx.fillText('TOPOLOGY: DYNAMIC WEIGHT MESH', hudX + 12, hudY + 38);
@@ -4010,13 +3999,11 @@ def render_dashboard_html() -> str:
         sCtx.fillText('Q-LEARNING / MCTS THREADS: CONVERGED', hudX + 12, hudY + 70);
         sCtx.fillText('INFERENCE LATENCY: 11.2ms [REAL-TIME]', hudX + 12, hudY + 86);
 
-        // Animated Synapse Weight Flow Bar
+        // Animated Synapse Weight Flow Bar (smooth hardware fill)
         sCtx.fillStyle = 'rgba(30, 41, 59, 0.9)';
         sCtx.fillRect(hudX + 12, hudY + 98, 266, 12);
         const neuroW = (266 * ((Date.now() / 1800) % 1));
         sCtx.fillStyle = '#3b82f6';
-        sCtx.shadowColor = '#60a5fa';
-        sCtx.shadowBlur = 8;
         sCtx.fillRect(hudX + 12, hudY + 98, neuroW, 12);
         sCtx.restore();
     }}
