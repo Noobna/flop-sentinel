@@ -43,7 +43,8 @@ class AutonomousSonnetDaemon:
     ):
         self.contest_id = contest_id
         self.target_game = target_game
-        self.monitored_games = {"aurora-2", "bub"}
+        self.lock_target: bool = (target_game == "bub")
+        self.monitored_games = {"bub"}
         self.x_account_url = x_account_url
         self.agent = SonnetAgent(contest_id=contest_id)
         self.client = self.agent.client
@@ -113,7 +114,7 @@ class AutonomousSonnetDaemon:
             gen = data.get("room_generation", 1)
             poem_room = data.get("poem_room") or self.agent.team_room(game_id)
 
-            if (game_id in self.monitored_games or self.did in members) and game_id not in self.signed_rosters:
+            if not self.lock_target and (game_id in self.monitored_games or self.did in members) and game_id not in self.signed_rosters:
                 if self.did in members:
                     logger.info(f"[!] Roster detected for {game_id} including our DID! Signing roster consent...")
                     self.agent.sign_roster(game_id, gen, members)
