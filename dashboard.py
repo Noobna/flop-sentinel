@@ -2736,9 +2736,8 @@ def render_dashboard_html() -> str:
                 ctx.beginPath();
                 ctx.moveTo(pos.floorX, pos.floorY);
                 ctx.lineTo(pos.x, pos.y);
-                ctx.strokeStyle = 'rgba(245, 158, 11, 0.3)';
+                ctx.strokeStyle = 'rgba(245, 158, 11, 0.35)';
                 ctx.lineWidth = 1.2;
-                ctx.setLineDash([3, 3]);
                 ctx.stroke();
                 ctx.restore();
             }}
@@ -3596,8 +3595,11 @@ def render_dashboard_html() -> str:
         speechBubbles.push({{ node: node, el: div, created: Date.now() }});
     }}
 
+    let lastSpeechUpdate = 0;
     function updateSpeechBubbles() {{
         const now = Date.now();
+        if (now - lastSpeechUpdate < 30) return;
+        lastSpeechUpdate = now;
         for (let i = speechBubbles.length - 1; i >= 0; i--) {{
             const b = speechBubbles[i];
             if (now - b.created > 8000) {{
@@ -3926,9 +3928,9 @@ def render_dashboard_html() -> str:
 
         // 1. Concentric Neural Wave Rings (Brainwave Oscillations)
         sCtx.save();
-        for (let w = 1; w <= 4; w++) {{
-            const waveR = (w * 75 + (Date.now() * 0.04) % 75);
-            const wAlpha = Math.max(0, 0.35 - (waveR / 360) * 0.35);
+        for (let w = 1; w <= 3; w++) {{
+            const waveR = (w * 80 + (Date.now() * 0.04) % 80);
+            const wAlpha = Math.max(0, 0.3 - (waveR / 360) * 0.3);
             sCtx.beginPath();
             sCtx.arc(cx, cy, waveR, 0, Math.PI * 2);
             sCtx.strokeStyle = `rgba(59, 130, 246, ${{wAlpha}})`;
@@ -3936,39 +3938,48 @@ def render_dashboard_html() -> str:
             sCtx.stroke();
         }}
 
-        // 2. Synaptic Network Mesh & Impulse Currents
+        // Precompute screen positions once per frame to eliminate O(N^2) method overhead
         const nLen = nodes.length;
+        const sPositions = nodes.map(n => n.getScreenPos());
+
+        // 2. Synaptic Network Mesh - Batched into a single stroke call
+        sCtx.beginPath();
         for (let i = 0; i < nLen; i++) {{
-            const p1 = nodes[i].getScreenPos();
+            const p1 = sPositions[i];
             for (let j = i + 1; j < nLen; j++) {{
-                const p2 = nodes[j].getScreenPos();
+                const p2 = sPositions[j];
                 const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-                if (dist < 185) {{
-                    const alpha = (1 - dist / 185) * 0.45;
-                    sCtx.beginPath();
+                if (dist < 175) {{
                     sCtx.moveTo(p1.x, p1.y);
                     sCtx.lineTo(p2.x, p2.y);
-                    sCtx.strokeStyle = `rgba(59, 130, 246, ${{alpha}})`;
-                    sCtx.lineWidth = 1;
-                    sCtx.stroke();
-
-                    // Firing Synaptic Action Potentials
-                    const sparkProg = (neuralMeshAnim * 2 + i * 0.3 + j * 0.5) % 1;
-                    const sx = p1.x + (p2.x - p1.x) * sparkProg;
-                    const sy = p1.y + (p2.y - p1.y) * sparkProg;
-                    sCtx.beginPath();
-                    sCtx.arc(sx, sy, 2.5, 0, Math.PI * 2);
-                    sCtx.fillStyle = '#93c5fd';
-                    sCtx.shadowColor = '#60a5fa';
-                    sCtx.shadowBlur = 8;
-                    sCtx.fill();
-                    sCtx.shadowBlur = 0;
                 }}
             }}
         }}
+        sCtx.strokeStyle = 'rgba(59, 130, 246, 0.25)';
+        sCtx.lineWidth = 1.1;
+        sCtx.stroke();
+
+        // 3. Firing Synaptic Action Potentials - Batched into a single fill call (zero GPU state thrashing)
+        sCtx.beginPath();
+        for (let i = 0; i < nLen; i++) {{
+            const p1 = sPositions[i];
+            for (let j = i + 1; j < nLen; j++) {{
+                const p2 = sPositions[j];
+                const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+                if (dist < 175) {{
+                    const sparkProg = (neuralMeshAnim * 2 + i * 0.3 + j * 0.5) % 1;
+                    const sx = p1.x + (p2.x - p1.x) * sparkProg;
+                    const sy = p1.y + (p2.y - p1.y) * sparkProg;
+                    sCtx.moveTo(sx + 2.5, sy);
+                    sCtx.arc(sx, sy, 2.5, 0, Math.PI * 2);
+                }}
+            }}
+        }}
+        sCtx.fillStyle = '#93c5fd';
+        sCtx.fill();
         sCtx.restore();
 
-        // 3. Holographic Top-Left Neural HUD
+        // 4. Holographic Top-Left Neural HUD
         sCtx.save();
         const hudX = 20;
         const hudY = 30;
@@ -4014,53 +4025,52 @@ def render_dashboard_html() -> str:
     function drawIsometricMatrixField(cx, cy) {{
         isoPulseTime += 0.015;
 
-        // 1. 2.5D Isometric Diamond Grid (Axonometric 30° / 150°)
+        // 1. 2.5D Isometric Diamond Grid (Axonometric 30° / 150°) - Single Batched Path
         sCtx.save();
-        sCtx.strokeStyle = 'rgba(245, 158, 11, 0.09)';
+        sCtx.strokeStyle = 'rgba(245, 158, 11, 0.12)';
         sCtx.lineWidth = 1;
 
-        const isoStep = 48;
+        const isoStep = 56;
         const w = sCanvas.width;
         const h = sCanvas.height;
 
-        // Diagonal Grid Axis 1
+        // Batch all grid diagonal lines into a single stroke call (ultra-low CPU/GPU overhead)
+        sCtx.beginPath();
         for (let x = -w; x < w * 2; x += isoStep) {{
-            sCtx.beginPath();
             sCtx.moveTo(x, 0);
             sCtx.lineTo(x + h * 1.732, h);
-            sCtx.stroke();
         }}
-        // Diagonal Grid Axis 2
         for (let x = -w; x < w * 2; x += isoStep) {{
-            sCtx.beginPath();
             sCtx.moveTo(x, 0);
             sCtx.lineTo(x - h * 1.732, h);
-            sCtx.stroke();
         }}
+        sCtx.stroke();
 
-        // Glowing Isometric Grid Intersections
-        for (let ix = cx - 240; ix <= cx + 240; ix += isoStep) {{
-            for (let iy = cy - 180; iy <= cy + 180; iy += isoStep * 0.5) {{
-                sCtx.beginPath();
-                sCtx.arc(ix, iy, 1.2, 0, Math.PI * 2);
-                sCtx.fillStyle = 'rgba(251, 191, 36, 0.25)';
-                sCtx.fill();
+        // Batch intersection nodes into a single path and single fill call
+        sCtx.beginPath();
+        for (let ix = cx - 224; ix <= cx + 224; ix += isoStep) {{
+            for (let iy = cy - 168; iy <= cy + 168; iy += isoStep * 0.5) {{
+                sCtx.moveTo(ix + 1.4, iy);
+                sCtx.arc(ix, iy, 1.4, 0, Math.PI * 2);
             }}
         }}
+        sCtx.fillStyle = 'rgba(251, 191, 36, 0.35)';
+        sCtx.fill();
 
         // Isometric Bastion Defense Contour Perimeter
+        sCtx.save();
+        sCtx.translate(cx, cy);
+        sCtx.scale(1, 0.55);
+        sCtx.rotate(Math.PI / 4);
         for (let c = 1; c <= 3; c++) {{
             const cR = c * 90;
-            sCtx.save();
-            sCtx.translate(cx, cy);
-            sCtx.scale(1, 0.55);
-            sCtx.rotate(Math.PI / 4);
             sCtx.beginPath();
             sCtx.strokeRect(-cR, -cR, cR * 2, cR * 2);
             sCtx.strokeStyle = `rgba(245, 158, 11, ${{0.25 - c * 0.06}})`;
             sCtx.lineWidth = 1.2;
-            sCtx.restore();
+            sCtx.stroke();
         }}
+        sCtx.restore();
         sCtx.restore();
 
         // 2. Holographic Top-Left Isometric HUD
@@ -4708,8 +4718,13 @@ def render_dashboard_html() -> str:
         }}
     }}
 
-    // Streamgraph Canvas
-    function drawStreamgraph() {{
+    // Streamgraph Canvas (Throttled for 60 FPS Swarm Performance)
+    let lastStreamgraphTime = 0;
+    function drawStreamgraph(force = false) {{
+        const now = Date.now();
+        if (!force && now - lastStreamgraphTime < 150) return;
+        lastStreamgraphTime = now;
+
         gCtx.clearRect(0, 0, gCanvas.width, gCanvas.height);
         const w = gCanvas.width;
         const h = gCanvas.height;
