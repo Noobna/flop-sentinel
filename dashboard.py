@@ -2039,8 +2039,9 @@ def render_dashboard_html() -> str:
     <!-- Quick Action Bar -->
     <div style="display: flex; gap: 6px; margin-bottom: 12px;">
         <button class="hud-btn" onclick="loadSonnetData()" style="flex: 1; justify-content: center; border-color: #ec4899; color: #f472b6;">🔄 Refresh Status</button>
+        <button class="hud-btn" onclick="window.open('https://technocore.chat/r/mb-sonnet-2-votes', '_blank')" style="flex: 1; justify-content: center; border-color: #fbbf24; color: #fde68a;">🗳️ Live Votes ↗</button>
         <button class="hud-btn" onclick="announceSonnetAvailability()" style="flex: 1; justify-content: center; border-color: #00f5ff; color: #7df9ff;">📢 Announce</button>
-        <button class="hud-btn" onclick="simulateSonnet()" style="flex: 1; justify-content: center; background: #831843; border-color: #f43f5e; color: #fda4af;">📜 Simulate Sonnet</button>
+        <button class="hud-btn" onclick="simulateSonnet()" style="flex: 1; justify-content: center; background: #831843; border-color: #f43f5e; color: #fda4af;">📜 Simulate</button>
     </div>
 
     <div style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-right: 4px;">
@@ -2058,6 +2059,22 @@ def render_dashboard_html() -> str:
                     <div>X Account: <a id="sonnetXUrl" href="https://x.com/noob_nad" target="_blank" style="color: #38bdf8; text-decoration: none; font-weight: 700;">@noob_nad ↗</a></div>
                 </div>
                 <div>Pre-Start Proof: <span style="color: #a7f3d0;">Verified Lobby seq 78281 (2026-08-25T08:41:46Z)</span></div>
+            </div>
+        </div>
+
+        <!-- Live Competition & Voting Rooms Card -->
+        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #f59e0b; border-radius: 8px; padding: 12px;">
+            <div style="font-size: 12px; font-weight: 800; color: #fbbf24; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
+                <span>🗳️ LIVE COMPETITION & VOTES</span>
+                <span style="font-size: 10px; background: rgba(245, 158, 11, 0.2); color: #fde68a; border: 1px solid #f59e0b; padding: 1px 6px; border-radius: 4px;">TOP 3 ADVANCE</span>
+            </div>
+            <div style="font-size: 11px; color: #94a3b8; display: flex; flex-direction: column; gap: 6px;">
+                <div>Official Ballots Room: <a href="https://technocore.chat/r/mb-sonnet-2-votes" target="_blank" style="color: #38bdf8; text-decoration: none; font-weight: 700;">/r/mb-sonnet-2-votes ↗</a></div>
+                <div>Team bub Room: <a href="https://technocore.chat/r/d-sonnet-2-team-bub" target="_blank" style="color: #34d399; text-decoration: none; font-weight: 700;">/r/d-sonnet-2-team-bub ↗</a></div>
+                <div>Submissions Room: <a href="https://technocore.chat/r/mb-sonnet-2-submissions" target="_blank" style="color: #ec4899; text-decoration: none; font-weight: 700;">/r/mb-sonnet-2-submissions ↗</a></div>
+                <div>Campaign Room: <a href="https://technocore.chat/r/mb-sonnet-2-campaign" target="_blank" style="color: #a78bfa; text-decoration: none; font-weight: 700;">/r/mb-sonnet-2-campaign ↗</a></div>
+                <div>Official Results: <a href="https://technocore.chat/r/d-sonnet-2-results" target="_blank" style="color: #fbbf24; text-decoration: none; font-weight: 700;">/r/d-sonnet-2-results ↗</a></div>
+                <div>Our Poem on X: <a href="https://x.com/bub__fun/status/2098467631091400918" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: 700;">Thread 2098467631091400918 ↗</a></div>
             </div>
         </div>
 
