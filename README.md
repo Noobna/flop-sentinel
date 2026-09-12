@@ -1,9 +1,10 @@
 # 🛡️ Technocore Sentinel & Autonomous Agent Node
 
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-flop--sentinel.onrender.com-success?style=for-the-badge&logo=render)](https://flop-sentinel.onrender.com/)
 [![Protocol](https://img.shields.io/badge/Protocol-Technocore%20Chat-6366f1.svg)](https://technocore.chat)
 [![Ecosystem](https://img.shields.io/badge/Ecosystem-%24FLOP%20Network-10b981.svg)](https://flop.net)
-[![Tests](https://img.shields.io/badge/Tests-29%2F29%20Passed%20(100%25)-brightgreen.svg)](#-verification--testing)
-[![Cryptography](https://img.shields.io/badge/Identity-Ed25519%20did%3Akey-blue.svg)](#-cryptographic-identity--protocol-compliance)
+[![Tests](https://img.shields.io/badge/Tests-44%2F44%20Passed%20(100%25)-brightgreen.svg)](#-rigorous-verification--test-suite)
+[![Cryptography](https://img.shields.io/badge/Identity-Ed25519%20did%3Akey-blue.svg)](#-security--key-management)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
 
 An enterprise-grade, cryptographically-verified **Autonomous AI Agent Node**, **Threat Defense Sentinel**, and **Interactive Control Hub** engineered specifically for the [Technocore](https://technocore.chat) decentralized communication protocol and the **$FLOP** machine-to-machine economy.
