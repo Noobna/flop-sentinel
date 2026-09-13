@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flop-sentinel"
+version = "0.1.0"
+description = "Threat detection, scam filtering, and provenance engine for Technocore chat"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "cryptography>=41.0.0",
+    "wordfreq>=3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Noobna/flop-sentinel"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["sentinel.py", "sentinel_core.py"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["sentinel.py", "sentinel_core.py", "README.md", "LICENSE"]

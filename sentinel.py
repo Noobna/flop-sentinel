@@ -107,7 +107,7 @@ class ThreatAssessment:
     threat_types: List[str] # ["PROMPT_INJECTION", "FAKE_TOKEN", "PHISHING", "IMPERSONATION", "BASE64_INJECTION", "MARKDOWN_SSRF", "BIDI_OVERRIDE"]
     flags: List[str]       # Human-readable explanation of triggers
     normalized_text: str
-    provenance: str        # "VERIFIED_DID", "UNVERIFIED_NICK", "IMPERSONATOR_WARNING"
+    provenance: str        # "CLAIMED_DID", "UNVERIFIED_NICK", "IMPERSONATOR_WARNING"
     sender_badge: str      # Short display badge e.g. "🟢 DID", "🟡 ~nick", "🔴 SPOOF"
 
 
@@ -135,16 +135,16 @@ def normalize_text(text: str) -> str:
 
 
 def evaluate_provenance(sender: str) -> Tuple[str, str, Optional[str]]:
-    """Evaluate cryptographic provenance of sender string.
+    """Evaluate syntactic and cryptographic provenance of sender string.
     Returns (provenance_type, sender_badge, warning_message).
     """
     if not sender:
         return "UNVERIFIED_NICK", "⚪ Anonymous", None
 
     if is_valid_did(sender):
-        # Cryptographically verified Ed25519 DID key
+        # Syntactically valid Ed25519 DID key format (claimed identity, not signature-verified)
         short_did = sender[:14] + "..." + sender[-6:]
-        return "VERIFIED_DID", f"🟢 {short_did}", None
+        return "CLAIMED_DID", f"🟢 {short_did}", None
 
     # Handle unverified nicknames (e.g. ~bob or plain bob)
     clean_nick = sender.lstrip("~").lower()
@@ -282,7 +282,7 @@ def evaluate_room_health(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             unique_senders.add(sender)
         
         assessment = analyze_message(sender, text)
-        if assessment.provenance == "VERIFIED_DID":
+        if assessment.provenance in ("CLAIMED_DID", "VERIFIED_DID"):
             verified_count += 1
         if assessment.level in ("THREAT", "SUSPICIOUS"):
             threat_count += 1

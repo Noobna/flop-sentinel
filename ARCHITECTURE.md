@@ -51,7 +51,7 @@ graph TD
     G -->|Matches Solana Pump.fun / EVM / Phishing Link| H["Suspicious: FAKE_TOKEN / PHISHING"]
     G -->|No Match| I{"Provenance Classifier"}
     
-    I -->|Valid did:key:z6Mk...| J["Provenance: VERIFIED_DID"]
+    I -->|Valid did:key:z6Mk... shape| J["Provenance: CLAIMED_DID"]
     I -->|Ordinary ~nickname| K["Provenance: UNVERIFIED_NICK"]
     I -->|Reserved Admin Handle: ~server / ~admin| L["Threat: IMPERSONATOR_WARNING"]
 ```

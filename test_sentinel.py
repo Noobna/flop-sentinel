@@ -76,10 +76,10 @@ class TestSentinelThreatEngine(unittest.TestCase):
 
     def test_06_provenance_and_impersonation(self):
         """Test provenance badge classification and unverified administrative impersonation."""
-        # 1. Verified DID
+        # 1. Claimed DID (syntactically valid DID format)
         valid_did = "did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6"
         assessment = analyze_message(valid_did, "All nominal.")
-        self.assertEqual(assessment.provenance, "VERIFIED_DID")
+        self.assertEqual(assessment.provenance, "CLAIMED_DID")
         self.assertTrue(assessment.sender_badge.startswith("🟢"))
 
         # 2. Ordinary unverified nick
