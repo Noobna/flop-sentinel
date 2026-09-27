@@ -49,6 +49,7 @@ from tclk import (
     open_contract,
     try_decode_frame,
 )
+from close_call import CloseCallClient
 
 LOG_FILE = "agent_activity.log"
 DEAL_STATE_FILE = "deal_state.json"
@@ -74,6 +75,7 @@ CORE_ROOMS = [
     "autonomous-mesh",
     "sentinel-hub",
     "crypto-agents",
+    "tclk-deliveries",
 ]
 
 logging.basicConfig(
@@ -368,17 +370,60 @@ def maybe_accept_offer(offer: dict, room: str, priv: ed25519.Ed25519PrivateKey, 
     if offer.get("expiresMs", 0) <= now_ms + 30_000:
         return False
 
-    rails = offer.get("rails", [])
+    try:
+        amt = float(offer.get("amount", 0))
+    except Exception:
+        return False
+    if amt <= 0:
+        return False
+
+    rails = set(offer.get("rails", []))
     supported_rails = {"paper", "paper-htlc", "flop-htlc", "evm-htlc"}
-    if not any(r in supported_rails for r in rails):
+    if not (rails & supported_rails):
         return False
 
     # 2. Rate-limiting & concurrency capacity
     deal_map = deals.setdefault("deals", {})
-    active_jobs = [d for d in deal_map.values() if d.get("isOurJob") and d.get("status") == "accepted"]
-    if len(active_jobs) >= 3:
+    payer_did = offer.get("from")
+
+    # Anti-Ghost & Legitimacy Filter:
+    payer_jobs = [d for d in deal_map.values() if d.get("offer", {}).get("from") == payer_did and d.get("isOurJob")]
+    payer_locks = [d for d in payer_jobs if d.get("status") in ("locked", "claimed") or "rail" in d]
+
+    # Rule 1: Proven ghost bot (accepted >= 2 times from us and NEVER locked) -> SKIP
+    if len(payer_jobs) >= 2 and len(payer_locks) == 0:
         return False
-    if (now - _last_worker_job_time) < 45.0:
+
+    # Rule 2: Proven legit payer (has locked in the past) -> ALWAYS ACCEPT ANY AMOUNT
+    is_legit = (len(payer_locks) > 0)
+
+    # Rule 3: Actionable paper rail -> Executable on testnet!
+    if not is_legit and ("paper" in rails or "paper-htlc" in rails):
+        if offer.get("job", {}).get("context") or amt <= 500000:
+            is_legit = True
+
+    # Rule 4: Standard / micro testable bounties (<= 10,000 FLOP) -> Accept to test new payers
+    if not is_legit and amt <= 10000:
+        is_legit = True
+
+    # Rule 5: Offers with verifiable solvable task context (A2A / blockrewards)
+    ctx = offer.get("job", {}).get("context", "")
+    if not is_legit and ctx and (ctx.startswith("/kv/") or len(ctx) > 10) and amt <= 5000000:
+        is_legit = True
+
+    if not is_legit:
+        # Uncollateralized ghost offer on bare flop-htlc from unknown entity -> SKIP!
+        return False
+
+    active_jobs = [
+        d for d in deal_map.values()
+        if d.get("isOurJob")
+        and d.get("status") == "accepted"
+        and d.get("offer", {}).get("expiresMs", 0) > now_ms
+    ]
+    if len(active_jobs) >= 5000:
+        return False
+    if (now - _last_worker_job_time) < 2.0:
         return False
 
     # 3. Mint hash lock & accept frame
@@ -411,6 +456,36 @@ def maybe_accept_offer(offer: dict, room: str, priv: ed25519.Ed25519PrivateKey, 
             }
             save_json_atomic(DEAL_STATE_FILE, deals)
             logger.info(f"[TCLK WORKER] [SUCCESS] TOOK BOUNTY JOB {oid[:18]}...! Contract: {cid[:18]}... Monitoring deal room /r/{deal_room}")
+
+            # Official Protocol Step: Immediately post heartbeat frame in deal room to create it
+            try:
+                init_hb = f"tclk1 {{\"contract\":\"{cid}\",\"from\":\"{did}\",\"status\":\"ready\",\"type\":\"heartbeat\"}}"
+                send_signed_message(priv, did, init_hb, room=deal_room)
+            except Exception as e_hb:
+                logger.debug(f"Could not post init heartbeat to {deal_room}: {e_hb}")
+
+            # Auto-solve and post deliverable directly to private deal room for reviewer bot
+            try:
+                ctx = offer.get("job", {}).get("context", "")
+                if ctx:
+                    from tclk_auto_deliver import solve_job_context
+                    ans = solve_job_context(ctx)
+                    if ans:
+                        # 1. Post exact answer into private deal room so reviewer bot grades PASS
+                        logger.info(f"[TCLK DELIVER] Posting answer directly to deal room /r/{deal_room}: '{ans}'")
+                        send_signed_message(priv, did, ans, room=deal_room)
+                        time.sleep(1.0)
+                        
+                        # 2. Post receipt to tclk-deliveries
+                        deliv_text = f"{cid[:18]} Deliverable: {ans}"
+                        send_signed_message(priv, did, deliv_text, room="tclk-deliveries")
+                        deal_map[oid]["delivered"] = True
+                        deal_map[oid]["deliveredAt"] = time.time()
+                        deal_map[oid]["deliverableText"] = ans
+                        save_json_atomic(DEAL_STATE_FILE, deals)
+            except Exception as e_deliv:
+                logger.debug(f"Could not auto-deliver for {cid[:18]}: {e_deliv}")
+
             return True
     except Exception as e:
         logger.error(f"[TCLK WORKER] Error accepting offer: {e}")
@@ -552,6 +627,7 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
 
     last_heartbeat_time = 0
     last_discovery_time = 0
+    last_close_call_sweep_time = 0
     active_rooms = list(CORE_ROOMS)
 
     while True:
@@ -578,8 +654,8 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
                 last_heartbeat_time = now
             time.sleep(5)
 
-        # 3. Check for and accept available bounties from the board
-        if (now - _last_worker_job_time) >= 60.0:
+        # 3. Check for and accept available bounties from the board (FLOP prioritized)
+        if (now - _last_worker_job_time) >= 3.0:
             with _state_lock:
                 deals = load_json_safe(DEAL_STATE_FILE, {"deals": {}})
                 deal_map = deals.get("deals", {})
@@ -589,23 +665,66 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
                     if v.get("status") == "proposed"
                     and v.get("offer", {}).get("role") == "payer"
                     and v.get("offer", {}).get("from") != did
-                    and v.get("offer", {}).get("expiresMs", 0) > (now_ms + 40_000)
+                    and v.get("offer", {}).get("expiresMs", 0) > (now_ms + 30_000)
                 ]
                 def _amount_sort(o):
                     try:
-                        return float(o.get("amount", 0))
+                        amt = float(o.get("amount", 0))
+                        payer_did = o.get("from")
+                        rails = set(o.get("rails", []))
+                        
+                        # 1. Check payer track record
+                        payer_jobs = [d for d in deal_map.values() if d.get("offer", {}).get("from") == payer_did and d.get("isOurJob")]
+                        payer_locks = [d for d in payer_jobs if d.get("status") in ("locked", "claimed") or "rail" in d]
+                        
+                        # Proven ghost bot: skip completely
+                        if len(payer_jobs) >= 2 and len(payer_locks) == 0:
+                            return -1.0
+
+                        # Proven legit payer: HUGE boost (10,000x) so large legit bounties take highest priority!
+                        lock_mult = 10000.0 if payer_locks else 1.0
+
+                        # Solvable tasks with context
+                        ctx = o.get("job", {}).get("context", "")
+                        solve_mult = 5.0 if ctx else 1.0
+
+                        # Executable paper rail
+                        paper_mult = 3.0 if ("paper" in rails or "paper-htlc" in rails) else 1.0
+
+                        # Asset multiplier (FLOP prioritized)
+                        asset_mult = 10.0 if o.get("asset") == "FLOP" else 1.0
+
+                        # If unverified payer offering > 10,000 on bare flop-htlc with no context -> Ghost bot!
+                        if not payer_locks and amt > 10000 and not ("paper" in rails or "paper-htlc" in rails) and not ctx:
+                            return -1.0
+
+                        # If proven legit payer: uncapped amount!
+                        # If new testable payer: capped at 50,000 for safety
+                        effective_amt = amt if payer_locks else min(amt, 50000.0)
+                        return effective_amt * asset_mult * lock_mult * solve_mult * paper_mult
                     except Exception:
                         return 0
                 candidates.sort(key=_amount_sort, reverse=True)
-                for best_offer in candidates[:3]:
+                accepted_count = 0
+                for best_offer in candidates[:15]:
                     if maybe_accept_offer(best_offer, "tclk-offers", priv, did, deals):
-                        break
+                        accepted_count += 1
+                        if accepted_count >= 5:
+                            break
+                        time.sleep(2.0)
 
-        # 4. Monitor & Chat across Global Rooms + Active Deal Rooms concurrently
+        # 4. Monitor & Chat across Global Rooms + Active Deal Rooms (Batched to respect Technocore rate limits)
         with _state_lock:
-            poll_target_rooms = list(set(active_rooms) | _active_deal_rooms)
+            deal_room_list = list(_active_deal_rooms)
+            if deal_room_list:
+                batch_size = 15
+                idx = (int(time.time() // 10) * batch_size) % len(deal_room_list)
+                sampled_deal_rooms = deal_room_list[idx:idx + batch_size]
+            else:
+                sampled_deal_rooms = []
+            poll_target_rooms = list(set(active_rooms) | set(sampled_deal_rooms))
 
-        with ThreadPoolExecutor(max_workers=16) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(process_room, room, state, priv, did) for room in poll_target_rooms]
             for future in as_completed(futures):
                 try:
@@ -613,11 +732,39 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
                 except Exception as e:
                     logger.error(f"[!] Error processing room: {e}")
 
+        # 5. Autonomous Close Call Challenge (close-1) Sweep (every 5 minutes)
+        if now - last_close_call_sweep_time >= 300:
+            last_close_call_sweep_time = now
+            try:
+                cc = CloseCallClient()
+                is_reg, reg_info = cc.check_registration()
+                if not is_reg and "Registered in room" not in reg_info:
+                    logger.info(f"[Close-1] Auto-registering agent {cc.did} in close1...")
+                    cc.register_owner("close1")
+                res = cc.run_trading_cycle()
+                sweep_n = res.get("sweep", "-")
+                ref_px = res.get("ref_px", "-")
+                pos = res.get("final_position", "-")
+                cash = res.get("final_cash", "-")
+                m_ana = res.get("market_analysis", {})
+                regime = m_ana.get("regime", "UNKNOWN")
+                vol_reg = m_ana.get("volatility_regime", "NORMAL")
+                vol_pct = m_ana.get("volatility_pct", 0.0)
+                logger.info(
+                    f"[Close-1] Autonomous Sweep #{sweep_n} | NVDA: ${ref_px} | Trend: {regime} | "
+                    f"Vol: {vol_reg} ({vol_pct:.2f}%) | Pos: {pos} | Cash: {cash} POLF | "
+                    f"Execs: {len(res.get('executed_trades', []))} | Quotes: {len(res.get('posted_quotes', []))}"
+                )
+                for ex in res.get("executed_trades", []):
+                    logger.info(f"[Close-1] Trade Filled: {ex['side'].upper()} {ex['qty']} @ ${ex['px']} (ID: {ex['id']})")
+            except Exception as cc_err:
+                logger.debug(f"[Close-1] Background sweep error: {cc_err}")
+
         with _state_lock:
             save_state(state)
 
         # Sleep before next polling sweep (faster cadence)
-        sweep_sleep = random.randint(18, 28)
+        sweep_sleep = random.randint(8, 14)
         time.sleep(sweep_sleep)
 
 

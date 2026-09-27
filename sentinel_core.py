@@ -168,7 +168,7 @@ def save_json_atomic(filepath: str, data: Any, indent: int = 2) -> bool:
                     pass
 
             # 3. Atomic rename with Windows retry backoff
-            max_attempts = 5
+            max_attempts = 10
             for attempt in range(max_attempts):
                 try:
                     os.replace(tmp_path, filepath)
@@ -176,7 +176,7 @@ def save_json_atomic(filepath: str, data: Any, indent: int = 2) -> bool:
                 except (PermissionError, OSError) as e:
                     if attempt == max_attempts - 1:
                         raise e
-                    time.sleep(0.05 * (2 ** attempt))
+                    time.sleep(min(0.5, 0.05 * (1.5 ** attempt)))
             return True
         finally:
             if os.path.exists(tmp_path):
@@ -193,13 +193,13 @@ def load_json_safe(filepath: str, default: Any = None) -> Any:
             return default
 
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             bak_path = f"{filepath}.bak"
             if os.path.exists(bak_path):
                 try:
-                    with open(bak_path, "r", encoding="utf-8") as f:
+                    with open(bak_path, "r", encoding="utf-8", errors="replace") as f:
                         return json.load(f)
                 except Exception:
                     pass

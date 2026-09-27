@@ -3,8 +3,18 @@ services:
     name: flop-sentinel
     runtime: python
     buildCommand: pip install -r requirements.txt
+    # The positional $PORT is read by dashboard.py's __main__; --public selects the
+    # 0.0.0.0 bind that Render requires. Auth is a password gate, not loopback binding.
     startCommand: python dashboard.py $PORT --public
     plan: free
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      # Set this in the Render dashboard (Environment). `sync: false` keeps the secret
+      # out of git; the value is never written to disk or logged once configured.
+      - key: SENTINEL_PASSWORD
+        sync: false
+      # Optional. Falls back to RENDER_EXTERNAL_HOSTNAME, which Render sets
+      # automatically. Only needed for a custom domain or a tunnel in front.
+      # - key: SENTINEL_ALLOWED_HOSTS
+      #   sync: false

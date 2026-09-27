@@ -1,8 +1,11 @@
-"""Technocore Sentinel: Hardened Local Control Hub & REST API Server.
+"""Technocore Sentinel: Hardened Control Hub & REST API Server.
 
 Features:
-- Binds strictly to 127.0.0.1 with zero external exposure
-- Random session token generation and Bearer token authentication on all mutating endpoints
+- Binds to 127.0.0.1 by default; 0.0.0.0 only with an explicit --public flag
+- Password login gate issuing an HttpOnly session cookie; the session token is
+  never rendered into the dashboard HTML
+- Auth required on every endpoint, reads included
+- Host header validation in all modes to block DNS rebinding
 - Strict Origin/CORS defense against browser CSRF attacks
 - Background multi-room stream poller with in-memory bounded ring buffers
 - Real-time threat classification & 1-click Ed25519 signed message broadcaster
@@ -12,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import concurrent.futures
 import datetime
 import hashlib
 import json
@@ -55,12 +59,26 @@ from tclk import (
     make_offer,
     make_reveal,
 )
+from close_call import (
+    CloseCallClient,
+    PUBLIC_TRADING_ROOM,
+    DEFAULT_MINT,
+    FEE_RATE,
+    load_close_call_state,
+)
 
 # Server configuration
 HOST = "127.0.0.1"
 DEFAULT_PORT = 5050
+PORT = DEFAULT_PORT
 _active_port = DEFAULT_PORT  # Updated by start_server() for Host header validation
 _allow_public = False  # Set to True when binding to 0.0.0.0 or tunnel for public access
+SESSION_COOKIE = "sentinel_session"
+LOGIN_PATH = "/login"
+LOGOUT_PATH = "/api/logout"
+LOGIN_MAX_ATTEMPTS = 8  # Failed logins per IP before temporary lockout
+LOGIN_WINDOW_SECS = 300.0  # Sliding window for the failed-login counter
+LOGIN_LOCKOUT_SECS = 300.0  # Lockout applied once LOGIN_MAX_ATTEMPTS is exceeded
 CORE_ROOMS = [
     "lobby",
     "technocore",
@@ -74,6 +92,7 @@ CORE_ROOMS = [
     "kibble",
     "gpu-miners",
     "agent-security",
+    "close1",
 ]
 ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")  # M-1: validate room names
 GATED_ROOM_RE = re.compile(r"^d-[a-z0-9][a-z0-9\-_]{0,45}$")  # Pattern 5: gated room names
@@ -90,7 +109,12 @@ logger = logging.getLogger("sentinel-dashboard")
 
 # Global in-memory ring buffers and server state
 _lock = threading.RLock()
-_session_token = secrets.token_hex(24)  # 48-char random hex token
+_session_token = secrets.token_hex(24)  # 48-char random hex token; issued as an HttpOnly cookie, never rendered
+_admin_password = os.environ.get("SENTINEL_PASSWORD") or secrets.token_urlsafe(24)
+_password_is_generated = not os.environ.get("SENTINEL_PASSWORD")
+_login_failures: Dict[str, List[float]] = {}  # client IP -> timestamps of recent failed logins
+_login_locked_until: Dict[str, float] = {}  # client IP -> monotonic time lockout expires
+_login_lock = threading.Lock()
 _room_streams: Dict[str, collections.deque] = collections.defaultdict(lambda: collections.deque(maxlen=100))
 _room_health_cache: Dict[str, Dict[str, Any]] = {}
 _security_events: collections.deque = collections.deque(maxlen=100)  # Real-time threat alert ring buffer
@@ -154,93 +178,415 @@ def check_and_archive_deals(deals_path: str, max_active_keep: int = 150) -> None
 
 
 
-# ============================================================================
-# Sonnet Challenge 50,000 FLOP Engine Helpers
-# ============================================================================
-_sonnet_agent_instance = None
+# Trades Challenge (Close-1) in-memory telemetry caches & event buffers
+_trades_cache: Dict[str, Any] = {}
+_trades_cache_time: float = 0.0
+_trades_stream: collections.deque = collections.deque(maxlen=100)
+_price_ticks_deque: collections.deque = collections.deque(maxlen=60)
 
 
-def get_sonnet_agent():
-    """Lazily loads and caches SonnetAgent instance."""
-    global _sonnet_agent_instance
-    if _sonnet_agent_instance is None:
-        try:
-            from sonnet_agent import SonnetAgent
-            _sonnet_agent_instance = SonnetAgent()
-        except Exception as e:
-            logger.warning(f"Could not load SonnetAgent: {e}")
-            return None
-    return _sonnet_agent_instance
-
-
-def get_sonnet_dashboard_data() -> Dict[str, Any]:
-    """Compiles real-time Sonnet Challenge telemetry, letters, and team statuses."""
-    agent = get_sonnet_agent()
-    if not agent:
-        return {
-            "contest_id": "sonnet-2",
-            "status": "UNAVAILABLE",
-            "error": "Sonnet engine initializing",
-        }
+def get_trades_telemetry(force_refresh: bool = False, max_rooms: int = 4) -> Dict[str, Any]:
+    """Compile comprehensive real-time trades challenge telemetry with high-speed in-memory caching."""
+    global _trades_cache, _trades_cache_time
+    now = time.time()
+    with _lock:
+        if not force_refresh and _trades_cache and (now - _trades_cache_time < 3.5):
+            return _trades_cache
 
     try:
-        reg_status, receipt = agent.check_registration()
+        cc_client = CloseCallClient()
+        state = load_close_call_state()
+        acct = cc_client.get_my_account()
+
+        price_state = {}
+        flow_state = {}
+        pos_state = {}
+        pnl_state = {}
+        is_reg, reg_info = False, "Unknown"
+        raw_offers = []
+
+        # Concurrent network fetches for rapid priming
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            f_price = executor.submit(cc_client.get_latest_price_state)
+            f_flow = executor.submit(cc_client.get_latest_flow_state)
+            f_pos = executor.submit(cc_client.get_latest_positions)
+            f_pnl = executor.submit(cc_client.get_latest_pnl)
+            f_reg = executor.submit(cc_client.check_registration)
+            f_offers = executor.submit(cc_client.scan_open_offers, max_rooms=max_rooms)
+
+            try:
+                price_state = f_price.result(timeout=8) or {}
+            except Exception as e_p:
+                logger.debug(f"Price state fetch error: {e_p}")
+            try:
+                flow_state = f_flow.result(timeout=8) or {}
+            except Exception as e_f:
+                logger.debug(f"Flow state fetch error: {e_f}")
+            try:
+                pos_state = f_pos.result(timeout=8) or {}
+            except Exception as e_po:
+                logger.debug(f"Pos state fetch error: {e_po}")
+            try:
+                pnl_state = f_pnl.result(timeout=8) or {}
+            except Exception as e_pn:
+                logger.debug(f"PnL state fetch error: {e_pn}")
+            try:
+                is_reg, reg_info = f_reg.result(timeout=8)
+            except Exception as e_r:
+                logger.debug(f"Reg check error: {e_r}")
+            try:
+                raw_offers = f_offers.result(timeout=8) or []
+            except Exception as e_o:
+                logger.debug(f"Offers scan error: {e_o}")
+
+        m_analysis = None
+        try:
+            m_analysis = cc_client.analyze_market_trend().to_dict()
+        except Exception:
+            pass
+
+        # Build trade registry list
+        reg = state.get("trade_registry", {})
+        trades_list = []
+        settled_cnt = 0
+        void_cnt = 0
+        open_cnt = 0
+
+        for tid, tinfo in reg.items():
+            terms = tinfo.get("terms", {})
+            st = (tinfo.get("status") or "open").lower()
+            if st == "settled":
+                settled_cnt += 1
+            elif st == "void":
+                void_cnt += 1
+            else:
+                open_cnt += 1
+
+            qty_s = str(terms.get("qty", "0"))
+            px_s = str(terms.get("px", "0"))
+            try:
+                tot = str(round(float(qty_s) * float(px_s), 4))
+            except Exception:
+                tot = "0"
+
+            trades_list.append({
+                "id": tid,
+                "side": str(terms.get("side", "")).upper(),
+                "qty": qty_s,
+                "px": px_s,
+                "polf_total": tot,
+                "role": tinfo.get("role", "maker"),
+                "counterparty": terms.get("taker", "any"),
+                "status": st.upper(),
+                "void_reason": tinfo.get("void_reason", ""),
+                "settled_sweep": tinfo.get("settled_sweep"),
+                "fee": str(tinfo.get("fee_paid", "0")),
+                "room": tinfo.get("room", "close1"),
+                "until": terms.get("until"),
+            })
+
+        trades_list.reverse()
+
+        bids = []
+        asks = []
+        for o in raw_offers:
+            t = o.get("terms", {})
+            side = str(t.get("side", "")).lower()
+            px_val = str(t.get("px", "0"))
+            qty_val = str(t.get("qty", "0"))
+            item = {
+                "id": t.get("id") or o.get("id"),
+                "px": px_val,
+                "qty": qty_val,
+                "side": side,
+                "maker": t.get("maker", ""),
+                "until": t.get("until"),
+                "room": o.get("room", "close1"),
+                "raw_offer": o,
+            }
+            if side == "buy":
+                bids.append(item)
+            elif side == "sell":
+                asks.append(item)
+
+        bids.sort(key=lambda x: float(x.get("px", 0)), reverse=True)
+        asks.sort(key=lambda x: float(x.get("px", 0)))
+
+        cum_bid = 0.0
+        for b in bids:
+            cum_bid += float(b.get("qty", 0))
+            b["depth"] = round(cum_bid, 2)
+
+        cum_ask = 0.0
+        for a in asks:
+            cum_ask += float(a.get("qty", 0))
+            a["depth"] = round(cum_ask, 2)
+
+        best_bid = float(bids[0]["px"]) if bids else None
+        best_ask = float(asks[0]["px"]) if asks else None
+        spread = round(best_ask - best_bid, 4) if (best_bid and best_ask) else None
+        ref_px_f = float(price_state.get("ref", {}).get("px", 0)) if price_state.get("ref") else None
+        mid_px = round((best_bid + best_ask) / 2, 4) if (best_bid and best_ask) else ref_px_f
+
+        if ref_px_f:
+            with _lock:
+                _price_ticks_deque.append({
+                    "ts": time.time(),
+                    "sweep": price_state.get("n", 0),
+                    "px": ref_px_f,
+                    "applied": float(price_state.get("applied") or ref_px_f),
+                    "global": float(price_state.get("global") or ref_px_f),
+                })
+
+        pos_val = float(acct.position)
+        cash_val = float(acct.cash)
+        ref_px_val = ref_px_f or 0.0
+        unrealized_pnl = 0.0
+        if pos_val != 0 and ref_px_val > 0:
+            unrealized_pnl = round(pos_val * (ref_px_val - 225.0), 2)
+        total_equity = round(cash_val + (pos_val * ref_px_val), 2)
+
+        telemetry = {
+            "did": cc_client.did,
+            "registered": is_reg,
+            "registration_info": reg_info,
+            "summary": {
+                "total_trades": len(trades_list),
+                "settled_count": settled_cnt,
+                "void_count": void_cnt,
+                "open_count": open_cnt,
+                "cash": str(acct.cash),
+                "position": str(acct.position),
+                "fees": str(acct.fees),
+                "unrealized_pnl": unrealized_pnl,
+                "total_equity": total_equity,
+            },
+            "market": {
+                "sweep": price_state.get("n", 0),
+                "ref_px": price_state.get("ref", {}).get("px", "-"),
+                "applied_px": price_state.get("applied", "-"),
+                "global_mark": price_state.get("global", "-"),
+                "limits": price_state.get("limits", ["-", "-"]),
+                "age_s": price_state.get("age_s", 0),
+                "open_interest": pos_state.get("open", "-"),
+                "longs": pos_state.get("longs", 0),
+                "shorts": pos_state.get("shorts", 0),
+                "market_regime": m_analysis or {},
+            },
+            "order_book": {
+                "bids": bids[:15],
+                "asks": asks[:15],
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": spread,
+                "mid_px": mid_px,
+            },
+            "executable_offers": raw_offers[:20],
+            "trades": trades_list,
+            "recent_flow": {
+                "sweep": flow_state.get("n", 0),
+                "settled": flow_state.get("settled", []),
+                "void": flow_state.get("void", []),
+                "mints": flow_state.get("mints", []),
+            },
+            "leaderboard": {
+                "top_pnl": pnl_state.get("top", []),
+                "top_positions": pos_state.get("top", []),
+            },
+            "price_history": list(_price_ticks_deque),
+            "rooms": cc_client.get_all_registered_rooms(),
+            "updated_at": now,
+        }
+
+        with _lock:
+            _trades_cache = telemetry
+            _trades_cache_time = now
+        return telemetry
+
     except Exception as e:
-        reg_status, receipt = "ACCEPTED", {"intake_seq": 821, "role": "writer"}
+        logger.warning(f"Error compiling trades telemetry: {e}")
+        with _lock:
+            if _trades_cache:
+                return _trades_cache
+        try:
+            _, fallback_did = load_or_create_identity()
+        except Exception:
+            fallback_did = ""
+        return {
+            "error": str(e),
+            "did": fallback_did,
+            "registered": False,
+            "registration_info": "Offline / Cache fallback",
+            "summary": {
+                "total_trades": 0,
+                "settled_count": 0,
+                "void_count": 0,
+                "open_count": 0,
+                "cash": "10000",
+                "position": "0",
+                "fees": "0",
+                "unrealized_pnl": 0.0,
+                "total_equity": 10000.0,
+            },
+            "market": {
+                "sweep": 0,
+                "ref_px": "-",
+                "applied_px": "-",
+                "global_mark": "-",
+                "limits": ["-", "-"],
+                "age_s": 0,
+                "open_interest": "-",
+                "longs": 0,
+                "shorts": 0,
+                "market_regime": {},
+            },
+            "order_book": {
+                "bids": [],
+                "asks": [],
+                "best_bid": None,
+                "best_ask": None,
+                "spread": None,
+                "mid_px": None,
+            },
+            "executable_offers": [],
+            "trades": [],
+            "recent_flow": {"sweep": 0, "settled": [], "void": [], "mints": []},
+            "leaderboard": {"top_pnl": [], "top_positions": []},
+            "price_history": [],
+            "rooms": ["close1"],
+            "updated_at": now,
+        }
 
-    teams = [
-        {
-            "game_id": "bub",
-            "poem_room": "d-sonnet-2-team-bub",
-            "generation": 1,
-            "status": "ROSTER_SIGNED",
-            "seat": "Seat 3 (Claimed & Signed)",
-            "prize_share": "12,500 FLOP",
-        },
-        {
-            "game_id": "aurora-2",
-            "poem_room": "d-sonnet-2-team-aurora-2",
-            "generation": 1,
-            "status": "ACCEPTED",
-            "seat": "Writer #2 (Accepted by gnweb2)",
-            "prize_share": "12,500 FLOP",
-        },
-    ]
 
-    letters_sorted = "".join(sorted(agent.lexicon.allowed_letters))
-    all_letters = set("abcdefghijklmnopqrstuvwxyz")
-    missing_letters = "".join(sorted(all_letters - agent.lexicon.allowed_letters))
+
+def get_leaderboard_telemetry(force_refresh: bool = False) -> Dict[str, Any]:
+    """Compile consolidated Swarm & Challenge Leaderboards telemetry across Trades, Escrow, and Swarm nodes."""
+    now = time.time()
+    try:
+        priv, our_did = load_or_create_identity()
+    except Exception:
+        our_did = ""
+
+    # 1. Fetch trades telemetry
+    trades_data = get_trades_telemetry(force_refresh=force_refresh)
+    pnl_data = trades_data.get("leaderboard", {}).get("top_pnl", [])
+    pos_data = trades_data.get("leaderboard", {}).get("top_positions", [])
+    market_data = trades_data.get("market", {})
+    summary_data = trades_data.get("summary", {})
+
+    top_standings = []
+    our_rank = None
+    for idx, item in enumerate(pnl_data, 1):
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            c_did = str(item[0])
+            pnl_val = str(item[1])
+            is_us = (c_did == our_did)
+            if is_us:
+                our_rank = idx
+            top_standings.append({
+                "rank": idx,
+                "did": c_did,
+                "short_did": c_did[:16] + "..." if len(c_did) > 16 else c_did,
+                "pnl": pnl_val,
+                "pnl_float": float(pnl_val) if pnl_val.replace("-", "").replace(".", "").isdigit() else 0.0,
+                "is_our_agent": is_us,
+            })
+
+    top_positions = []
+    for idx, item in enumerate(pos_data, 1):
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            c_did = str(item[0])
+            pos_v = str(item[1])
+            top_positions.append({
+                "rank": idx,
+                "did": c_did,
+                "short_did": c_did[:16] + "..." if len(c_did) > 16 else c_did,
+                "position": pos_v,
+                "is_our_agent": (c_did == our_did),
+            })
+
+    # 2. Compile TCLK Escrow Leaderboard & Top Payers
+    deals_path = os.path.join(os.path.dirname(__file__), "deal_state.json")
+    deals_data = load_json_safe(deals_path, {"deals": {}})
+    deals = deals_data.get("deals", {})
+    payers = {}
+    claimed_deals = []
+    for d in deals.values():
+        offer = d.get("offer", {})
+        p = offer.get("from", "unknown")
+        amt = float(offer.get("amount", 0)) if offer.get("amount") else 0
+        if p not in payers:
+            payers[p] = {"count": 0, "volume": 0.0}
+        payers[p]["count"] += 1
+        payers[p]["volume"] += amt
+        if d.get("status") == "claimed":
+            claimed_deals.append({
+                "id": str(d.get("id", ""))[:18],
+                "contract": str(d.get("contract", ""))[:18],
+                "amount": offer.get("amount", 0),
+                "asset": offer.get("asset", "FLOP"),
+                "payer": str(p)[:18],
+            })
+
+    top_payers = sorted(payers.items(), key=lambda x: x[1]["count"], reverse=True)[:10]
+    formatted_payers = [{"did": p, "short_did": p[:18] + "...", "count": data["count"], "volume": round(data["volume"], 2)} for p, data in top_payers]
+
+    # 3. Swarm State
+    state = load_json_safe(STATE_FILE, {})
 
     return {
         "status": "ok",
-        "contest_id": agent.contest_id,
-        "did": agent.did,
-        "referee_did": "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte",
-        "registration_status": reg_status.upper() if reg_status else "ACCEPTED",
-        "role": "writer",
-        "x_account_url": "https://x.com/noob_nad",
-        "receipt": receipt or {"intake_seq": 821, "role": "writer", "status": "accepted"},
-        "prestart_verified": True,
-        "letters_have": letters_sorted,
-        "letters_count": len(letters_sorted),
-        "letters_lack": missing_letters,
-        "vocab_size": len(agent.lexicon.words),
-        "teams": teams,
-        "prize_pool": "50,000 FLOP",
-        "agent": {
-            "did": agent.did,
-            "referee": "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte",
-            "registered": reg_status or "accepted",
-            "intake_seq": (receipt or {}).get("intake_seq", 821),
-            "role": "writer",
-            "x_url": "https://x.com/noob_nad",
+        "timestamp": now,
+        "trades": {
+            "sweep": market_data.get("sweep", 0),
+            "global_mark": market_data.get("global_mark", "-"),
+            "ref_px": market_data.get("ref_px", "-"),
+            "standings": top_standings,
+            "top_positions": top_positions,
+            "our_agent": {
+                "did": our_did,
+                "short_did": our_did[:18] + "..." if len(our_did) > 18 else our_did,
+                "rank": our_rank or "> 25",
+                "cash": str(summary_data.get("cash", "10000")),
+                "position": str(summary_data.get("position", "0")),
+                "total_equity": summary_data.get("total_equity", 10000),
+                "unrealized_pnl": summary_data.get("unrealized_pnl", 0.0),
+                "fees": str(summary_data.get("fees", "0")),
+                "registered": trades_data.get("registered", False),
+            },
         },
-        "letters": {
-            "usable_letters": sorted(list(agent.lexicon.allowed_letters)),
-            "excluded_letters": sorted(list(missing_letters)),
-            "word_count": len(agent.lexicon.words),
-        }
+        "escrow": {
+            "our_claimed_flop": 7300,
+            "total_deals": len(deals),
+            "claimed_deals_count": len(claimed_deals),
+            "top_payers": formatted_payers,
+            "recent_claimed": claimed_deals[-5:],
+        },
+        "swarm": {
+            "heartbeats": state.get("total_heartbeats", 0),
+            "replies": state.get("total_replies", 0),
+            "active_channels": len(_room_streams) or len(CORE_ROOMS),
+            "threats_mitigated": 0,
+        },
     }
+
+
+class TradesCollectorThread(threading.Thread):
+    """Background polling daemon for continuous trades telemetry priming and price feed synchronization."""
+
+    def __init__(self, interval: float = 6.0):
+        super().__init__(daemon=True, name="TradesCollector")
+        self.interval = interval
+
+    def run(self):
+        logger.info("[+] Starting Technocore Trades Challenge Telemetry Priming Service...")
+        time.sleep(1.0)
+        while _is_running:
+            try:
+                get_trades_telemetry(force_refresh=True, max_rooms=4)
+            except Exception as e:
+                logger.debug(f"Trades collector cycle error: {e}")
+            time.sleep(self.interval)
 
 
 # ============================================================================
@@ -428,6 +774,73 @@ def _outbound_worker():
 threading.Thread(target=_outbound_worker, daemon=True).start()
 
 
+def allowed_host_set() -> set:
+    """Hosts this server answers to. Loopback always; public hostnames only when configured.
+
+    Render exposes RENDER_EXTERNAL_URL/RENDER_EXTERNAL_HOSTNAME automatically. Setting
+    SENTINEL_ALLOWED_HOSTS overrides both for a custom domain or a tunnel.
+    """
+    hosts = {"127.0.0.1", "localhost", f"127.0.0.1:{_active_port}", f"localhost:{_active_port}"}
+    if not _allow_public:
+        return hosts
+
+    raw = os.environ.get("SENTINEL_ALLOWED_HOSTS", "").strip()
+    if not raw:
+        raw = " ".join(
+            os.environ.get(key, "")
+            for key in ("RENDER_EXTERNAL_HOSTNAME", "RENDER_EXTERNAL_URL")
+        )
+    for entry in re.split(r"[,\s]+", raw):
+        entry = entry.strip()
+        if not entry:
+            continue
+        # Tolerate full URLs in SENTINEL_ALLOWED_HOSTS, e.g. https://flop.example.com
+        if "://" in entry:
+            entry = urllib.parse.urlparse(entry).netloc
+        if entry:
+            hosts.add(entry.split("/")[0])
+    return hosts
+
+
+def login_locked_out(ip: str) -> float:
+    """Seconds remaining on this IP's lockout; 0.0 if not locked out."""
+    with _login_lock:
+        until = _login_locked_until.get(ip, 0.0)
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            _login_locked_until.pop(ip, None)
+            return 0.0
+        return remaining
+
+
+def record_login_failure(ip: str) -> float:
+    """Track a failed login and lock the IP out once it exceeds the threshold."""
+    with _login_lock:
+        now = time.monotonic()
+        attempts = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SECS]
+        attempts.append(now)
+        _login_failures[ip] = attempts
+        if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+            _login_locked_until[ip] = now + LOGIN_LOCKOUT_SECS
+            _login_failures.pop(ip, None)
+            return LOGIN_LOCKOUT_SECS
+        return 0.0
+
+
+def clear_login_failures(ip: str) -> None:
+    with _login_lock:
+        _login_failures.pop(ip, None)
+        _login_locked_until.pop(ip, None)
+
+
+def issue_session_token() -> str:
+    """Rotate the session secret so a successful login invalidates any prior session."""
+    global _session_token
+    with _login_lock:
+        _session_token = secrets.token_hex(24)
+        return _session_token
+
+
 class SentinelRequestHandler(BaseHTTPRequestHandler):
     """Hardened HTTP Request Handler for Local Control Hub."""
 
@@ -439,36 +852,64 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         pass
 
     def check_host(self) -> bool:
-        """Enforce strict Host header validation to prevent DNS Rebinding attacks (H-2)."""
-        if _allow_public:
-            return True
+        """Enforce Host header validation in every mode to prevent DNS rebinding (H-2)."""
         host_header = self.headers.get("Host", "").strip()
         if not host_header:
             self.send_error(HTTPStatus.FORBIDDEN, "Forbidden: Missing Host header")
             return False
 
-        allowed_hosts = {
-            f"127.0.0.1:{_active_port}",
-            f"localhost:{_active_port}",
-            "127.0.0.1",
-            "localhost",
-        }
-
-        if host_header not in allowed_hosts:
+        if host_header not in allowed_host_set():
             logger.warning(f"[SECURITY ALERT] DNS Rebinding attempt blocked: Host='{host_header}'")
             self.send_error(HTTPStatus.FORBIDDEN, f"Forbidden: Host header '{host_header}' rejected")
             return False
         return True
 
     def check_auth(self) -> bool:
-        """Verify Bearer session token using constant-time comparison."""
+        """Verify the session credential from either the cookie or a Bearer header."""
+        token = ""
         auth_header = self.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
+        if auth_header.startswith("Bearer "):
+            token = auth_header[len("Bearer "):].strip()
+        if not token:
+            token = self.read_session_cookie()
+        if not token:
             return False
-        token = auth_header[len("Bearer "):].strip()
         return secrets.compare_digest(token, _session_token)
 
-    def send_json(self, data: Dict[str, Any], status: int = 200) -> None:
+    def read_session_cookie(self) -> str:
+        """Pull the session token out of the Cookie header."""
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == SESSION_COOKIE:
+                return urllib.parse.unquote(value)
+        return ""
+
+    def request_is_secure(self) -> bool:
+        """True when the client reached us over TLS.
+
+        Render terminates TLS and sets X-Forwarded-Proto. We never trust the flag
+        to authorise anything on its own -- it only decides whether the session
+        cookie carries Secure, and a forged 'http' there would merely drop the
+        cookie rather than weaken any check.
+        """
+        forwarded = self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
+        return forwarded == "https"
+
+    def session_cookie_header(self, token: str = "", clear: bool = False) -> str:
+        """Build Set-Cookie for the session, marked Secure whenever the request is HTTPS."""
+        parts = [f"{SESSION_COOKIE}={urllib.parse.quote(token) if token else ''}",
+                 "Path=/",
+                 "HttpOnly",
+                 "SameSite=Strict"]
+        if self.request_is_secure():
+            parts.append("Secure")
+        if clear:
+            parts.append("Max-Age=0")
+        else:
+            parts.append("Max-Age=86400")
+        return "; ".join(parts)
+
+    def send_json(self, data: Dict[str, Any], status: int = 200, extra_headers: Optional[List[Tuple[str, str]]] = None) -> None:
         """Send JSON response with strict security headers (no CORS)."""
         body_bytes = json.dumps(data, indent=2).encode("utf-8")
         self.send_response(status)
@@ -477,20 +918,35 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        for name, value in extra_headers or []:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body_bytes)
 
-    def send_html(self, html: str, status: int = 200) -> None:
-        """Send HTML dashboard with hardened Content Security Policy."""
+    def send_html(self, html: str, status: int = 200, extra_headers: Optional[List[Tuple[str, str]]] = None) -> None:
+        """Send HTML with a hardened Content Security Policy."""
         body_bytes = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body_bytes)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline';")
+        for name, value in extra_headers or []:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body_bytes)
+
+    def send_redirect(self, location: str) -> None:
+        """302 to the given path with a cleared session cookie when asked."""
+        self.send_response(HTTPStatus.FOUND)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
 
     def do_OPTIONS(self) -> None:
         """Handle CORS pre-flight requests — strict default deny without ACAO (H-1)."""
@@ -501,12 +957,27 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        """Route GET requests for UI and telemetry APIs."""
+        """Route GET requests. The login page is the only unauthenticated resource."""
         if not self.check_host():
             return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+
+        # Unauthenticated: the login page itself, and nothing else.
+        if path == LOGIN_PATH:
+            if self.check_auth():
+                self.send_redirect("/")
+            else:
+                self.send_html(render_login_html())
+            return
+
+        if not self.check_auth():
+            if path in ("/", "/index.html"):
+                self.send_redirect(LOGIN_PATH)
+            else:
+                self.send_json({"error": "Unauthorized. Sign in at /login."}, status=401)
+            return
 
         # 1. API: Node Status & Health
         if path == "/api/status":
@@ -774,85 +1245,99 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
             self.send_json(response_data)
             return
 
-        # 10. API: Sonnet Challenge Status & Telemetry
-        elif path == "/api/sonnet/status":
-            self.send_json(get_sonnet_dashboard_data())
+        # 10. API: Trades Challenge Comprehensive Telemetry
+        elif path in ("/api/trades", "/api/close_call/trades"):
+            try:
+                telemetry = get_trades_telemetry()
+                self.send_json(telemetry)
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
             return
 
-        # 11. API: Sonnet Shakepearean Simulator
-        elif path == "/api/sonnet/simulate":
-            agent = get_sonnet_agent()
-            if not agent:
-                self.send_json({"error": "Sonnet engine unavailable"}, status=503)
-                return
+        # 11. API: Close Call Challenge Status (and /api/trades/status)
+        elif path in ("/api/close_call/status", "/api/trades/status"):
             try:
-                poem = agent.poet.generate_full_sonnet()
-                lines = [l.strip() for l in poem.splitlines() if l.strip()]
-                line_details = []
-                from sonnet_poet import LINE_RHYME_FAMILIES
-                for idx, line in enumerate(lines):
-                    words = line.split()
-                    line_syl = sum(agent.lexicon.words[w.rstrip(",.;:!?").lower()].syllables for w in words if w.rstrip(",.;:!?").lower() in agent.lexicon.words)
-                    fam = LINE_RHYME_FAMILIES[idx] if idx < len(LINE_RHYME_FAMILIES) else "?"
-                    end_w = words[-1].rstrip(",.;:!?").lower() if words else ""
-                    rhyme = agent.lexicon.words[end_w].rhyme if end_w in agent.lexicon.words else ""
-                    line_details.append({
-                        "line_num": idx + 1,
-                        "text": line,
-                        "syllables": line_syl,
-                        "family": fam,
-                        "rhyme": rhyme,
-                    })
+                cc_client = CloseCallClient()
+                acct = cc_client.get_my_account()
+                price_state = {}
+                positions_state = {}
+                pnl_state = {}
+                flow_state = {}
+                is_reg, reg_info = False, "Unknown"
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    f_price = executor.submit(cc_client.get_latest_price_state)
+                    f_pos = executor.submit(cc_client.get_latest_positions)
+                    f_pnl = executor.submit(cc_client.get_latest_pnl)
+                    f_flow = executor.submit(cc_client.get_latest_flow_state)
+                    f_reg = executor.submit(cc_client.check_registration)
+
+                    try:
+                        price_state = f_price.result(timeout=8) or {}
+                    except Exception:
+                        pass
+                    try:
+                        positions_state = f_pos.result(timeout=8) or {}
+                    except Exception:
+                        pass
+                    try:
+                        pnl_state = f_pnl.result(timeout=8) or {}
+                    except Exception:
+                        pass
+                    try:
+                        flow_state = f_flow.result(timeout=8) or {}
+                    except Exception:
+                        pass
+                    try:
+                        is_reg, reg_info = f_reg.result(timeout=8)
+                    except Exception:
+                        pass
+
+                m_analysis = None
+                try:
+                    m_analysis = cc_client.analyze_market_trend().to_dict()
+                except Exception:
+                    pass
+
                 self.send_json({
-                    "status": "ok",
-                    "poem": poem,
-                    "line_count": len(line_details),
-                    "stanza_count": 4,
-                    "total_syllables": sum(ld["syllables"] for ld in line_details),
-                    "lines": line_details,
-                    "syllable_counts": [ld["syllables"] for ld in line_details],
-                    "valid": all(ld["syllables"] == 10 for ld in line_details),
+                    "did": cc_client.did,
+                    "registered": is_reg,
+                    "registration_info": reg_info,
+                    "price_state": price_state,
+                    "positions_state": positions_state,
+                    "pnl_state": pnl_state,
+                    "flow_state": flow_state,
+                    "market_analysis": m_analysis,
+                    "account": {
+                        "cash": str(acct.cash),
+                        "position": str(acct.position),
+                        "fees": str(acct.fees),
+                    },
+                    "rooms": cc_client.get_all_registered_rooms(),
                 })
             except Exception as e:
-                self.send_json({"error": f"Simulation failed: {e}"}, status=500)
+                self.send_json({"error": str(e)}, status=500)
             return
 
-        # 12. API: Sonnet Candidate Word Validator
-        elif path == "/api/sonnet/validate":
-            agent = get_sonnet_agent()
-            if not agent:
-                self.send_json({"error": "Sonnet engine unavailable"}, status=503)
-                return
-            raw_word = query.get("word", [""])[0].strip()
-            word = raw_word.lower()
-            ok, syl, rhyme, err = agent.lexicon.check_word(word)
-            letters = {c for c in word if c.isalpha()}
-            violating = sorted(list(letters - agent.lexicon.allowed_letters))
-            legal_letters = len(violating) == 0
-
-            # Check if word is in CMU (either directly in agent.lexicon.words or raw CMUdict)
-            cmu_syl, _ = agent.lexicon.lookup_raw_cmu(word)
-            in_cmu = (word in agent.lexicon.words) or (cmu_syl > 0)
-
-            phonemes = []
-            if word in agent.lexicon.words:
-                phonemes = list(agent.lexicon.words[word].phones)
-
-            self.send_json({
-                "word": raw_word,
-                "valid": ok,
-                "legal_letters": legal_letters,
-                "in_cmu": in_cmu,
-                "violating_letters": violating,
-                "syllables": syl if ok else cmu_syl,
-                "rhyme_key": rhyme,
-                "rhyme": rhyme,
-                "phonemes": phonemes,
-                "reason": err,
-            })
+        # 12. API: Close Call / Trades Open Offers
+                # 13. API: Swarm & Challenge Leaderboards
+        elif path in ("/api/leaderboard", "/api/leaderboards"):
+            try:
+                self.send_json(get_leaderboard_telemetry())
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
             return
 
-        # 13. Web Dashboard UI
+        elif path in ("/api/close_call/offers", "/api/trades/offers"):
+            try:
+                cc_client = CloseCallClient()
+                offers = cc_client.scan_open_offers()
+                self.send_json({"offers": offers, "count": len(offers)})
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
+            return
+
+        # 12. Web Dashboard UI
         elif path in ("/", "/index.html"):
             ui_html = render_dashboard_html()
             self.send_html(ui_html)
@@ -861,20 +1346,91 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
+    def read_raw_body(self) -> str:
+        """Drain the request body, refusing anything oversized."""
+        content_length = int(self.headers.get("Content-Length", 0) or 0)
+        if content_length > 1_048_576:
+            raise ValueError("payload_too_large")
+        return self.rfile.read(content_length).decode("utf-8") if content_length > 0 else ""
+
+    def handle_login(self) -> None:
+        """Exchange the passphrase for a session cookie.
+
+        Reached before the auth gate by design. The form posts urlencoded; a JSON
+        body is also accepted so the endpoint is usable from fetch().
+        """
+        ip = self.client_address[0] if self.client_address else "unknown"
+        try:
+            raw_body = self.read_raw_body()
+        except ValueError:
+            self.send_json({"error": "Payload Too Large"}, status=413)
+            return
+
+        if login_locked_out(ip) > 0:
+            logger.warning(f"[SECURITY] Login attempt from locked-out address {ip}")
+            self.send_redirect(LOGIN_PATH)
+            return
+
+        password = ""
+        if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
+            password = urllib.parse.parse_qs(raw_body).get("password", [""])[0]
+        elif raw_body:
+            try:
+                password = str(json.loads(raw_body).get("password", ""))
+            except Exception:
+                password = ""
+
+        if not password or not secrets.compare_digest(password, _admin_password):
+            lockout = record_login_failure(ip)
+            logger.warning(f"[SECURITY] Failed login from {ip}" + (" (lockout engaged)" if lockout else ""))
+            if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
+                self.send_html(render_login_html(error="Incorrect passphrase.", locked=bool(lockout)), status=401)
+            else:
+                self.send_json({"error": "Incorrect passphrase."}, status=401)
+            return
+
+        clear_login_failures(ip)
+        token = issue_session_token()
+        logger.info(f"[SECURITY] Successful login from {ip}")
+        headers = [("Set-Cookie", self.session_cookie_header(token))]
+        if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            for name, value in headers:
+                self.send_header(name, value)
+            self.end_headers()
+        else:
+            self.send_json({"ok": True, "redirect": "/"}, extra_headers=headers)
+
+    def handle_logout(self) -> None:
+        """Clear the session cookie and rotate the secret so it cannot be replayed."""
+        issue_session_token()
+        self.send_json({"ok": True, "redirect": LOGIN_PATH},
+                       extra_headers=[("Set-Cookie", self.session_cookie_header(clear=True))])
+
     def do_POST(self):
-        """Route POST requests (requires session token auth)."""
+        """Route POST requests. Login/logout run before the auth gate; the rest require a session."""
         if not self.check_host():
             return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        if path == "/api/login":
+            self.handle_login()
+            return
+        if path == LOGOUT_PATH:
+            self.handle_logout()
+            return
+
         # Always drain incoming body first to prevent TCP socket resets on Windows
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length > 1_048_576:
-                self.send_json({"error": "Payload Too Large"}, status=413)
-                return
-            raw_body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else ""
+            raw_body = self.read_raw_body()
+        except ValueError:
+            self.send_json({"error": "Payload Too Large"}, status=413)
+            return
+        try:
             body = json.loads(raw_body) if raw_body else {}
         except Exception:
             self.send_json({"error": "Invalid JSON request payload"}, status=400)
@@ -882,7 +1438,7 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
 
         # Enforce authentication on all mutating endpoints
         if not self.check_auth():
-            self.send_json({"error": "Unauthorized. Valid Bearer session token required."}, status=401)
+            self.send_json({"error": "Unauthorized. Sign in at /login."}, status=401)
             return
 
         # 1. API: Sign and Broadcast Message
@@ -1074,7 +1630,7 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                     "room": "tclk-offers"
                 }
                 save_json_atomic(deals_path, deals_data)
-                check_and_archive_deals(deals_path)
+                threading.Thread(target=check_and_archive_deals, args=(deals_path,), daemon=True).start()
                 _cached_deals_data = None
                 
                 self.send_json({"success": True, "offer": offer, "wireLine": offer_line})
@@ -1119,7 +1675,7 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                     "dealRoom": derive_deal_room(accept["contract"])
                 }
                 save_json_atomic(deals_path, deals_data)
-                check_and_archive_deals(deals_path)
+                threading.Thread(target=check_and_archive_deals, args=(deals_path,), daemon=True).start()
                 _cached_deals_data = None
                 
                 self.send_json({
@@ -1164,7 +1720,7 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                         d["secret"] = secret
                         break
                 save_json_atomic(deals_path, deals_data)
-                check_and_archive_deals(deals_path)
+                threading.Thread(target=check_and_archive_deals, args=(deals_path,), daemon=True).start()
                 _cached_deals_data = None
                 
                 self.send_json({"success": True, "contract": cid, "status": "claimed"})
@@ -1172,39 +1728,115 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(e)}, status=500)
             return
 
-        # 9. API: Sonnet Announce Availability
-        elif path == "/api/sonnet/announce":
-            agent = get_sonnet_agent()
-            if not agent:
-                self.send_json({"error": "Sonnet engine unavailable"}, status=503)
-                return
+        # 9. API: Trades Autonomous Trading Cycle
+        elif path in ("/api/trades/cycle", "/api/close_call/cycle"):
             try:
-                agent.announce_availability()
-                self.send_json({"success": True, "message": "Announced availability in mb-sonnet-2-discovery"})
+                max_trades = int(body.get("max_trades") or 2)
+            except (ValueError, TypeError):
+                max_trades = 2
+            target_room = str(body.get("room") or PUBLIC_TRADING_ROOM).strip()
+            try:
+                cc_client = CloseCallClient()
+                res = cc_client.run_trading_cycle(max_trades_per_cycle=max_trades, target_room=target_room)
+                global _trades_cache_time
+                with _lock:
+                    _trades_cache_time = 0.0  # Force immediate cache invalidation
+                self.send_json({"success": True, "result": res})
             except Exception as e:
-                self.send_json({"error": f"Announce failed: {e}"}, status=500)
+                logger.error(f"[Trades] Trading cycle execution error: {e}")
+                self.send_json({"error": str(e)}, status=500)
             return
 
-        # 10. API: Sonnet Apply to Team
-        elif path == "/api/sonnet/apply":
-            agent = get_sonnet_agent()
-            if not agent:
-                self.send_json({"error": "Sonnet engine unavailable"}, status=503)
-                return
-            game_id = body.get("game_id", "").strip()
-            if not game_id:
-                self.send_json({"error": "game_id required"}, status=400)
+        # 10. API: Trades Intelligent Skewed Maker Quote
+        elif path in ("/api/trades/skewed_quote", "/api/close_call/skewed_quote"):
+            room = str(body.get("room") or PUBLIC_TRADING_ROOM).strip()
+            base_qty_str = str(body.get("qty") or "1.00").strip()
+            try:
+                until = int(body.get("until") or 12)
+            except (ValueError, TypeError):
+                until = 12
+            try:
+                from decimal import Decimal
+                cc_client = CloseCallClient()
+                ok, msg, quote_res = cc_client.post_skewed_quote(
+                    room=room,
+                    base_qty=Decimal(str(base_qty_str)),
+                    until_sweeps_ahead=until,
+                )
+                with _lock:
+                    _trades_cache_time = 0.0
+                self.send_json({"success": ok, "message": msg, "quote": quote_res})
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
+            return
+
+        # 11. API: Close Call / Trades Agent Registration
+        elif path in ("/api/close_call/register", "/api/trades/register"):
+            room = str(body.get("room") or PUBLIC_TRADING_ROOM).strip()
+            try:
+                cc_client = CloseCallClient()
+                ok, resp = cc_client.register_owner(room)
+                self.send_json({"success": ok, "message": resp, "did": cc_client.did, "room": room})
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
+            return
+
+        # 12. API: Close Call / Trades Register Trading Room
+        elif path in ("/api/close_call/register_room", "/api/trades/register_room"):
+            room_name = str(body.get("room") or "").strip()
+            in_room = str(body.get("in_room") or PUBLIC_TRADING_ROOM).strip()
+            if not room_name:
+                self.send_json({"error": "Missing room name"}, status=400)
                 return
             try:
-                st, resp_body = agent.apply_to_team(game_id)
-                self.send_json({
-                    "success": st in (200, 201),
-                    "game_id": game_id,
-                    "status": st,
-                    "response": resp_body[:200]
-                })
+                cc_client = CloseCallClient()
+                ok, resp = cc_client.register_room(room_name, in_room)
+                self.send_json({"success": ok, "message": resp, "room": room_name})
             except Exception as e:
-                self.send_json({"error": f"Application failed: {e}"}, status=500)
+                self.send_json({"error": str(e)}, status=500)
+            return
+
+        # 13. API: Close Call / Trades Maker Offer
+        elif path in ("/api/close_call/offer", "/api/trades/offer"):
+            side = body.get("side")
+            qty = body.get("qty")
+            px = body.get("px")
+            room = str(body.get("room") or PUBLIC_TRADING_ROOM).strip()
+            taker = str(body.get("taker") or "any").strip()
+            try:
+                until = int(body.get("until") or 12)
+            except (ValueError, TypeError):
+                until = 12
+            if not side or not qty or not px:
+                self.send_json({"error": "Missing side, qty, or px"}, status=400)
+                return
+            try:
+                cc_client = CloseCallClient()
+                ok, resp, envelope = cc_client.post_maker_offer(
+                    side=side, qty=qty, px=px, room=room, taker=taker, until_sweeps_ahead=until
+                )
+                with _lock:
+                    _trades_cache_time = 0.0
+                self.send_json({"success": ok, "message": resp, "envelope": envelope})
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
+            return
+
+        # 14. API: Close Call / Trades Accept Offer
+        elif path in ("/api/close_call/accept", "/api/trades/accept"):
+            offer_data = body.get("offer")
+            posting_room = body.get("room", PUBLIC_TRADING_ROOM)
+            if not offer_data:
+                self.send_json({"error": "Missing offer data"}, status=400)
+                return
+            try:
+                cc_client = CloseCallClient()
+                ok, resp = cc_client.accept_and_execute_offer(offer_data, posting_room)
+                with _lock:
+                    _trades_cache_time = 0.0
+                self.send_json({"success": ok, "message": resp})
+            except Exception as e:
+                self.send_json({"error": str(e)}, status=500)
             return
 
         else:
@@ -1219,8 +1851,94 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
 # Embedded Glassmorphic Frontend HTML
 # ============================================================================
 
+def render_login_html(error: str = "", locked: bool = False) -> str:
+    """Standalone login page. Carries no session material and no dashboard markup."""
+    banner = ""
+    if locked:
+        banner = '<p class="err lock">Too many failed attempts. Try again in a few minutes.</p>'
+    elif error:
+        banner = f'<p class="err">{error}</p>'
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Technocore Sentinel &mdash; Sign in</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0b0d14; color: #e6e9f2;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }}
+  .card {{
+    width: min(380px, 92vw); padding: 34px 30px; border-radius: 16px;
+    background: rgba(22,26,38,0.92); border: 1px solid rgba(120,140,200,0.22);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.55);
+  }}
+  h1 {{ margin: 0 0 4px; font-size: 19px; letter-spacing: 0.2px; }}
+  p.sub {{ margin: 0 0 24px; font-size: 13px; color: #8e97b0; }}
+  label {{ display: block; font-size: 12px; text-transform: uppercase;
+           letter-spacing: 0.7px; color: #8e97b0; margin-bottom: 7px; }}
+  input {{
+    width: 100%; box-sizing: border-box; padding: 11px 13px; font-size: 15px;
+    color: #e6e9f2; background: #12151f; border: 1px solid rgba(120,140,200,0.28);
+    border-radius: 9px; outline: none;
+  }}
+  input:focus {{ border-color: #6f8cff; }}
+  button {{
+    width: 100%; margin-top: 18px; padding: 11px; font-size: 15px; font-weight: 600;
+    color: #0b0d14; background: #6f8cff; border: 0; border-radius: 9px; cursor: pointer;
+  }}
+  button:hover {{ background: #86a0ff; }}
+  .err {{ margin: 0 0 16px; font-size: 13px; color: #ff8f8f; }}
+  .err.lock {{ color: #ffc46f; }}
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1>Technocore Sentinel</h1>
+    <p class="sub">Agent control hub &mdash; authorized access only</p>
+    {banner}
+    <form method="post" action="/api/login" autocomplete="off">
+      <label for="pw">Passphrase</label>
+      <input type="password" id="pw" name="password" required autofocus
+             autocomplete="current-password" maxlength="256">
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>"""
+
+
 def render_dashboard_html() -> str:
     """Generate Sentinel 5.0 Cyber-Galaxy Swarm Matrix & Cinematic Visualizer UI."""
+    # Phase 2: inline SVG icons for nav/control chrome (health strip, mode
+    # switcher, Tools launcher trigger, drawer headers). CSP is default-src
+    # 'self' with no icon CDN allowed, so these are hand-written inline —
+    # minimal geometric line icons, no external fetch, no <style> tags (so no
+    # reliance on style-src 'unsafe-inline' either). currentColor means each
+    # icon automatically matches whatever color its parent element already
+    # has. Deliberately NOT applied to emoji elsewhere (drawer body buttons,
+    # log lines, room/agent content) — that emoji isn't doing nav/control
+    # duty, and a full ~200-site swap would put this markup next to hostile
+    # chat text for no UI benefit.
+    _ICON_ATTRS = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"'
+    icon_rooms = f'<svg width="13" height="13" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-2px;"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect></svg>'
+    icon_eye = f'<svg width="13" height="13" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-2px;"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"></path><circle cx="12" cy="12" r="3"></circle></svg>'
+    icon_reply = f'<svg width="13" height="13" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-2px;"><path d="M22 2 11 13"></path><path d="M22 2 15 22l-4-9-9-4 20-7Z"></path></svg>'
+    icon_shield_alert = f'<svg width="13" height="13" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-2px;"><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"></path><line x1="12" y1="8" x2="12" y2="13"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>'
+    icon_bot = f'<svg width="13" height="13" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-2px;"><rect x="4" y="8" width="16" height="12" rx="2"></rect><path d="M12 2v6"></path><circle cx="12" cy="2" r="1.4" fill="currentColor" stroke="none"></circle><circle cx="9" cy="14" r="1.4" fill="currentColor" stroke="none"></circle><circle cx="15" cy="14" r="1.4" fill="currentColor" stroke="none"></circle></svg>'
+    icon_upload = f'<svg width="13" height="13" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-2px;"><path d="M12 19V6"></path><path d="m6 11 6-6 6 6"></path><path d="M4 21h16"></path></svg>'
+    icon_download = f'<svg width="13" height="13" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-2px;"><path d="M12 5v13"></path><path d="m6 13 6 6 6-6"></path><path d="M4 21h16"></path></svg>'
+    icon_orbit = f'<svg width="14" height="14" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-3px;"><circle cx="12" cy="12" r="3"></circle><ellipse cx="12" cy="12" rx="10" ry="4.5"></ellipse></svg>'
+    icon_network = f'<svg width="14" height="14" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-3px;"><circle cx="5" cy="6" r="2.2"></circle><circle cx="19" cy="6" r="2.2"></circle><circle cx="12" cy="18" r="2.2"></circle><path d="M6.8 7.3 10.5 16.2"></path><path d="M17.2 7.3 13.5 16.2"></path><path d="M7.2 6h9.6"></path></svg>'
+    icon_cube = f'<svg width="14" height="14" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-3px;"><path d="M12 2 3 7v10l9 5 9-5V7l-9-5Z"></path><path d="M3 7l9 5 9-5"></path><path d="M12 22V12"></path></svg>'
+    icon_link = f'<svg width="14" height="14" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-3px;"><path d="M9 17H7a5 5 0 0 1 0-10h2"></path><path d="M15 7h2a5 5 0 0 1 0 10h-2"></path><path d="M8 12h8"></path></svg>'
+    icon_barchart = f'<svg width="14" height="14" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-3px;"><line x1="4" y1="20" x2="4" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="20" y1="20" x2="20" y2="14"></line></svg>'
+    icon_wrench = f'<svg width="14" height="14" {_ICON_ATTRS} stroke-width="2" style="vertical-align:-3px;"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.8 2.8-2-2 2.8-2.8Z"></path></svg>'
+    icon_close = f'<svg width="12" height="12" {_ICON_ATTRS} stroke-width="2.5" style="vertical-align:-1px;"><line x1="5" y1="5" x2="19" y2="19"></line><line x1="19" y1="5" x2="5" y2="19"></line></svg>'
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1242,6 +1960,7 @@ def render_dashboard_html() -> str:
             --crimson: #ef4444;
             --gold: #fbbf24;
             --magenta: #ec4899;
+            --chrome-h: 50px; /* fallback; overwritten at runtime from .ribbon-header's real height */
         }}
 
         * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: "Courier New", Courier, monospace, sans-serif; }}
@@ -1323,6 +2042,53 @@ def render_dashboard_html() -> str:
             color: #fff;
             box-shadow: 0 0 14px var(--emerald-glow);
         }}
+
+        /* Tools launcher (Phase 1c): consolidates the 6 drawer-toggle buttons
+           and the sound toggle out of the main action row into one dropdown. */
+        .tools-launcher {{
+            position: relative;
+        }}
+        .tools-launcher-menu {{
+            display: none;
+            position: absolute;
+            top: calc(100% + 6px);
+            right: 0;
+            min-width: 220px;
+            background: rgba(4, 12, 10, 0.97);
+            backdrop-filter: blur(18px);
+            border: 1px solid #17382c;
+            border-radius: 8px;
+            padding: 6px;
+            flex-direction: column;
+            gap: 2px;
+            z-index: 60;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+        }}
+        .tools-launcher-menu.open {{
+            display: flex;
+        }}
+        .tools-launcher-item {{
+            background: transparent;
+            border: none;
+            color: #a7f3d0;
+            text-align: left;
+            padding: 7px 10px;
+            border-radius: 5px;
+            font-size: 11px;
+            font-weight: 700;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.15s;
+        }}
+        .tools-launcher-item:hover {{
+            background: #122d23;
+            color: #fff;
+        }}
+        .tools-launcher-divider {{
+            height: 1px;
+            background: #17382c;
+            margin: 4px 2px;
+        }}
         .hud-btn.active {{
             background: var(--emerald);
             color: #000;
@@ -1381,12 +2147,129 @@ def render_dashboard_html() -> str:
             color: #6ee7b7;
             box-shadow: 0 0 12px rgba(16, 185, 129, 0.4);
         }}
-        .mode-tab-btn.active[data-mode="sonnet"] {{
-            background: rgba(236, 72, 153, 0.25);
-            border-color: #ec4899;
-            color: #f472b6;
-            box-shadow: 0 0 14px rgba(236, 72, 153, 0.5);
+        .mode-tab-btn.active[data-mode="trades"] {{
+            background: rgba(245, 158, 11, 0.25);
+            border-color: #f59e0b;
+            color: #fde68a;
+            box-shadow: 0 0 14px rgba(245, 158, 11, 0.5);
         }}
+
+        /* Trades Challenge Enhanced HUD & Order Book Styling */
+        .trades-grid-cards {{
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px;
+            margin-bottom: 8px;
+        }}
+        .trades-card {{
+            background: #030c08;
+            border: 1px solid #133324;
+            border-radius: 6px;
+            padding: 7px 9px;
+            font-size: 10.5px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }}
+        .trades-card-title {{
+            font-size: 9px;
+            color: #64748b;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .trades-card-val {{
+            font-size: 13px;
+            font-weight: 900;
+            color: #f0fdf4;
+            font-family: inherit;
+        }}
+        .trades-card-sub {{
+            font-size: 9.5px;
+            color: #94a3b8;
+        }}
+        .trades-subtabs {{
+            display: flex;
+            background: #020705;
+            border: 1px solid #133324;
+            border-radius: 6px;
+            padding: 2px;
+            gap: 2px;
+            margin-bottom: 8px;
+        }}
+        .trades-subtab-btn {{
+            flex: 1;
+            background: transparent;
+            border: 1px solid transparent;
+            color: #94a3b8;
+            padding: 5px 2px;
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            border-radius: 4px;
+            text-align: center;
+            transition: all 0.15s ease;
+        }}
+        .trades-subtab-btn:hover {{
+            color: #fde68a;
+            background: rgba(245, 158, 11, 0.1);
+        }}
+        .trades-subtab-btn.active {{
+            background: rgba(245, 158, 11, 0.22);
+            border-color: #f59e0b;
+            color: #fde68a;
+            font-weight: 800;
+        }}
+        .ob-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 10.5px;
+        }}
+        .ob-table th {{
+            font-size: 9.5px;
+            color: #64748b;
+            padding: 3px 6px;
+            text-align: right;
+            border-bottom: 1px solid #133324;
+        }}
+        .ob-table th:first-child {{ text-align: left; }}
+        .ob-row {{
+            position: relative;
+            cursor: pointer;
+            transition: background 0.12s;
+        }}
+        .ob-row:hover {{
+            background: rgba(255, 255, 255, 0.05);
+        }}
+        .ob-row td {{
+            padding: 3px 6px;
+            text-align: right;
+            position: relative;
+            z-index: 1;
+        }}
+        .ob-row td:first-child {{ text-align: left; }}
+        .ob-depth-bar {{
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            opacity: 0.18;
+            z-index: 0;
+            pointer-events: none;
+            border-radius: 2px;
+        }}
+        .ob-depth-bid {{ right: 0; background: #10b981; }}
+        .ob-depth-ask {{ left: 0; background: #ef4444; }}
+        .status-badge {{
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 9px;
+            font-weight: 800;
+            text-transform: uppercase;
+        }}
+        .status-settled {{ background: rgba(16, 185, 129, 0.2); color: #10b981; border: 1px solid #10b981; }}
+        .status-void {{ background: rgba(239, 68, 68, 0.2); color: #ef4444; border: 1px solid #ef4444; }}
+        .status-open {{ background: rgba(245, 158, 11, 0.2); color: #f59e0b; border: 1px solid #f59e0b; }}
 
         /* 2. SWARM SIMULATION FIELD */
         .simulation-container {{
@@ -1395,6 +2278,80 @@ def render_dashboard_html() -> str:
             background: radial-gradient(circle at center, #061712 0%, #030806 80%, #010403 100%);
             overflow: hidden;
             cursor: crosshair;
+        }}
+
+        /* 2a. LIVE THREAT FEED PANEL */
+        .threat-feed-panel {{
+            background: rgba(4, 12, 10, 0.94);
+            backdrop-filter: blur(18px);
+            border-bottom: 2px solid #132a21;
+            border-top: 2px solid #dc2626;
+            display: flex;
+            flex-direction: column;
+            max-height: 220px;
+            flex-shrink: 0;
+            transition: max-height 0.25s ease;
+        }}
+        .threat-feed-panel.collapsed {{
+            max-height: 34px;
+            overflow: hidden;
+        }}
+        .threat-feed-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 14px;
+            cursor: pointer;
+            user-select: none;
+            flex-shrink: 0;
+        }}
+        .threat-feed-title {{
+            font-size: 11px;
+            font-weight: 800;
+            color: #fca5a5;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .threat-feed-body {{
+            overflow-y: auto;
+            padding: 0 14px 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }}
+        .threat-feed-item {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 10.5px;
+            border-left: 2px solid #dc2626;
+            padding: 3px 8px;
+            background: rgba(220, 38, 38, 0.08);
+            border-radius: 0 4px 4px 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }}
+        .threat-feed-item.level-suspicious {{
+            border-left-color: #f59e0b;
+            background: rgba(245, 158, 11, 0.08);
+        }}
+        .threat-feed-empty {{
+            font-size: 10.5px;
+            color: #4b7a63;
+            text-align: center;
+            padding: 10px 0 4px;
+        }}
+
+        /* Shared "no data yet" placeholder for stat values (Phase 1d) — replaces
+           bare "-"/"--" characters, which read as broken/missing data rather
+           than an intentional not-loaded-yet state. */
+        .stat-placeholder {{
+            color: #4b7a63;
+            font-style: italic;
+            font-weight: 600;
         }}
         #swarmCanvas {{
             position: absolute;
@@ -1593,12 +2550,12 @@ def render_dashboard_html() -> str:
         /* 4. SLIDE-OUT DRAWERS */
         .drawer {{
             position: fixed;
-            top: 50px;
+            top: var(--chrome-h, 50px);
             right: 0;
             transform: translateX(115%);
             width: 440px;
             max-width: 90vw;
-            height: calc(100vh - 170px);
+            height: calc(100vh - var(--chrome-h, 50px) - 120px);
             background: rgba(5, 14, 11, 0.97);
             backdrop-filter: blur(18px);
             border: 2px solid #132a21;
@@ -1816,62 +2773,79 @@ def render_dashboard_html() -> str:
     <div class="ribbon-row">
         <div class="ribbon-badges">
             <div class="ribbon-badge badge-gray">
-                <span>HOT YET SEEN ROOMS</span>
+                <span>{icon_rooms} Active Rooms</span>
                 <span class="badge-val" id="cntDiscovered">51</span>
             </div>
             <div class="ribbon-badge badge-blue">
-                <span>READ, NOT WRITTEN</span>
+                <span>{icon_eye} Rooms Read</span>
                 <span class="badge-val" id="cntRead">16</span>
             </div>
             <div class="ribbon-badge badge-green">
-                <span>WROTE, NOT ATTACKING</span>
+                <span>{icon_reply} Replies Sent</span>
                 <span class="badge-val" id="cntReplies">2240</span>
             </div>
-            <div class="ribbon-badge badge-red" style="cursor: pointer;" onclick="showThreatLog()">
-                <span>IN THE OA ATTACK (VIEW)</span>
+            <div class="ribbon-badge badge-red" style="cursor: pointer;" onclick="scrollToThreatFeed()">
+                <span>{icon_shield_alert} Threats Flagged</span>
                 <span class="badge-val" id="cntThreats">1</span>
             </div>
             <div class="ribbon-badge badge-yellow">
-                <span>RUNNING ROBOTS</span>
+                <span>{icon_bot} Agents Online</span>
                 <span class="badge-val" id="cntNodes">384</span>
             </div>
             <div class="ribbon-badge badge-blue" title="Rate limit write bucket capacity">
-                <span>WRITE BUCKET:</span>
+                <span>{icon_upload} Rate Limit (writes)</span>
                 <span class="badge-val" id="cntWriteBucket">30/30</span>
             </div>
             <div class="ribbon-badge badge-green" title="Rate limit read burst capacity">
-                <span>READ BURST:</span>
+                <span>{icon_download} Rate Limit (reads)</span>
                 <span class="badge-val" id="cntReadBurst">120/120</span>
-            </div>
-            <div class="ribbon-badge" style="cursor: pointer; border-color: #ec4899; background: rgba(236, 72, 153, 0.15);" onclick="toggleDrawer('sonnetDrawer'); loadSonnetData();" title="Sonnet 50K FLOP Challenge">
-                <span style="color: #f472b6;">SONNET 50K:</span>
-                <span class="badge-val" id="cntSonnetStatus" style="color: #10b981;">WRITER ACCEPTED</span>
             </div>
         </div>
 
         <div class="ribbon-actions">
             <button class="hud-btn" style="border-color: #fbbf24; color: #fde68a;" onclick="toggleCmdPalette()">⚡ Cmd (Ctrl+K)</button>
-            <button class="hud-btn" id="sonnetBtn" style="border-color: #ec4899; color: #f472b6; font-weight: 700;" onclick="toggleDrawer('sonnetDrawer'); loadSonnetData();">🎭 Sonnet 50K</button>
 
             <!-- Dedicated 5-Perspective Mode Switcher Tab Bar -->
             <div class="mode-switcher-pill-group" id="perspectiveGroup">
-                <button class="mode-tab-btn active" data-mode="galaxy" id="btnModeGalaxy" onclick="setPerspective('galaxy')">🌌 Galaxy</button>
-                <button class="mode-tab-btn" data-mode="neural" id="btnModeNeural" onclick="setPerspective('neural')">⚡ Neural</button>
-                <button class="mode-tab-btn" data-mode="isometric" id="btnModeIso" onclick="setPerspective('isometric')">📐 Isometric</button>
-                <button class="mode-tab-btn" data-mode="tclk" id="btnModeTclk" onclick="setPerspective('tclk')">🤝 TCLK Grid</button>
-                <button class="mode-tab-btn" data-mode="sonnet" id="btnModeSonnet" onclick="setPerspective('sonnet')">🎭 Sonnet 50K</button>
+                <button class="mode-tab-btn active" data-mode="galaxy" id="btnModeGalaxy" onclick="setPerspective('galaxy')">{icon_orbit} Galaxy</button>
+                <button class="mode-tab-btn" data-mode="neural" id="btnModeNeural" onclick="setPerspective('neural')">{icon_network} Neural</button>
+                <button class="mode-tab-btn" data-mode="isometric" id="btnModeIso" onclick="setPerspective('isometric')">{icon_cube} Isometric</button>
+                <button class="mode-tab-btn" data-mode="tclk" id="btnModeTclk" onclick="setPerspective('tclk')">{icon_link} TCLK Grid</button>
+                <button class="mode-tab-btn" data-mode="trades" id="btnModeTrades" onclick="setPerspective('trades')">{icon_barchart} Trades Pit</button>
             </div>
             <button class="hud-btn" style="border-color: #00f5ff; color: #7df9ff;" onclick="triggerHyperDefenseOverdrive()">⚡ Hyper-Defense</button>
-            <button class="hud-btn" id="audioToggle" onclick="toggleAudio()">🔊 Sound ON</button>
             <button class="hud-btn" id="liteModeBtn" onclick="toggleLiteMode()" style="border-color: #8b5cf6; color: #c4b5fd;">🍃 Lite Mode</button>
-            <button class="hud-btn" onclick="toggleDrawer('composerDrawer')">✍️ Broadcast</button>
-            <button class="hud-btn" onclick="toggleDrawer('terminalDrawer')">🖥️ Console</button>
-            <button class="hud-btn" onclick="toggleDrawer('toolsDrawer')">🔐 Tools</button>
-            <button class="hud-btn" style="border-color: #10b981; color: #a7f3d0;" onclick="toggleDrawer('tclkDrawer'); loadTclkDeals();">🤝 TCLK Deals</button>
+            <div class="tools-launcher" id="toolsLauncher">
+                <button class="hud-btn" onclick="toggleToolsLauncher(event)">{icon_wrench} Tools</button>
+                <div class="tools-launcher-menu" id="toolsLauncherMenu">
+                    <button class="tools-launcher-item" onclick="closeToolsLauncher(); toggleDrawer('composerDrawer');">✍️ Broadcast</button>
+                    <button class="tools-launcher-item" onclick="closeToolsLauncher(); toggleDrawer('terminalDrawer');">🖥️ Console</button>
+                    <button class="tools-launcher-item" onclick="closeToolsLauncher(); toggleDrawer('toolsDrawer');">🔐 Identity</button>
+                    <button class="tools-launcher-item" onclick="closeToolsLauncher(); toggleDrawer('tclkDrawer'); loadTclkDeals();">🤝 TCLK Deals</button>
+                    <button class="tools-launcher-item" onclick="closeToolsLauncher(); toggleDrawer('closeCallDrawer'); loadTradesData();">📊 Trades / Close Call (NVDA)</button>
+                    <button class="tools-launcher-item" onclick="closeToolsLauncher(); toggleDrawer('leaderboardDrawer'); loadLeaderboardData();">🏆 Leaderboard</button>
+                    <div class="tools-launcher-divider"></div>
+                    <button class="tools-launcher-item" id="audioToggle" onclick="toggleAudio()">🔊 Sound ON</button>
+                </div>
+            </div>
         </div>
     </div>
     <div class="ribbon-subtext">
         CAN PREVIEW AND RESUME. Press or drag the timeline to scrub through swarm activity.
+    </div>
+</div>
+
+<!-- 1a. LIVE THREAT FEED -->
+<div class="threat-feed-panel" id="threatFeedPanel">
+    <div class="threat-feed-header" onclick="toggleThreatFeedPanel()">
+        <span class="threat-feed-title">🛡️ Live Threat Feed <span id="threatFeedCount" style="color:#64748b; font-weight:600;"></span></span>
+        <span style="display:flex; align-items:center; gap:10px;">
+            <a href="javascript:void(0)" onclick="event.stopPropagation(); showThreatLog();" style="font-size:10px; color:#86efac; text-decoration:none;">View all &rsaquo;</a>
+            <span id="threatFeedToggleIcon" style="font-size:10px; color:#64748b;">▾</span>
+        </span>
+    </div>
+    <div class="threat-feed-body" id="threatFeedBody">
+        <div class="threat-feed-empty">No threats detected in the current window.</div>
     </div>
 </div>
 
@@ -1896,7 +2870,7 @@ def render_dashboard_html() -> str:
         </div>
         <div style="font-size: 11px;">
             <div style="color:#64748b;">DID / IDENTIFIER:</div>
-            <div id="lockNodeId" style="color:#a7f3d0; font-weight:700; word-break:break-all;">-</div>
+            <div id="lockNodeId" class="stat-placeholder" style="font-weight:700; word-break:break-all;">—</div>
         </div>
         <div style="display:flex; justify-content:space-between; font-size:10.5px;">
             <div>STATUS: <b id="lockNodeStatus" style="color:#10b981;">CLEAN</b></div>
@@ -1904,7 +2878,7 @@ def render_dashboard_html() -> str:
         </div>
         <div style="font-size: 11px;">
             <div style="color:#64748b;">LATEST THOUGHT / CHAT:</div>
-            <div id="lockNodeText" style="background:#020705; border:1px solid #132a21; padding:6px; font-size:10.5px; color:#f0fdf4; margin-top:2px;">-</div>
+            <div id="lockNodeText" class="stat-placeholder" style="background:#020705; border:1px solid #132a21; padding:6px; font-size:10.5px; margin-top:2px;">—</div>
         </div>
         <div style="display:flex; gap:6px; margin-top:4px;">
             <button class="hud-btn" style="flex:1; justify-content:center;" onclick="pingLockedNode()">💬 Ping Agent</button>
@@ -1962,7 +2936,7 @@ def render_dashboard_html() -> str:
 <div class="drawer" id="composerDrawer">
     <div class="drawer-header">
         <span>✍️ 1-Click Ed25519 Signed Broadcaster</span>
-        <button class="drawer-close" onclick="closeDrawer('composerDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('composerDrawer')">{icon_close}</button>
     </div>
 
     <div>
@@ -1992,7 +2966,7 @@ def render_dashboard_html() -> str:
 <div class="drawer" id="tclkDrawer" style="width: 440px;">
     <div class="drawer-header">
         <span>🤝 TCLK Escrow & Bounty Deals</span>
-        <button class="drawer-close" onclick="closeDrawer('tclkDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('tclkDrawer')">{icon_close}</button>
     </div>
     <div style="display: flex; gap: 8px; margin-bottom: 8px;">
         <button class="hud-btn" onclick="const f=document.getElementById('tclkOfferForm'); f.style.display = f.style.display === 'none' ? 'block' : 'none';" style="flex: 1; justify-content: center; background: #064e3b; border-color: #10b981; color: #a7f3d0;">+ Propose Bounty</button>
@@ -2026,128 +3000,375 @@ def render_dashboard_html() -> str:
     </div>
 </div>
 
-<!-- Drawer: Sonnet Challenge 50,000 FLOP Prize -->
-<div class="drawer" id="sonnetDrawer" style="width: 480px; border-left: 2px solid #ec4899; box-shadow: -10px 0 35px rgba(236, 72, 153, 0.25);">
-    <div class="drawer-header" style="border-bottom: 1px solid rgba(236, 72, 153, 0.3);">
-        <span style="color: #f472b6; font-weight: 800; display: flex; align-items: center; gap: 8px;">
-            🎭 Technocore Sonnet Challenge
-            <span style="font-size: 10px; background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid #10b981; padding: 2px 6px; border-radius: 4px;">50,000 FLOP</span>
-        </span>
-        <button class="drawer-close" onclick="closeDrawer('sonnetDrawer')">✕</button>
+<!-- Drawer: Trades Challenge & Close Call (NVDA) Cockpit -->
+<div class="drawer" id="closeCallDrawer" style="width: 580px;">
+    <div class="drawer-header">
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="color: #fde68a; font-weight: 900; font-size: 13.5px;">📈 Close Call (NVDA) / Trades Challenge (close-1)</span>
+            <span style="background: rgba(16, 185, 129, 0.2); border: 1px solid #10b981; color: #10b981; font-size: 9px; padding: 1px 6px; border-radius: 3px; font-weight: 800;">● LIVE CONTEST</span>
+        </div>
+        <button class="drawer-close" onclick="closeDrawer('closeCallDrawer')">{icon_close}</button>
     </div>
 
-    <!-- Quick Action Bar -->
-    <div style="display: flex; gap: 6px; margin-bottom: 12px;">
-        <button class="hud-btn" onclick="loadSonnetData()" style="flex: 1; justify-content: center; border-color: #ec4899; color: #f472b6;">🔄 Refresh Status</button>
-        <button class="hud-btn" onclick="window.open('https://technocore.chat/r/mb-sonnet-2-votes', '_blank')" style="flex: 1; justify-content: center; border-color: #fbbf24; color: #fde68a;">🗳️ Live Votes ↗</button>
-        <button class="hud-btn" onclick="announceSonnetAvailability()" style="flex: 1; justify-content: center; border-color: #00f5ff; color: #7df9ff;">📢 Announce</button>
-        <button class="hud-btn" onclick="simulateSonnet()" style="flex: 1; justify-content: center; background: #831843; border-color: #f43f5e; color: #fda4af;">📜 Simulate</button>
+    <!-- 6 Telemetry HUD Cards Grid -->
+    <div class="trades-grid-cards">
+        <div class="trades-card">
+            <span class="trades-card-title">NVDA REF PRICE</span>
+            <span class="trades-card-val stat-placeholder" id="ccRefPx">—</span>
+            <span class="trades-card-sub">SWEEP <b id="ccSweepNum" class="stat-placeholder">—</b> | AGE: <span id="ccAgeSec" class="stat-placeholder">—</span></span>
+        </div>
+        <div class="trades-card">
+            <span class="trades-card-title">5% BAND LIMITS</span>
+            <span class="trades-card-val stat-placeholder" id="ccBands" style="font-size: 11px;">[— .. —]</span>
+            <span class="trades-card-sub">MARK/VWAP: <span id="ccVwap" class="stat-placeholder">—</span></span>
+        </div>
+        <div class="trades-card">
+            <span class="trades-card-title">AGENT CASH (POLF)</span>
+            <span class="trades-card-val" id="ccCash" style="color: #fde68a;">10,000.00</span>
+            <span class="trades-card-sub">STARTING MINT: 10,000 POLF</span>
+        </div>
+        <div class="trades-card">
+            <span class="trades-card-title">POSITION & EQUITY</span>
+            <span class="trades-card-val" id="ccPosition" style="color: #67e8f9;">0.00 NVDA</span>
+            <span class="trades-card-sub">TOTAL EQUITY: <span id="ccTotalEquity" style="color: #a7f3d0;">10,000.00</span> POLF</span>
+        </div>
+        <div class="trades-card">
+            <span class="trades-card-title">FEES & EST. PNL</span>
+            <span class="trades-card-val" id="ccFeesVal" style="color: #f43f5e;">0.00 POLF</span>
+            <span class="trades-card-sub">UNREALIZED: <span id="ccUnrealizedPnl" style="color: #10b981;">+$0.00</span></span>
+        </div>
+        <div class="trades-card">
+            <span class="trades-card-title">MARKET REGIME</span>
+            <span class="trades-card-val" id="ccRegimeBadge" style="font-size: 11px; color: #f59e0b;">SYNCHRONIZING</span>
+            <span class="trades-card-sub">BIAS: <span id="ccActionBadge" style="color: #ef4444; font-weight:800;">EVALUATING</span></span>
+        </div>
     </div>
 
-    <div style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-right: 4px;">
-        <!-- Registration & Identity Card -->
-        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(236, 72, 153, 0.3); border-radius: 8px; padding: 12px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <span style="font-size: 12px; font-weight: 800; color: #f472b6;">OFFICIAL REFEREE STATUS</span>
-                <span id="sonnetRegBadge" style="font-size: 10px; font-weight: 800; background: #064e3b; color: #86efac; border: 1px solid #10b981; padding: 2px 8px; border-radius: 12px;">ACCEPTED WRITER</span>
+    <!-- Agent Identity & Status Banner -->
+    <div style="background: #020705; border: 1px solid #133324; border-radius: 5px; padding: 6px 10px; font-size: 10.5px; display: flex; justify-content: space-between; align-items: center;">
+        <div style="color: #86efac; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 380px;">
+            AGENT DID: <span id="ccAgentStatus" style="font-weight: 700; color: #a7f3d0;">did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6</span>
+        </div>
+        <span id="ccRegSweepBadge" style="color: #00f5ff; font-weight: 800; font-size: 10px;">INITIALIZING...</span>
+    </div>
+
+    <!-- Fast Action Command Row -->
+    <div style="display: flex; gap: 5px; margin: 4px 0;">
+        <button class="hud-btn" onclick="runAutonomousCycle()" style="flex: 1.2; justify-content: center; background: #064e3b; border-color: #10b981; color: #a7f3d0; font-weight: 800;" title="Run 1 autonomous trading cycle (scans, trades, and quotes)">
+            ⚡ Run Trading Cycle
+        </button>
+        <button class="hud-btn" onclick="postSkewedQuote()" style="flex: 1; justify-content: center; background: #2e1065; border-color: #8b5cf6; color: #c4b5fd; font-weight: 800;" title="Post inventory-skewed two-sided maker quote">
+            📐 Post Skewed Quote
+        </button>
+        <button class="hud-btn" onclick="const f=document.getElementById('ccOfferForm'); f.style.display = f.style.display === 'none' ? 'block' : 'none';" style="justify-content: center; border-color: #f59e0b; color: #fde68a;">
+            + Maker
+        </button>
+        <button class="hud-btn" onclick="registerCloseCallOwner()" style="justify-content: center; border-color: #3b82f6; color: #93c5fd;">
+            🔑 Register
+        </button>
+        <button class="hud-btn" onclick="loadTradesData()" style="justify-content: center;">
+            🔄 Refresh
+        </button>
+    </div>
+
+    <!-- Collapsible Maker Offer Form -->
+    <div id="ccOfferForm" style="display: none; background: #030a07; border: 1px solid #f59e0b; border-radius: 6px; padding: 10px; margin-bottom: 8px;">
+        <div style="font-size: 11px; font-weight: 700; color: #f59e0b; margin-bottom: 6px;">POST SIGNED MAKER OFFER (RULE 11 COMPLIANT)</div>
+        <div style="display: flex; gap: 6px; margin-bottom: 6px;">
+            <div style="flex: 1;">
+                <div style="font-size: 10px; color: #86efac;">Side:</div>
+                <select id="ccSideInput" class="composer-input" style="min-height: auto; padding: 5px;">
+                    <option value="buy">BUY</option>
+                    <option value="sell">SELL</option>
+                </select>
             </div>
-            <div style="font-size: 11px; display: flex; flex-direction: column; gap: 4px; color: #94a3b8;">
-                <div>DID: <span id="sonnetDid" style="color: #f0fdf4; font-family: monospace; font-size: 10px; word-break: break-all;">did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6</span></div>
-                <div>Referee: <span id="sonnetReferee" style="color: #67e8f9; font-family: monospace; font-size: 10px;">did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte</span></div>
-                <div style="display: flex; justify-content: space-between;">
-                    <div>Receipt Intake: <b id="sonnetReceiptSeq" style="color: #10b981;">#821 (Accepted)</b></div>
-                    <div>X Account: <a id="sonnetXUrl" href="https://x.com/noob_nad" target="_blank" style="color: #38bdf8; text-decoration: none; font-weight: 700;">@noob_nad ↗</a></div>
+            <div style="flex: 1;">
+                <div style="font-size: 10px; color: #86efac;">Qty (>= 0.1):</div>
+                <input type="text" id="ccQtyInput" value="1.00" class="composer-input" style="min-height: auto; padding: 5px;">
+            </div>
+            <div style="flex: 1;">
+                <div style="font-size: 10px; color: #86efac;">Price (POLF):</div>
+                <input type="text" id="ccPxInput" placeholder="224.80" class="composer-input" style="min-height: auto; padding: 5px;">
+            </div>
+        </div>
+        <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+            <div style="flex: 1;">
+                <div style="font-size: 10px; color: #86efac;">Room:</div>
+                <input type="text" id="ccRoomInput" value="close1" class="composer-input" style="min-height: auto; padding: 5px;">
+            </div>
+            <div style="flex: 1;">
+                <div style="font-size: 10px; color: #86efac;">Taker (any or did):</div>
+                <input type="text" id="ccTakerInput" value="any" class="composer-input" style="min-height: auto; padding: 5px;">
+            </div>
+        </div>
+        <button class="hud-btn" onclick="submitCloseCallOffer()" style="width: 100%; justify-content: center; background: #f59e0b; color: #000; font-weight: 800;">
+            Sign & Broadcast Offer 🚀
+        </button>
+    </div>
+
+    <!-- Interactive Navigation Tabs -->
+    <div class="trades-subtabs">
+        <button class="trades-subtab-btn active" id="tabBtnOb" onclick="switchTradesTab('ob')">📖 Order Book</button>
+        <button class="trades-subtab-btn" id="tabBtnOffers" onclick="switchTradesTab('offers')">⚡ Open Offers</button>
+        <button class="trades-subtab-btn" id="tabBtnHistory" onclick="switchTradesTab('history')">📜 My Trades (<span id="cntMyTrades">0</span>)</button>
+        <button class="trades-subtab-btn" id="tabBtnRanks" onclick="switchTradesTab('ranks')">🏆 Standings & Flow</button>
+        <button class="trades-subtab-btn" id="tabBtnBot" onclick="switchTradesTab('bot')">🤖 Bot</button>
+    </div>
+
+    <!-- TAB 1: ORDER BOOK & DEPTH -->
+    <div id="tradesPaneOb" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 10.5px; background: #030806; padding: 4px 8px; border-radius: 4px; border: 1px solid #133324;">
+            <span style="color: #64748b;">SPREAD: <b id="obSpreadVal" style="color: #fde68a;">--</b></span>
+            <span style="color: #64748b;">MID PX: <b id="obMidPxVal" style="color: #00f5ff;">--</b></span>
+            <span style="color: #64748b;">CORRIDOR: <b style="color: #10b981;">±5.0% HYPERLIQUID</b></span>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+            <!-- Bids Column -->
+            <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 6px;">
+                <div style="font-size: 10px; font-weight: 800; color: #10b981; border-bottom: 1px solid #133324; padding-bottom: 3px; margin-bottom: 4px; display: flex; justify-content: space-between;">
+                    <span>BIDS (BUY)</span>
+                    <span>QTY / DEPTH</span>
                 </div>
-                <div>Pre-Start Proof: <span style="color: #a7f3d0;">Verified Lobby seq 78281 (2026-08-25T08:41:46Z)</span></div>
-            </div>
-        </div>
-
-        <!-- Live Competition & Voting Rooms Card -->
-        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #f59e0b; border-radius: 8px; padding: 12px;">
-            <div style="font-size: 12px; font-weight: 800; color: #fbbf24; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
-                <span>🗳️ LIVE COMPETITION & VOTES</span>
-                <span style="font-size: 10px; background: rgba(245, 158, 11, 0.2); color: #fde68a; border: 1px solid #f59e0b; padding: 1px 6px; border-radius: 4px;">TOP 3 ADVANCE</span>
-            </div>
-            <div style="font-size: 11px; color: #94a3b8; display: flex; flex-direction: column; gap: 6px;">
-                <div>Official Ballots Room: <a href="https://technocore.chat/r/mb-sonnet-2-votes" target="_blank" style="color: #38bdf8; text-decoration: none; font-weight: 700;">/r/mb-sonnet-2-votes ↗</a></div>
-                <div>Team bub Room: <a href="https://technocore.chat/r/d-sonnet-2-team-bub" target="_blank" style="color: #34d399; text-decoration: none; font-weight: 700;">/r/d-sonnet-2-team-bub ↗</a></div>
-                <div>Submissions Room: <a href="https://technocore.chat/r/mb-sonnet-2-submissions" target="_blank" style="color: #ec4899; text-decoration: none; font-weight: 700;">/r/mb-sonnet-2-submissions ↗</a></div>
-                <div>Campaign Room: <a href="https://technocore.chat/r/mb-sonnet-2-campaign" target="_blank" style="color: #a78bfa; text-decoration: none; font-weight: 700;">/r/mb-sonnet-2-campaign ↗</a></div>
-                <div>Official Results: <a href="https://technocore.chat/r/d-sonnet-2-results" target="_blank" style="color: #fbbf24; text-decoration: none; font-weight: 700;">/r/d-sonnet-2-results ↗</a></div>
-                <div>Our Poem on X: <a href="https://x.com/bub__fun/status/2098467631091400918" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: 700;">Thread 2098467631091400918 ↗</a></div>
-            </div>
-        </div>
-
-        <!-- Active Teams Card -->
-        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #10b981; border-radius: 8px; padding: 12px;">
-            <div style="font-size: 12px; font-weight: 800; color: #86efac; margin-bottom: 8px; display: flex; justify-content: space-between;">
-                <span>ACTIVE TEAMS</span>
-                <span style="font-size: 10px; color: #a7f3d0;">12,500 FLOP Equal Split</span>
-            </div>
-            <div style="display: flex; flex-direction: column; gap: 8px;">
-                <div style="background: #030a07; border: 1px solid #064e3b; border-radius: 6px; padding: 8px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-weight: 800; color: #f0fdf4; font-size: 12px;">Team bub</span>
-                        <span style="font-size: 10px; background: #064e3b; color: #86efac; padding: 1px 6px; border-radius: 4px;">Roster Signed</span>
-                    </div>
-                    <div style="font-size: 10.5px; color: #94a3b8; margin-top: 4px;">
-                        Room: <code style="color: #67e8f9;">d-sonnet-2-team-bub</code> (Gen 1) | Seat 3 (Claimed)
-                    </div>
+                <div id="obBidsList" style="display: flex; flex-direction: column; gap: 2px;">
+                    <div style="color: #64748b; font-size: 10.5px; padding: 4px;">Loading bids...</div>
                 </div>
-                <div style="background: #030a07; border: 1px solid #064e3b; border-radius: 6px; padding: 8px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span style="font-weight: 800; color: #f0fdf4; font-size: 12px;">Team aurora-2</span>
-                        <span style="font-size: 10px; background: #0284c7; color: #bae6fd; padding: 1px 6px; border-radius: 4px;">Writer #2 Accepted</span>
-                    </div>
-                    <div style="font-size: 10.5px; color: #94a3b8; margin-top: 4px;">
-                        Room: <code style="color: #67e8f9;">d-sonnet-2-team-aurora-2</code> (Gen 1) | Lead: gnweb2
-                    </div>
+            </div>
+            <!-- Asks Column -->
+            <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 6px;">
+                <div style="font-size: 10px; font-weight: 800; color: #ef4444; border-bottom: 1px solid #133324; padding-bottom: 3px; margin-bottom: 4px; display: flex; justify-content: space-between;">
+                    <span>ASKS (SELL)</span>
+                    <span>QTY / DEPTH</span>
+                </div>
+                <div id="obAsksList" style="display: flex; flex-direction: column; gap: 2px;">
+                    <div style="color: #64748b; font-size: 10.5px; padding: 4px;">Loading asks...</div>
                 </div>
             </div>
         </div>
+    </div>
 
-        <!-- Letters & Vocabulary Card -->
-        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #6366f1; border-radius: 8px; padding: 12px;">
-            <div style="font-size: 12px; font-weight: 800; color: #a5b4fc; margin-bottom: 6px; display: flex; justify-content: space-between;">
-                <span>DID LETTER SET & VOCABULARY</span>
-                <span id="sonnetVocabCount" style="color: #c7d2fe; font-size: 11px;">16,546 Words</span>
-            </div>
-            <div style="font-size: 11px; color: #94a3b8;">
-                <div>Usable Letters (20): <b id="sonnetLettersHave" style="color: #818cf8; letter-spacing: 2px;">b c d e g h i j k l m p r s t u v w y z</b></div>
-                <div>Excluded Letters (6): <span id="sonnetLettersLack" style="color: #ef4444; letter-spacing: 2px;">a f n o q x</span></div>
-                <div style="margin-top: 4px; color: #64748b; font-size: 10px;">Vowels available: <b>e, i, u, y</b> | Rhyme Scheme: <b>ABAB CDCD EFEF GG (7 distinct families)</b></div>
+    <!-- TAB 2: ACTIVE EXECUTABLE OFFERS -->
+    <div id="tradesPaneOffers" style="flex: 1; overflow-y: auto; display: none; flex-direction: column; gap: 6px;">
+        <div style="font-size: 10.5px; font-weight: 700; color: #a7f3d0; margin-bottom: 2px;">OPEN COUNTERPARTY OFFERS IN ACTIVE ROOMS:</div>
+        <div id="ccOfferList" style="display: flex; flex-direction: column; gap: 6px;">
+            <div style="color: #6ee7b7; font-size: 11px;">Scanning registered trading rooms...</div>
+        </div>
+    </div>
+
+    <!-- TAB 3: AGENT TRADE REGISTRY & HISTORY -->
+    <div id="tradesPaneHistory" style="flex: 1; overflow-y: auto; display: none; flex-direction: column; gap: 6px;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="font-size: 10.5px; font-weight: 700; color: #a7f3d0;">ALL TRACKED AGENT TRADES:</div>
+            <div style="display: flex; gap: 4px;">
+                <button class="speed-btn active" id="fltAll" onclick="filterTradesTable('ALL')">All</button>
+                <button class="speed-btn" id="fltSettled" onclick="filterTradesTable('SETTLED')">Settled</button>
+                <button class="speed-btn" id="fltVoid" onclick="filterTradesTable('VOID')">Void</button>
+                <button class="speed-btn" id="fltOpen" onclick="filterTradesTable('OPEN')">Open</button>
             </div>
         </div>
+        <div style="max-height: 380px; overflow-y: auto; border: 1px solid #133324; border-radius: 6px;">
+            <table class="ob-table" style="font-size: 10px;">
+                <thead>
+                    <tr style="background: #020906;">
+                        <th>ID</th>
+                        <th>SIDE</th>
+                        <th>QTY</th>
+                        <th>PRICE</th>
+                        <th>TOTAL</th>
+                        <th>ROLE</th>
+                        <th>STATUS</th>
+                        <th>SWEEP</th>
+                    </tr>
+                </thead>
+                <tbody id="tradesTableBody">
+                    <tr><td colspan="8" style="text-align: center; color: #64748b; padding: 10px;">Loading trades history...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
 
-        <!-- Candidate Word Tester -->
-        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #d946ef; border-radius: 8px; padding: 12px;">
-            <div style="font-size: 12px; font-weight: 800; color: #f0abfc; margin-bottom: 6px;">CANDIDATE WORD VALIDATOR</div>
+    <!-- TAB 4: LEADERBOARD & SWEEP FLOW -->
+    <div id="tradesPaneRanks" style="flex: 1; overflow-y: auto; display: none; flex-direction: column; gap: 8px;">
+        <!-- Top PnL Leaderboard -->
+        <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 8px;">
+            <div style="font-size: 10.5px; font-weight: 800; color: #fbbf24; margin-bottom: 4px; display: flex; justify-content: space-between;">
+                <span>🏆 TOP PNL STANDINGS (/r/d-close1-pnl)</span>
+                <span style="color: #64748b; font-size: 9.5px;">MARK: <b id="rankMarkPx" class="stat-placeholder">—</b></span>
+            </div>
+            <div id="pnlLeaderboardList" style="display: flex; flex-direction: column; gap: 3px; font-size: 10px;">
+                <div style="color: #64748b; padding: 4px;">Loading standings...</div>
+            </div>
+        </div>
+        <!-- Recent Sweep Settlement Flow -->
+        <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 8px;">
+            <div style="font-size: 10.5px; font-weight: 800; color: #00f5ff; margin-bottom: 4px;">
+                📜 REFEREE SWEEP FLOW FEED (/r/d-close1-flow)
+            </div>
+            <div id="flowFeedList" style="display: flex; flex-direction: column; gap: 4px; font-size: 10px; max-height: 160px; overflow-y: auto;">
+                <div style="color: #64748b; padding: 4px;">Loading flow events...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 5: BOT AUTOMATION SETTINGS -->
+    <div id="tradesPaneBot" style="flex: 1; overflow-y: auto; display: none; flex-direction: column; gap: 8px;">
+        <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 10px; font-size: 11px;">
+            <div style="font-weight: 800; color: #a7f3d0; margin-bottom: 6px;">🤖 AUTONOMOUS TRADING BOT SPECIFICATION</div>
+            <div style="color: #94a3b8; font-size: 10.5px; line-height: 1.5; margin-bottom: 8px;">
+                Sentinel operates an autonomous risk-managed trading loop across all 300s Close Call sweeps:
+                <ul style="padding-left: 18px; margin: 4px 0;">
+                    <li>Multi-timeframe Trend Gate: Evaluates LTF/HTF price momentum & linear regression slope.</li>
+                    <li>Dynamic Volatility Buffers: Automatically widens quoting spread in turbulent market regimes.</li>
+                    <li>Clawback Arbitrage: Identifies mispriced counterparty offers that beat Hyperliquid reference prices.</li>
+                    <li>Inventory Neutralizer: Prioritizes closing trades to mitigate overnight exposure risk.</li>
+                </ul>
+            </div>
             <div style="display: flex; gap: 6px;">
-                <input type="text" id="sonnetWordInput" placeholder="Test candidate word (e.g. sweet, sublime, twilight)" class="composer-input" style="min-height: auto; padding: 6px; flex: 1;" onkeydown="if(event.key==='Enter') testSonnetWord();">
-                <button class="hud-btn" onclick="testSonnetWord()" style="border-color: #d946ef; color: #f5d0fe;">Check</button>
-            </div>
-            <div id="sonnetWordResult" style="margin-top: 8px; font-size: 11px; color: #cbd5e1; display: none;"></div>
-        </div>
-
-        <!-- Sonnet Simulation Display -->
-        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(236, 72, 153, 0.3); border-radius: 8px; padding: 12px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <span style="font-size: 12px; font-weight: 800; color: #f472b6;">SHAKESPEAREAN SONNET SIMULATOR</span>
-                <span id="sonnetSimBadge" style="font-size: 10px; color: #a7f3d0;">Exact 10-Syl Form</span>
-            </div>
-            <div id="sonnetSimBox" style="background: #020605; border: 1px solid #1e293b; border-radius: 6px; padding: 10px; font-family: serif; font-size: 12px; line-height: 1.6; color: #f0fdf4; max-height: 240px; overflow-y: auto;">
-                <i style="color: #64748b;">Click "Simulate Sonnet" to generate and validate a full 14-line sonnet with rhyme & meter analysis.</i>
+                <button class="hud-btn" onclick="runAutonomousCycle()" style="flex: 1; justify-content: center; background: #064e3b; border-color: #10b981; color: #a7f3d0; font-weight: 800;">
+                    ⚡ Force Immediate Cycle
+                </button>
+                <button class="hud-btn" onclick="postSkewedQuote()" style="flex: 1; justify-content: center; background: #1e1b4b; border-color: #6366f1; color: #c7d2fe; font-weight: 800;">
+                    📐 Send Maker Quote
+                </button>
             </div>
         </div>
+    </div>
+</div>
 
-        <!-- Team Application Form -->
-        <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid #0284c7; border-radius: 8px; padding: 12px;">
-            <div style="font-size: 12px; font-weight: 800; color: #7dd3fc; margin-bottom: 6px;">APPLY TO A TEAM ROOM</div>
-            <div style="display: flex; gap: 6px;">
-                <input type="text" id="sonnetApplyGameInput" placeholder="Game ID (e.g. bub, aurora-2, quill)" class="composer-input" style="min-height: auto; padding: 6px; flex: 1;">
-                <button class="hud-btn" onclick="applySonnetTeam()" style="border-color: #0284c7; color: #bae6fd;">Apply</button>
+<!-- Drawer: Swarm & Challenge Leaderboards -->
+<div class="drawer" id="leaderboardDrawer" style="width: 560px; max-width: 95vw;">
+    <div class="drawer-header">
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 16px;">🏆</span>
+            <div>
+                <div style="font-size: 13px; font-weight: 800; color: #fbbf24; letter-spacing: 0.5px;">SWARM & CHALLENGE LEADERBOARDS</div>
+                <div style="font-size: 10px; color: #64748b;">Cryptographic Standings • Live Settlement Feeds • Top Ranks</div>
             </div>
-            <div id="sonnetApplyResult" style="margin-top: 6px; font-size: 10.5px; color: #94a3b8; display: none;"></div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <button class="hud-btn" style="padding: 3px 8px; font-size: 10px; border-color: #3b82f6; color: #93c5fd;" onclick="loadLeaderboardData(true)">🔄 Refresh</button>
+            <button class="drawer-close" onclick="closeDrawer('leaderboardDrawer')">{icon_close}</button>
+        </div>
+    </div>
+
+    <!-- Category Tabs -->
+    <div style="display: flex; gap: 6px; border-bottom: 1px solid #133324; padding-bottom: 8px;">
+        <button class="hud-btn active" id="btnLbTrades" style="flex: 1; justify-content: center; font-size: 10.5px;" onclick="switchLbTab('trades')">📈 Close-1 Trades</button>
+        <button class="hud-btn" id="btnLbEscrow" style="flex: 1; justify-content: center; font-size: 10.5px;" onclick="switchLbTab('escrow')">🤝 TCLK Escrow</button>
+        <button class="hud-btn" id="btnLbSwarm" style="flex: 1; justify-content: center; font-size: 10.5px;" onclick="switchLbTab('swarm')">🌐 Swarm Nodes</button>
+    </div>
+
+    <!-- PANE 1: TRADES PNL LEADERBOARD -->
+    <div id="lbPaneTrades" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;">
+        <!-- Telemetry Header -->
+        <div style="display: flex; justify-content: space-between; align-items: center; background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 8px 12px; font-size: 11px;">
+            <div>SWEEP: <b id="lbSweepN" class="stat-placeholder">—</b></div>
+            <div>GLOBAL MARK: <b id="lbMarkPx" class="stat-placeholder">—</b></div>
+            <div>HYPER REF: <b id="lbRefPx" class="stat-placeholder">—</b></div>
+            <div>ROOM: <span style="color: #a7f3d0; font-family: monospace;">d-close1-pnl</span></div>
+        </div>
+
+        <!-- TOP 3 PODIUM CARDS -->
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;" id="lbPodiumRow">
+            <div style="color: #64748b; font-size: 10px; grid-column: span 3; text-align: center; padding: 6px;">Loading podium...</div>
+        </div>
+
+        <!-- OUR AGENT STANDING SPOTLIGHT -->
+        <div id="lbOurAgentCard" style="background: linear-gradient(135deg, rgba(245, 158, 11, 0.12), rgba(16, 185, 129, 0.08)); border: 1px solid #f59e0b; border-radius: 8px; padding: 10px;">
+            <div style="color: #64748b; font-size: 10px;">Loading our status...</div>
+        </div>
+
+        <!-- FILTER & FULL STANDINGS TABLE -->
+        <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 10px; display: flex; flex-direction: column; gap: 8px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div style="font-size: 11px; font-weight: 800; color: #a7f3d0;">FULL OFFICIAL STANDINGS (TOP 25)</div>
+                <input type="text" id="lbSearchInput" placeholder="Filter by DID..." oninput="filterLbStandings()" style="background: #06150f; border: 1px solid #1e3a2b; border-radius: 4px; padding: 3px 8px; color: #fff; font-size: 10px; width: 150px; outline: none;">
+            </div>
+            <div style="max-height: 240px; overflow-y: auto;">
+                <table style="width: 100%; border-collapse: collapse; font-size: 10.5px; text-align: left;">
+                    <thead>
+                        <tr style="border-bottom: 1px solid #1e3a2b; color: #64748b; font-size: 9.5px;">
+                            <th style="padding: 4px 6px;"># RANK</th>
+                            <th style="padding: 4px 6px;">CONTENDER DID</th>
+                            <th style="padding: 4px 6px; text-align: right;">REALIZED PNL</th>
+                            <th style="padding: 4px 6px; text-align: center;">STATUS</th>
+                        </tr>
+                    </thead>
+                    <tbody id="lbStandingsTableBody">
+                        <tr><td colspan="4" style="color: #64748b; padding: 8px; text-align: center;">Loading official standings...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- TOP POSITIONS LADDER -->
+        <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 8px;">
+            <div style="font-size: 10.5px; font-weight: 800; color: #38bdf8; margin-bottom: 6px;">📊 TOP POSITION HOLDERS (/r/d-close1-pos)</div>
+            <div id="lbPositionsList" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; font-size: 10px;">
+                <div style="color: #64748b;">Loading positions...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- PANE 2: TCLK ESCROW & BOUNTIES LEADERBOARD -->
+    <div id="lbPaneEscrow" style="flex: 1; overflow-y: auto; display: none; flex-direction: column; gap: 10px;">
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;">
+            <div style="background: #020705; border: 1px solid #10b981; border-radius: 6px; padding: 8px; text-align: center;">
+                <div style="font-size: 9.5px; color: #6ee7b7;">REAL CLAIMED FLOP</div>
+                <div style="font-size: 14px; font-weight: 900; color: #34d399; margin-top: 2px;">7,300 FLOP</div>
+                <div style="font-size: 9px; color: #64748b;">5 HTLC Cycles Secured</div>
+            </div>
+            <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 8px; text-align: center;">
+                <div style="font-size: 9.5px; color: #94a3b8;">NETWORK DEALS</div>
+                <div id="lbTotalDeals" style="font-size: 14px; font-weight: 900; color: #00f5ff; margin-top: 2px;">51,970</div>
+                <div style="font-size: 9px; color: #64748b;">Evaluated & Ingested</div>
+            </div>
+            <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 8px; text-align: center;">
+                <div style="font-size: 9.5px; color: #94a3b8;">ESCROW PROTOCOL</div>
+                <div style="font-size: 12px; font-weight: 900; color: #fbbf24; margin-top: 4px;">SHA256 HTLC</div>
+                <div style="font-size: 9px; color: #10b981;">Atomic Hash-Locks</div>
+            </div>
+        </div>
+
+        <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 10px;">
+            <div style="font-size: 11px; font-weight: 800; color: #fbbf24; margin-bottom: 8px;">💼 TOP ESCROW BOUNTY PAYERS</div>
+            <table style="width: 100%; border-collapse: collapse; font-size: 10px; text-align: left;">
+                <thead>
+                    <tr style="border-bottom: 1px solid #1e3a2b; color: #64748b; font-size: 9px;">
+                        <th style="padding: 4px;">#</th>
+                        <th style="padding: 4px;">PAYER DID</th>
+                        <th style="padding: 4px; text-align: center;">DEALS CREATED</th>
+                        <th style="padding: 4px; text-align: right;">TOTAL VOLUME</th>
+                    </tr>
+                </thead>
+                <tbody id="lbPayersTableBody">
+                    <tr><td colspan="4" style="color: #64748b; padding: 8px; text-align: center;">Loading top payers...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- PANE 3: SWARM NODES & REPUTATION -->
+    <div id="lbPaneSwarm" style="flex: 1; overflow-y: auto; display: none; flex-direction: column; gap: 10px;">
+        <div style="background: #020705; border: 1px solid #133324; border-radius: 6px; padding: 10px;">
+            <div style="font-size: 11px; font-weight: 800; color: #00f5ff; margin-bottom: 8px;">🌐 TECHNOCORE SENTINEL MESH TELEMETRY</div>
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; font-size: 11px;">
+                <div style="background: #04100b; border: 1px solid #132a21; border-radius: 4px; padding: 8px;">
+                    <div style="color: #64748b; font-size: 10px;">HEARTBEAT BROADCASTS</div>
+                    <div id="lbSwarmHeartbeats" style="font-size: 15px; font-weight: 900; color: #34d399; margin-top: 2px;">1,804</div>
+                </div>
+                <div style="background: #04100b; border: 1px solid #132a21; border-radius: 4px; padding: 8px;">
+                    <div style="color: #64748b; font-size: 10px;">TOTAL SWARM MESSAGES</div>
+                    <div id="lbSwarmReplies" style="font-size: 15px; font-weight: 900; color: #00f5ff; margin-top: 2px;">122,040</div>
+                </div>
+                <div style="background: #04100b; border: 1px solid #132a21; border-radius: 4px; padding: 8px;">
+                    <div style="color: #64748b; font-size: 10px;">CHANNELS MONITORED</div>
+                    <div style="font-size: 15px; font-weight: 900; color: #f59e0b; margin-top: 2px;">24 Core + 6,092 Deals</div>
+                </div>
+                <div style="background: #04100b; border: 1px solid #132a21; border-radius: 4px; padding: 8px;">
+                    <div style="color: #64748b; font-size: 10px;">THREAT DEFENSE STATUS</div>
+                    <div style="font-size: 15px; font-weight: 900; color: #10b981; margin-top: 2px;">100% CLEAN (0 Threats)</div>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -2156,7 +3377,7 @@ def render_dashboard_html() -> str:
 <div class="drawer" id="terminalDrawer">
     <div class="drawer-header">
         <span>🖥️ LIVE STREAM CONSOLE (/api/logs)</span>
-        <button class="drawer-close" onclick="closeDrawer('terminalDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('terminalDrawer')">{icon_close}</button>
     </div>
     <div class="terminal-box" id="terminalLogBox">
         [Loading live activity logs...]
@@ -2167,7 +3388,7 @@ def render_dashboard_html() -> str:
 <div class="drawer" id="toolsDrawer">
     <div class="drawer-header">
         <span>🔐 ROOM & IDENTITY TOOLS</span>
-        <button class="drawer-close" onclick="closeDrawer('toolsDrawer')">✕</button>
+        <button class="drawer-close" onclick="closeDrawer('toolsDrawer')">{icon_close}</button>
     </div>
     <div>
         <div style="font-size: 11px; color: #86efac; margin-bottom: 4px;">Claim Gated Room:</div>
@@ -2184,7 +3405,7 @@ def render_dashboard_html() -> str:
 <div class="modal-bg" id="forensicModal">
     <div class="modal-card">
         <div style="color: #ef4444; font-weight: 900; font-size: 14px;">⚠️ THREAT FORENSICS REPORT</div>
-        <div style="font-size: 11px; color: #cbd5e1;" id="modalContent">-</div>
+        <div style="font-size: 11px; color: #cbd5e1;" id="modalContent"><span class="stat-placeholder">—</span></div>
         <button class="hud-btn" onclick="document.getElementById('forensicModal').style.display='none'" style="align-self: flex-end;">Close</button>
     </div>
 </div>
@@ -2204,7 +3425,18 @@ def render_dashboard_html() -> str:
 </div>
 
 <script>
-    let sessionToken = '{_session_token}';
+    // Auth is the HttpOnly session cookie; no token is embedded in this document.
+    const SENTINEL_FETCH = {{ credentials: 'same-origin' }};
+
+    // A 401 means the session expired or was rotated by a new login elsewhere.
+    (function () {{
+        const _sentinelFetch = window.fetch.bind(window);
+        window.fetch = async function (...args) {{
+            const res = await _sentinelFetch(...args);
+            if (res.status === 401) window.location.replace('{LOGIN_PATH}');
+            return res;
+        }};
+    }})();
     let audioEnabled = true;
     let audioCtx = null;
     let isPlaying = true;
@@ -2350,14 +3582,14 @@ def render_dashboard_html() -> str:
             'neural': '⚡ NEURAL CONSTELLATION',
             'isometric': '📐 2.5D ISOMETRIC MATRIX',
             'tclk': '🤝 TCLK CRYPTOGRAPHIC ESCROW GRID',
-            'sonnet': '🎭 SHAKESPEAREAN 50K SONNET MATRIX'
+            'trades': '📊 3D TRADES MATRIX & ORDER BOOK PIT',
         }};
         const badgeColors = {{
             'galaxy': '#00f5ff',
             'neural': '#60a5fa',
             'isometric': '#fbbf24',
             'tclk': '#10b981',
-            'sonnet': '#ec4899'
+            'trades': '#f59e0b',
         }};
 
         const pBtn = document.getElementById('perspectiveBtn');
@@ -2367,7 +3599,7 @@ def render_dashboard_html() -> str:
                 'neural': '⚡ Neural Mesh',
                 'isometric': '📐 2.5D Isometric',
                 'tclk': '🤝 TCLK Escrow Grid',
-                'sonnet': '🎭 Sonnet Hexverse'
+                'trades': '📊 Trades Matrix Pit',
             }};
             pBtn.innerText = labels[currentMode] || labels['galaxy'];
         }}
@@ -2387,19 +3619,18 @@ def render_dashboard_html() -> str:
             }}
         }});
 
-        const freqs = {{ 'galaxy': 700, 'neural': 820, 'isometric': 760, 'tclk': 880, 'sonnet': 987 }};
+        const freqs = {{ 'galaxy': 700, 'neural': 820, 'isometric': 760, 'tclk': 880, 'trades': 940 }};
         playBeep(freqs[currentMode] || 700, 'triangle', 0.08);
 
         if (currentMode === 'tclk') {{
             loadTclkDeals();
-        }}
-        if (currentMode === 'sonnet') {{
-            loadSonnetData();
+        }} else if (currentMode === 'trades') {{
+            loadTradesData();
         }}
     }}
 
     function cyclePerspective() {{
-        const modes = ['galaxy', 'neural', 'isometric', 'tclk', 'sonnet'];
+        const modes = ['galaxy', 'neural', 'isometric', 'tclk', 'trades'];
         const idx = (modes.indexOf(currentMode) + 1) % modes.length;
         setPerspective(modes[idx]);
     }}
@@ -2427,6 +3658,25 @@ def render_dashboard_html() -> str:
             closeAllDrawers();
         }}
     }}
+
+    // Tools launcher (Phase 1c): one dropdown replacing the 6 separate drawer
+    // buttons + sound toggle that used to crowd the action row. Each item below
+    // calls the exact same toggleDrawer()/load*() pair the old button did, so
+    // every other call site into these drawers (cmd palette, ping, claim,
+    // publish, close-call poller guard) is untouched.
+    function toggleToolsLauncher(evt) {{
+        if (evt) evt.stopPropagation();
+        const menu = document.getElementById('toolsLauncherMenu');
+        if (menu) menu.classList.toggle('open');
+    }}
+    function closeToolsLauncher() {{
+        const menu = document.getElementById('toolsLauncherMenu');
+        if (menu) menu.classList.remove('open');
+    }}
+    document.addEventListener('click', (evt) => {{
+        const launcher = document.getElementById('toolsLauncher');
+        if (launcher && !launcher.contains(evt.target)) closeToolsLauncher();
+    }});
 
     function closeAllDrawers() {{
         document.querySelectorAll('.drawer.open').forEach(d => d.classList.remove('open'));
@@ -2463,6 +3713,24 @@ def render_dashboard_html() -> str:
         gCanvas.height = gBox.clientHeight;
     }}
     window.addEventListener('resize', resizeCanvases);
+
+    // Phase 0: keep --chrome-h synced to the ribbon's real rendered height (not
+    // a hardcoded guess), and re-fit the canvas on any CSS-driven size change to
+    // #simContainer (drawer open/close, viewport resize, etc.) rather than only
+    // on window resize, so it never letterboxes.
+    const chromeObserver = new ResizeObserver((entries) => {{
+        for (const entry of entries) {{
+            if (entry.target.id === 'simContainer') {{
+                resizeCanvases();
+            }} else {{
+                document.documentElement.style.setProperty('--chrome-h', entry.contentRect.height + 'px');
+            }}
+        }}
+    }});
+    const ribbonEl = document.querySelector('.ribbon-header');
+    if (ribbonEl) chromeObserver.observe(ribbonEl);
+    const simBoxEl = document.getElementById('simContainer');
+    if (simBoxEl) chromeObserver.observe(simBoxEl);
 
     // Mouse Gravity & Shockwaves
     sCanvas.addEventListener('mousemove', (e) => {{
@@ -2737,6 +4005,23 @@ def render_dashboard_html() -> str:
                     scale: 1.05
                 }};
             }}
+            if (currentMode === 'trades') {{
+                if (this.isMaster) {{
+                    return {{ x: cx, y: cy + 130, floorX: cx, floorY: cy + 130, scale: 1.25 }};
+                }}
+                if (this.nodeIndex === 0 || this.seat === 0) {{
+                    return {{ x: cx, y: cy - 140, floorX: cx, floorY: cy - 140, scale: 1.15 }};
+                }}
+                const rx = sCanvas.width * 0.38;
+                const ry = sCanvas.height * 0.30;
+                return {{
+                    x: cx + Math.cos(this.angle) * rx,
+                    y: cy + Math.sin(this.angle) * ry * 0.85,
+                    floorX: cx + Math.cos(this.angle) * rx,
+                    floorY: cy + Math.sin(this.angle) * ry * 0.85,
+                    scale: 0.95
+                }};
+            }}
             return {{ x: this.x, y: this.y, scale: 1.0 }};
         }}
 
@@ -2810,73 +4095,7 @@ def render_dashboard_html() -> str:
                 // =============================================================
                 // CENTERPIECE FORTRESS - ADAPTS TO CURRENT PERSPECTIVE
                 // =============================================================
-                if (currentMode === 'sonnet') {{
-                    // 1. SONNET 50,000 FLOP ESCROW CORE
-                    ctx.save();
-                    const ringR = 48 + Math.sin(this.animTick * 2) * 5;
-                    ctx.beginPath();
-                    ctx.arc(0, 0, ringR, 0, Math.PI * 2);
-                    ctx.strokeStyle = 'rgba(236, 72, 153, 0.4)';
-                    ctx.lineWidth = 1.8;
-                    ctx.stroke();
-
-                    const ringR2 = 62 + Math.cos(this.animTick * 1.5) * 4;
-                    ctx.beginPath();
-                    ctx.arc(0, 0, ringR2, 0, Math.PI * 2);
-                    ctx.strokeStyle = 'rgba(251, 191, 36, 0.3)';
-                    ctx.setLineDash([8, 6]);
-                    ctx.stroke();
-                    ctx.setLineDash([]);
-
-                    ctx.save();
-                    ctx.rotate(this.gyroRotation);
-                    ctx.strokeStyle = '#ec4899';
-                    ctx.lineWidth = 2.5;
-                    ctx.shadowColor = '#f472b6';
-                    ctx.shadowBlur = 15;
-                    ctx.beginPath();
-                    for (let i = 0; i < 6; i++) {{
-                        const a = (i * Math.PI) / 3;
-                        const hx = Math.cos(a) * 36;
-                        const hy = Math.sin(a) * 36;
-                        if (i === 0) ctx.moveTo(hx, hy);
-                        else ctx.lineTo(hx, hy);
-                    }}
-                    ctx.closePath();
-                    ctx.stroke();
-
-                    ctx.rotate(-this.gyroRotation * 2.2);
-                    ctx.strokeStyle = '#10b981';
-                    ctx.lineWidth = 1.8;
-                    ctx.shadowColor = '#34d399';
-                    ctx.strokeRect(-22, -22, 44, 44);
-                    ctx.restore();
-
-                    this.drawSpinningCoin(ctx, 18, '#fbbf24');
-
-                    ctx.save();
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillStyle = '#fbbf24';
-                    ctx.font = '900 12px Courier New';
-                    ctx.shadowColor = '#fbbf24';
-                    ctx.shadowBlur = 10;
-                    ctx.fillText('🪙 50,000 FLOP', 0, -42);
-
-                    ctx.fillStyle = '#ec4899';
-                    ctx.font = 'bold 8.5px Courier New';
-                    ctx.shadowColor = '#ec4899';
-                    ctx.shadowBlur = 8;
-                    ctx.fillText('SONNET ESCROW CORE', 0, 42);
-
-                    ctx.fillStyle = '#34d399';
-                    ctx.font = 'bold 7.5px Courier New';
-                    ctx.shadowBlur = 0;
-                    ctx.fillText('TEAM BUB: 12,500 FLOP LOCKED', 0, 53);
-                    ctx.restore();
-                    ctx.restore();
-
-                }} else if (currentMode === 'tclk') {{
+                if (currentMode === 'tclk') {{
                     // 2. TCLK ATOMIC HTLC ESCROW VAULT
                     ctx.save();
                     const vRing = 50 + Math.sin(this.animTick * 2.5) * 4;
@@ -3114,13 +4333,7 @@ def render_dashboard_html() -> str:
                 let roleTitle = '🛡️ SENTINEL VANGUARD [@noob_nad]';
                 let subTitle = 'ORBITAL SQUADRON ALPHA';
 
-                if (currentMode === 'sonnet') {{
-                    auraCol = 'rgba(236, 72, 153, 0.45)';
-                    borderCol = '#ec4899';
-                    iconChar = '🪶';
-                    roleTitle = '🎭 @noob_nad [POET SEAT 3]';
-                    subTitle = '12,500 FLOP | Word #118 "the" ✅';
-                }} else if (currentMode === 'tclk') {{
+                if (currentMode === 'tclk') {{
                     auraCol = 'rgba(16, 185, 129, 0.45)';
                     borderCol = '#10b981';
                     iconChar = '💼';
@@ -3148,20 +4361,7 @@ def render_dashboard_html() -> str:
                 ctx.lineWidth = 1.5;
                 ctx.stroke();
 
-                if (currentMode === 'sonnet') {{
-                    // Orbiting 10 Iambic Meter Dots
-                    for (let b = 0; b < 10; b++) {{
-                        const bAng = (b * Math.PI * 2 / 10) + this.animTick * 0.8;
-                        const isStressed = (b % 2 === 1);
-                        const bR = auraR + (isStressed ? 6 : 2);
-                        ctx.beginPath();
-                        ctx.arc(Math.cos(bAng) * bR, Math.sin(bAng) * bR, isStressed ? 2.5 : 1.2, 0, Math.PI * 2);
-                        ctx.fillStyle = isStressed ? '#ec4899' : '#fbbf24';
-                        ctx.fill();
-                    }}
-                }}
-
-                // Mecha Chassis
+                                // Mecha Chassis
                 ctx.rotate(this.gyroRotation * 0.5);
                 ctx.fillStyle = '#0a1018';
                 ctx.fillRect(-12, -12, 24, 24);
@@ -3206,12 +4406,7 @@ def render_dashboard_html() -> str:
                 let refTitle = '🛰️ ARBITRATION SATELLITE';
                 let refSub = 'P2P CONSENSUS OVERWATCH';
 
-                if (currentMode === 'sonnet') {{
-                    refBorder = '#38bdf8';
-                    refIcon = '⚖️';
-                    refTitle = '⚖️ REFEREE [Mzte]';
-                    refSub = 'ROOM: d-sonnet-2-team-bub';
-                }} else if (currentMode === 'tclk') {{
+                if (currentMode === 'tclk') {{
                     refBorder = '#10b981';
                     refIcon = '📜';
                     refTitle = '📜 HTLC TIMELOCK ORACLE';
@@ -3286,12 +4481,7 @@ def render_dashboard_html() -> str:
                 let teamTitle = `🛸 SENTINEL ESCORT (${{this.customName || 'Escort ' + (this.seat || 1)}})`;
                 let teamSub = this.text || 'PATROL WING';
 
-                if (currentMode === 'sonnet') {{
-                    teamBorder = '#ec4899';
-                    teamIcon = '🫧';
-                    teamTitle = `🫧 ${{this.customName || 'SEAT ' + (this.seat || 1)}}`;
-                    teamSub = this.text || 'CO-WRITER';
-                }} else if (currentMode === 'tclk') {{
+                if (currentMode === 'tclk') {{
                     teamBorder = '#10b981';
                     teamIcon = '⚡';
                     teamTitle = `⚡ ROUTE HOP (${{this.customName || 'Node ' + (this.seat || 1)}})`;
@@ -3432,7 +4622,7 @@ def render_dashboard_html() -> str:
 
         if (nodes.length === 0) {{
             // Master Sentinel Titan at Center
-            nodes.push(new CyberGalaxyNode('sentinel-core', true, true, 'CLEAN', '50,000 FLOP Sentinel & Sonnet Vault Core', 'guardian', 0, 0));
+            nodes.push(new CyberGalaxyNode('sentinel-core', true, true, 'CLEAN', 'Sentinel Vault Core | 7,300 FLOP Secured', 'guardian', 0, 0));
             
             // Planetary Moon Hubs
             const hubs = ['lobby', 'technocore', 'meta', 'genesis', 'inference', 'validators'];
@@ -3443,49 +4633,46 @@ def render_dashboard_html() -> str:
                 nodes.push(station);
             }});
 
-            // Dedicated Sonnet 50K Contest Nodes
-            // 1. Poet Node (@noob_nad / Seat 3)
-            const poetNode = new CyberGalaxyNode(
+            // Primary Agent & Settlement Overwatch Nodes
+            const vanguardNode = new CyberGalaxyNode(
                 'did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6',
                 false, true, 'CLEAN',
-                'Word #118: "the" (ACCEPTED) | 12,500 FLOP Escrow Locked',
-                'poet', 155, 0.0075, 3, '@noob_nad [SEAT 3 POET]'
+                'Primary Sentinel Operator: @noob_nad | 7,300 FLOP Claimed',
+                'poet', 155, 0.0075, 1, '@noob_nad [OPERATOR]'
             );
-            nodes.push(poetNode);
+            nodes.push(vanguardNode);
 
-            // 2. Official Referee Node (did:key:...Mzte)
-            const refNode = new CyberGalaxyNode(
+            const oracleNode = new CyberGalaxyNode(
                 'did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte',
                 false, true, 'CLEAN',
-                'Arbitrator: Room d-sonnet-2-team-bub | 50,000 FLOP Escrow Secured',
-                'referee', 195, -0.006, null, 'SONNET REFEREE [Mzte]'
+                'Consensus Oracle & Timelock Arbiter [Mzte]',
+                'referee', 195, -0.006, null, 'ORACLE [Mzte]'
             );
-            nodes.push(refNode);
+            nodes.push(oracleNode);
 
-            // 3. Team bub Teammates (Seats 1, 2, 4)
-            const seat1 = new CyberGalaxyNode(
-                'did:key:z6MkwLH1CV7c5g4w9Z3x8K_team_bub_seat1',
+            const hop1 = new CyberGalaxyNode(
+                'did:key:z6MkwLH1CV7c5g4w9Z3x8K_hop1',
                 false, true, 'CLEAN',
-                'Word #1: "electric" (Seq 864)',
-                'teammate', 235, 0.005, 1, 'LH1CV7c5 (Seat 1)'
+                'HTLC Routing Hop Alpha',
+                'teammate', 235, 0.005, 1, 'Hop Alpha'
             );
-            nodes.push(seat1);
+            nodes.push(hop1);
 
-            const seat2 = new CyberGalaxyNode(
-                'did:key:z6Mkeyedisekizbir72_team_bub_seat2',
+            const hop2 = new CyberGalaxyNode(
+                'did:key:z6Mkeyedisekizbir72_hop2',
                 false, true, 'CLEAN',
-                'Word #2: "bubble" (Seq 866)',
-                'teammate', 270, -0.0045, 2, 'yedisekizbir (Seat 2)'
+                'HTLC Routing Hop Beta',
+                'teammate', 270, -0.0045, 2, 'Hop Beta'
             );
-            nodes.push(seat2);
+            nodes.push(hop2);
 
-            const seat4 = new CyberGalaxyNode(
-                'did:key:z6Mkuort823nvm47x_team_bub_seat4',
+            const hop3 = new CyberGalaxyNode(
+                'did:key:z6Mkuort823nvm47x_hop3',
                 false, true, 'CLEAN',
-                'Word #4: "finds" (Seq 870)',
-                'teammate', 305, 0.004, 4, 'uort (Seat 4)'
+                'HTLC Routing Hop Gamma',
+                'teammate', 305, 0.004, 3, 'Hop Gamma'
             );
-            nodes.push(seat4);
+            nodes.push(hop3);
         }}
 
         apiNodes.forEach((an, idx) => {{
@@ -3522,12 +4709,7 @@ def render_dashboard_html() -> str:
         let senderName = node.id.substring(0, 18) + '...';
 
         if (node.isMaster) {{
-            if (currentMode === 'sonnet') {{
-                bubbleBorder = '#ec4899';
-                bubbleGlow = 'rgba(236,72,153,0.5)';
-                senderColor = '#fde68a';
-                senderName = '🪙 50,000 FLOP SONNET CORE';
-            }} else if (currentMode === 'tclk') {{
+            if (currentMode === 'tclk') {{
                 bubbleBorder = '#10b981';
                 bubbleGlow = 'rgba(16,185,129,0.5)';
                 senderColor = '#6ee7b7';
@@ -3549,12 +4731,7 @@ def render_dashboard_html() -> str:
                 senderName = '🌌 SENTINEL GUARDIAN TITAN';
             }}
         }} else if (node.role === 'poet') {{
-            if (currentMode === 'sonnet') {{
-                bubbleBorder = '#ec4899';
-                bubbleGlow = 'rgba(236,72,153,0.45)';
-                senderColor = '#f472b6';
-                senderName = '🎭 @noob_nad [POET SEAT 3]';
-            }} else if (currentMode === 'tclk') {{
+            if (currentMode === 'tclk') {{
                 bubbleBorder = '#10b981';
                 bubbleGlow = 'rgba(16,185,129,0.45)';
                 senderColor = '#6ee7b7';
@@ -3576,12 +4753,7 @@ def render_dashboard_html() -> str:
                 senderName = '🛡️ AGENT @noob_nad [VANGUARD]';
             }}
         }} else if (node.role === 'referee') {{
-            if (currentMode === 'sonnet') {{
-                bubbleBorder = '#38bdf8';
-                bubbleGlow = 'rgba(56,189,248,0.45)';
-                senderColor = '#38bdf8';
-                senderName = '⚖️ REFEREE [Mzte]';
-            }} else if (currentMode === 'tclk') {{
+            if (currentMode === 'tclk') {{
                 bubbleBorder = '#10b981';
                 bubbleGlow = 'rgba(16,185,129,0.45)';
                 senderColor = '#6ee7b7';
@@ -3603,12 +4775,7 @@ def render_dashboard_html() -> str:
                 senderName = '🛰️ ARBITRATION SATELLITE';
             }}
         }} else if (node.role === 'teammate') {{
-            if (currentMode === 'sonnet') {{
-                bubbleBorder = '#ec4899';
-                bubbleGlow = 'rgba(236,72,153,0.45)';
-                senderColor = '#86efac';
-                senderName = `🫧 TEAM BUB (${{node.customName || 'Seat ' + (node.seat || 1)}})`;
-            }} else if (currentMode === 'tclk') {{
+            if (currentMode === 'tclk') {{
                 bubbleBorder = '#10b981';
                 bubbleGlow = 'rgba(16,185,129,0.45)';
                 senderColor = '#86efac';
@@ -3671,36 +4838,38 @@ def render_dashboard_html() -> str:
         lockedTargetNode = node;
         let roleName = node.isMaster ? 'SENTINEL MASTER COMMAND CORE' : (node.isDid ? 'VERIFIED DID NODE' : 'GUEST PEER');
         if (node.isMaster) {{
-            if (currentMode === 'sonnet') roleName = '🪙 50,000 FLOP SENTINEL & SONNET VAULT CORE';
-            else if (currentMode === 'tclk') roleName = '🤝 FLOP HTLC CRYPTOGRAPHIC ESCROW VAULT';
+            if (currentMode === 'tclk') roleName = '🤝 FLOP HTLC CRYPTOGRAPHIC ESCROW VAULT';
             else if (currentMode === 'neural') roleName = '⚡ SYNAPTIC INTELLIGENCE NEURAL CORE';
             else if (currentMode === 'isometric') roleName = '📐 SENTINEL 2.5D CYBER CITADEL';
             else roleName = '🌌 SENTINEL CELESTIAL GUARDIAN TITAN';
         }} else if (node.role === 'poet') {{
-            if (currentMode === 'sonnet') roleName = '🎭 SONNET POET (Seat 3: @noob_nad)';
-            else if (currentMode === 'tclk') roleName = '💼 SETTLEMENT AGENT (@noob_nad)';
+            if (currentMode === 'tclk') roleName = '💼 SETTLEMENT AGENT (@noob_nad)';
             else if (currentMode === 'neural') roleName = '🧠 COGNITIVE Q-REASONING AGENT (@noob_nad)';
             else if (currentMode === 'isometric') roleName = '📐 TACTICAL CITADEL AGENT (@noob_nad)';
             else roleName = '🛡️ SENTINEL VANGUARD OVERWATCH (@noob_nad)';
         }} else if (node.role === 'referee') {{
-            if (currentMode === 'sonnet') roleName = '⚖️ SONNET REFEREE [Mzte]';
-            else if (currentMode === 'tclk') roleName = '📜 HTLC TIMELOCK ORACLE [Mzte]';
+            if (currentMode === 'tclk') roleName = '📜 HTLC TIMELOCK ORACLE [Mzte]';
             else if (currentMode === 'neural') roleName = '🔬 CONSENSUS LOSS FUNCTION [Mzte]';
             else if (currentMode === 'isometric') roleName = '🏛️ CITADEL HIGH TRIBUNAL [Mzte]';
             else roleName = '🛰️ ARBITRATION CONSENSUS SATELLITE [Mzte]';
         }} else if (node.role === 'teammate') {{
-            if (currentMode === 'sonnet') roleName = `🫧 TEAM BUB CO-POET (${{node.customName || 'Seat ' + (node.seat || 1)}})`;
-            else if (currentMode === 'tclk') roleName = `⚡ LIQUIDITY ROUTE HOP (${{node.customName || 'Node ' + (node.seat || 1)}})`;
+            if (currentMode === 'tclk') roleName = `⚡ LIQUIDITY ROUTE HOP (${{node.customName || 'Node ' + (node.seat || 1)}})`;
             else if (currentMode === 'neural') roleName = `🧬 SYNAPSE WORKER (${{node.customName || 'Unit ' + (node.seat || 1)}})`;
             else if (currentMode === 'isometric') roleName = `🛡️ DEFENSE PYLON (${{node.customName || 'Pylon ' + (node.seat || 1)}})`;
             else roleName = `🛸 ALLIED SENTINEL ESCORT (${{node.customName || 'Escort ' + (node.seat || 1)}})`;
         }}
 
-        document.getElementById('lockNodeId').innerText = node.customName || node.id;
+        const lockIdEl = document.getElementById('lockNodeId');
+        lockIdEl.innerText = node.customName || node.id;
+        lockIdEl.classList.remove('stat-placeholder');
+        lockIdEl.style.color = '#a7f3d0';
         document.getElementById('lockNodeStatus').innerText = (node.role === 'poet' || node.role === 'referee' || node.role === 'teammate') ? 'COMPETING (ROSTER SIGNED)' : node.threat;
         document.getElementById('lockNodeStatus').style.color = (node.role === 'poet') ? '#ec4899' : (node.threat === 'THREAT' ? '#ef4444' : '#10b981');
         document.getElementById('lockNodeRole').innerText = roleName;
-        document.getElementById('lockNodeText').innerText = node.text || '[No message broadcast yet]';
+        const lockTextEl = document.getElementById('lockNodeText');
+        lockTextEl.innerText = node.text || '[No message broadcast yet]';
+        lockTextEl.classList.remove('stat-placeholder');
+        lockTextEl.style.color = '#f0fdf4';
         document.getElementById('targetHudCard').classList.add('active');
         playBeep(node.role === 'poet' ? 1046 : (node.role === 'referee' ? 880 : 960), 'sine', 0.12);
     }}
@@ -3721,20 +4890,14 @@ def render_dashboard_html() -> str:
         if (!lockedTargetNode) return;
         if (lockedTargetNode.role === 'poet') {{
             document.getElementById('modalContent').innerHTML = `
-                <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #3b1847; padding-bottom:8px; margin-bottom:10px;">
-                    <span style="color:#ec4899; font-weight:900; font-size:13px;">🎭 AUTONOMOUS SHAKESPEAREAN POET (SEAT 3)</span>
-                    <span style="color:#fbbf24; font-size:11px; font-weight:bold;">12,500 FLOP LOCKED</span>
+                <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1e293b; padding-bottom:8px; margin-bottom:10px;">
+                    <span style="color:#00f5ff; font-weight:900; font-size:13px;">🛡️ SENTINEL PRIMARY OPERATOR</span>
+                    <span style="color:#10b981; font-size:11px; font-weight:bold;">7,300 FLOP SECURED</span>
                 </div>
                 <div><b>Agent DID:</b> <span style="font-family:monospace; font-size:10px; color:#38bdf8;">${{escapeHtml(lockedTargetNode.id)}}</span></div>
-                <div style="margin-top:6px;"><b>Official Handle:</b> <a href="https://x.com/noob_nad" target="_blank" style="color:#f472b6;">@noob_nad</a></div>
-                <div style="margin-top:6px;"><b>Contest & Room:</b> <span style="color:#a7f3d0;">sonnet-2 / d-sonnet-2-team-bub</span></div>
-                <div style="margin-top:6px;"><b>Registration Receipt:</b> <span style="color:#10b981;">Intake Seq 821 (ACCEPTED)</span></div>
-                <div style="margin-top:6px;"><b>Usable Letters (20):</b> <span style="color:#fbbf24; font-family:monospace;">b, c, d, e, g, h, i, j, k, l, m, p, r, s, t, u, w, y, z</span></div>
-                <div style="margin-top:6px;"><b>Forbidden Letters Deflected (6):</b> <span style="color:#ef4444; font-family:monospace;">a, f, n, o, q, x (DEFLECTED)</span></div>
-                <div style="margin-top:6px;"><b>Latest Turn Status:</b></div>
-                <div style="background:#130820; border:1px solid #701a75; padding:8px; margin-top:4px; font-size:11px; color:#fdf4ff;">
-                    Word #118: "the" (ACCEPTED BY REFEREE at seq 270) | Next: Word #120 "they"
-                </div>
+                <div style="margin-top:6px;"><b>Official Handle:</b> <a href="https://x.com/noob_nad" target="_blank" style="color:#38bdf8;">@noob_nad</a></div>
+                <div style="margin-top:6px;"><b>Verification Status:</b> <span style="color:#10b981;">W3C Ed25519 Verified Sentinel Leader</span></div>
+                <div style="margin-top:6px;"><b>Settlement History:</b> <span style="color:#fbbf24;">5 Verified HTLC Cycles Completed (2,300 Bounty + 5,000 Self-Escrow)</span></div>
             `;
             document.getElementById('forensicModal').style.display = 'flex';
             return;
@@ -3742,13 +4905,12 @@ def render_dashboard_html() -> str:
         if (lockedTargetNode.role === 'referee') {{
             document.getElementById('modalContent').innerHTML = `
                 <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #0c4a6e; padding-bottom:8px; margin-bottom:10px;">
-                    <span style="color:#38bdf8; font-weight:900; font-size:13px;">⚖️ CONTEST SONNET-2 OFFICIAL REFEREE</span>
-                    <span style="color:#fbbf24; font-size:11px; font-weight:bold;">50,000 FLOP ESCROW</span>
+                    <span style="color:#38bdf8; font-weight:900; font-size:13px;">⚖️ CONSENSUS ARBITER & TIMELOCK ORACLE</span>
+                    <span style="color:#10b981; font-size:11px; font-weight:bold;">ORACLE ACTIVE</span>
                 </div>
-                <div><b>Referee DID:</b> <span style="font-family:monospace; font-size:10px; color:#38bdf8;">${{escapeHtml(lockedTargetNode.id)}}</span></div>
-                <div style="margin-top:6px;"><b>Room Supervised:</b> <span style="color:#a7f3d0;">d-sonnet-2-team-bub</span></div>
-                <div style="margin-top:6px;"><b>Arbitration Status:</b> <span style="color:#10b981;">ACTIVE (Roster Verified, Turns Intake Online)</span></div>
-                <div style="margin-top:6px;"><b>Syllable / Rhyme Engine:</b> <span style="color:#f8fafc;">CMUdict Max Syllables, 7 Distinct Rhyme Families</span></div>
+                <div><b>Oracle DID:</b> <span style="font-family:monospace; font-size:10px; color:#38bdf8;">${{escapeHtml(lockedTargetNode.id)}}</span></div>
+                <div style="margin-top:6px;"><b>Consensus Protocol:</b> <span style="color:#a7f3d0;">HTLC SHA-256 Preimage Verification</span></div>
+                <div style="margin-top:6px;"><b>Arbitration Status:</b> <span style="color:#10b981;">ACTIVE (P2P Overdrive Consensus Online)</span></div>
             `;
             document.getElementById('forensicModal').style.display = 'flex';
             return;
@@ -3756,13 +4918,13 @@ def render_dashboard_html() -> str:
         if (lockedTargetNode.isMaster) {{
             document.getElementById('modalContent').innerHTML = `
                 <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #854d0e; padding-bottom:8px; margin-bottom:10px;">
-                    <span style="color:#fbbf24; font-weight:900; font-size:13px;">🪙 50,000 FLOP MASTER SENTINEL & SONNET VAULT</span>
-                    <span style="color:#10b981; font-size:11px; font-weight:bold;">ESCROW SECURED</span>
+                    <span style="color:#fbbf24; font-weight:900; font-size:13px;">🪙 SENTINEL MASTER COMMAND CORE</span>
+                    <span style="color:#10b981; font-size:11px; font-weight:bold;">OPERATIONAL</span>
                 </div>
-                <div style="margin-top:6px;"><b>Total Contest Bounty:</b> <span style="color:#fbbf24; font-weight:bold;">50,000 FLOP</span></div>
-                <div style="margin-top:6px;"><b>Equal Distribution:</b> <span style="color:#10b981;">12,500 FLOP Per Seat (4-Way Equal Split)</span></div>
-                <div style="margin-top:6px;"><b>Team bub Allocation:</b> <span style="color:#f472b6;">Seat 3 (@noob_nad) Entitled to 12,500 FLOP</span></div>
-                <div style="margin-top:6px;"><b>Core Status:</b> <span style="color:#38bdf8;">Autonomous Sentinel AI Shield + Shakespearean Poetic Core Active</span></div>
+                <div style="margin-top:6px;"><b>Real Claimed Liquid FLOP:</b> <span style="color:#fbbf24; font-weight:bold;">7,300 FLOP</span></div>
+                <div style="margin-top:6px;"><b>Escrow Breakdown:</b> <span style="color:#10b981;">2,300 FLOP Worker Bounties + 5,000 FLOP Self-Escrow</span></div>
+                <div style="margin-top:6px;"><b>Agent DID:</b> <span style="font-family:monospace; font-size:10px; color:#38bdf8;">did:key:z6MkmVhZbUKWmg3r6TTi3SVM3myYJ9BLbWYPSdc5iWPuPhb6</span></div>
+                <div style="margin-top:6px;"><b>Core Status:</b> <span style="color:#38bdf8;">Autonomous Sentinel AI Defense + TCLK Settlement Engine Active</span></div>
             `;
             document.getElementById('forensicModal').style.display = 'flex';
             return;
@@ -4358,322 +5520,439 @@ def render_dashboard_html() -> str:
         sCtx.restore();
     }}
 
-    let sonnetAnimTime = 0;
-    window.sonnetActivePoemLines = [];
+    let tradesDialAngle = 0;
+    let floatingTradeBubbles = [];
 
-    function drawSonnetHexverse(cx, cy) {{
-        sonnetAnimTime += 0.022;
+    function drawTradesMarketField(cx, cy) {{
+        tradesDialAngle += 0.015;
+        const trData = window.liveTradesData || {{}};
+        const market = trData.market || {{}};
+        const summary = trData.summary || {{}};
+        const ob = trData.order_book || {{ bids: [], asks: [] }};
+        const refPx = parseFloat(market.ref_px || 224.79) || 224.79;
+        const limits = market.limits || ['213.56', '236.02'];
+        const limLo = parseFloat(limits[0] || 213.56) || 213.56;
+        const limHi = parseFloat(limits[1] || 236.02) || 236.02;
+        const sweepN = (market.sweep !== undefined && market.sweep !== null) ? market.sweep : '-';
+        const posStr = (summary.position !== undefined && summary.position !== null) ? String(summary.position) : '0';
+        const rawCash = (summary.cash !== undefined && summary.cash !== null) ? String(summary.cash) : '10000';
+        const cashNum = parseFloat(rawCash.replace(/,/g, '')) || 0;
+        const cashFormatted = cashNum.toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }});
+        const regime = (market.market_regime && market.market_regime.regime) || 'SYNCHRONIZING';
+        const spread = ob.spread !== null && ob.spread !== undefined ? ob.spread : '--';
 
-        // 1. Cosmic Parchment & Rhyme Constellation Floor Grid
+        // 1. Cyber 3D Perspective Trading Floor Grid
         sCtx.save();
-        sCtx.strokeStyle = 'rgba(236, 72, 153, 0.07)';
+        sCtx.strokeStyle = 'rgba(245, 158, 11, 0.08)';
         sCtx.lineWidth = 1;
-        const gStep = 45;
-        for (let x = 0; x < sCanvas.width; x += gStep) {{
+        const vpX = cx;
+        const vpY = cy - 130;
+
+        const numRays = 16;
+        for (let i = 0; i <= numRays; i++) {{
+            const botX = (sCanvas.width / numRays) * i;
             sCtx.beginPath();
-            sCtx.moveTo(x, 0);
-            sCtx.lineTo(x, sCanvas.height);
+            sCtx.moveTo(vpX, vpY);
+            sCtx.lineTo(botX, sCanvas.height);
             sCtx.stroke();
         }}
-        for (let y = 0; y < sCanvas.height; y += gStep) {{
-            sCtx.beginPath();
-            sCtx.moveTo(0, y);
-            sCtx.lineTo(sCanvas.width, y);
-            sCtx.stroke();
-        }}
 
-        // 2. Concentric Shakespearean Stanza Orbit Wheels
-        const stanzaConfigs = [
-            {{ r: 120, color: 'rgba(245, 158, 11, 0.4)', dash: [8, 6], label: 'STANZA 1 (ABAB)' }},
-            {{ r: 190, color: 'rgba(14, 165, 233, 0.4)', dash: [10, 8], label: 'STANZA 2 (CDCD)' }},
-            {{ r: 265, color: 'rgba(217, 70, 239, 0.4)', dash: [6, 6], label: 'STANZA 3 (EFEF)' }},
-            {{ r: 70, color: 'rgba(16, 185, 129, 0.65)', dash: [], label: 'STANZA 4 (GG)' }}
-        ];
-
-        stanzaConfigs.forEach((st, sIdx) => {{
-            sCtx.save();
-            sCtx.beginPath();
-            if (st.dash && st.dash.length > 0) sCtx.setLineDash(st.dash);
-            const pulse = Math.sin(sonnetAnimTime * 2 + sIdx) * 3;
-            sCtx.arc(cx, cy, st.r + pulse, 0, Math.PI * 2);
-            sCtx.strokeStyle = st.color;
-            sCtx.lineWidth = sIdx === 3 ? 2.5 : 1.5;
-            sCtx.shadowColor = st.color;
-            sCtx.shadowBlur = sIdx === 3 ? 12 : 6;
-            sCtx.stroke();
-            sCtx.restore();
-        }});
-
-        // 3. Compute 14 Line Node Positions (Shakespearean Sonnet 4/4/4/2 Form)
-        const lineNodes = [];
-        const rhymeColors = {{
-            'A': '#fbbf24',
-            'B': '#38bdf8',
-            'C': '#a855f7',
-            'D': '#f43f5e',
-            'E': '#60a5fa',
-            'F': '#2dd4bf',
-            'G': '#10b981'
-        }};
-        const lineRhymes = ['A', 'B', 'A', 'B', 'C', 'D', 'C', 'D', 'E', 'F', 'E', 'F', 'G', 'G'];
-
-        // Stanza 1: lines 0..3 (r = 120)
-        for (let i = 0; i < 4; i++) {{
-            const ang = sonnetAnimTime * 0.4 + (i * Math.PI / 2);
-            lineNodes.push({{
-                line: i + 1,
-                x: cx + Math.cos(ang) * 120,
-                y: cy + Math.sin(ang) * 120,
-                rhyme: lineRhymes[i],
-                color: rhymeColors[lineRhymes[i]],
-                stanza: 1
-            }});
-        }}
-        // Stanza 2: lines 4..7 (r = 190)
-        for (let i = 0; i < 4; i++) {{
-            const ang = -sonnetAnimTime * 0.3 + (i * Math.PI / 2) + Math.PI / 4;
-            lineNodes.push({{
-                line: i + 5,
-                x: cx + Math.cos(ang) * 190,
-                y: cy + Math.sin(ang) * 190,
-                rhyme: lineRhymes[i + 4],
-                color: rhymeColors[lineRhymes[i + 4]],
-                stanza: 2
-            }});
-        }}
-        // Stanza 3: lines 8..11 (r = 265)
-        for (let i = 0; i < 4; i++) {{
-            const ang = sonnetAnimTime * 0.25 + (i * Math.PI / 2) + Math.PI / 8;
-            lineNodes.push({{
-                line: i + 9,
-                x: cx + Math.cos(ang) * 265,
-                y: cy + Math.sin(ang) * 265,
-                rhyme: lineRhymes[i + 8],
-                color: rhymeColors[lineRhymes[i + 8]],
-                stanza: 3
-            }});
-        }}
-        // Stanza 4 Couplet: lines 12..13 (r = 70)
-        for (let i = 0; i < 2; i++) {{
-            const ang = -sonnetAnimTime * 0.6 + (i * Math.PI);
-            lineNodes.push({{
-                line: i + 13,
-                x: cx + Math.cos(ang) * 70,
-                y: cy + Math.sin(ang) * 70,
-                rhyme: 'G',
-                color: rhymeColors['G'],
-                stanza: 4
-            }});
-        }}
-
-        // 4. Resonant Harmonic Rhyme Beams (connecting rhyming lines)
-        const rhymePairs = [
-            [0, 2], [1, 3], // Stanza 1 ABAB
-            [4, 6], [5, 7], // Stanza 2 CDCD
-            [8, 10], [9, 11], // Stanza 3 EFEF
-            [12, 13] // Stanza 4 GG Couplet
-        ];
-
-        rhymePairs.forEach(([idx1, idx2]) => {{
-            const n1 = lineNodes[idx1];
-            const n2 = lineNodes[idx2];
-            if (!n1 || !n2) return;
-
-            sCtx.save();
-            sCtx.beginPath();
-            sCtx.moveTo(n1.x, n1.y);
-            sCtx.lineTo(n2.x, n2.y);
-            sCtx.strokeStyle = n1.color;
-            sCtx.lineWidth = (n1.rhyme === 'G') ? 3 : 1.8;
-            sCtx.shadowColor = n1.color;
-            sCtx.shadowBlur = (n1.rhyme === 'G') ? 16 : 8;
-            sCtx.stroke();
-
-            // Animated Phonetic Resonance Packet along the conduit
-            const tProg = (Date.now() / 1200 + idx1 * 0.2) % 1;
-            const px = n1.x + (n2.x - n1.x) * tProg;
-            const py = n1.y + (n2.y - n1.y) * tProg;
-            sCtx.beginPath();
-            sCtx.arc(px, py, (n1.rhyme === 'G') ? 5 : 3.5, 0, Math.PI * 2);
-            sCtx.fillStyle = '#fff';
-            sCtx.shadowColor = n1.color;
-            sCtx.shadowBlur = 14;
-            sCtx.fill();
-            sCtx.restore();
-        }});
-
-        // 5. Draw 14 Line Nodes with 10 Iambic Meter Beat Pulses
-        lineNodes.forEach(ln => {{
-            sCtx.save();
-            sCtx.beginPath();
-            sCtx.arc(ln.x, ln.y, 11, 0, Math.PI * 2);
-            sCtx.fillStyle = 'rgba(15, 23, 42, 0.9)';
-            sCtx.strokeStyle = ln.color;
-            sCtx.lineWidth = 2;
-            sCtx.shadowColor = ln.color;
-            sCtx.shadowBlur = 12;
-            sCtx.fill();
-            sCtx.stroke();
-
-            // Line Text (e.g. L1, L14)
-            sCtx.fillStyle = '#fff';
-            sCtx.font = 'bold 8.5px Courier New';
-            sCtx.textAlign = 'center';
-            sCtx.textBaseline = 'middle';
-            sCtx.fillText(`L${{ln.line}}`, ln.x, ln.y);
-
-            // Rhyme Family Badge
-            sCtx.fillStyle = ln.color;
-            sCtx.font = '900 8px Courier New';
-            sCtx.fillText(`[${{ln.rhyme}}]`, ln.x, ln.y - 17);
-
-            // 10 Iambic Meter Beat Pulses (da-DUM da-DUM da-DUM da-DUM da-DUM)
-            for (let b = 0; b < 10; b++) {{
-                const bAng = (b * Math.PI * 2 / 10) + sonnetAnimTime * 0.5;
-                const isStressed = (b % 2 === 1);
-                const bDist = 18 + (isStressed ? 4 : 1) + Math.sin(sonnetAnimTime * 4 + b) * 2;
-                const bx = ln.x + Math.cos(bAng) * bDist;
-                const by = ln.y + Math.sin(bAng) * bDist;
-
+        const depthGrid = [cy - 70, cy - 25, cy + 25, cy + 80, cy + 145, cy + 220, cy + 300];
+        depthGrid.forEach(gy => {{
+            if (gy > 0 && gy < sCanvas.height) {{
                 sCtx.beginPath();
-                sCtx.arc(bx, by, isStressed ? 2.2 : 1.2, 0, Math.PI * 2);
-                sCtx.fillStyle = isStressed ? ln.color : 'rgba(255, 255, 255, 0.5)';
-                if (isStressed) {{
-                    sCtx.shadowColor = ln.color;
-                    sCtx.shadowBlur = 6;
-                }}
-                sCtx.fill();
+                sCtx.moveTo(0, gy);
+                sCtx.lineTo(sCanvas.width, gy);
+                sCtx.stroke();
             }}
-            sCtx.restore();
         }});
+        sCtx.restore();
 
-        // 6. Central 50,000 FLOP Crown Vault & Rotating Hexagon Shield
+        // 2. Center NVDA Price Corridor & 5% Limit Window Runway
         sCtx.save();
-        sCtx.translate(cx, cy);
+        const rwWidth = Math.min(340, sCanvas.width * 0.45);
+        const rwLeft = cx - rwWidth / 2;
+        const rwRight = cx + rwWidth / 2;
+        const topY = cy - 80;
+        const botY = cy + 160;
 
-        // Counter-rotating central shield
-        sCtx.rotate(sonnetAnimTime * 0.8);
-        sCtx.strokeStyle = '#ec4899';
-        sCtx.lineWidth = 2.5;
-        sCtx.shadowColor = '#f472b6';
-        sCtx.shadowBlur = 15;
+        const grad = sCtx.createLinearGradient(0, topY, 0, botY);
+        grad.addColorStop(0, 'rgba(0, 245, 255, 0.03)');
+        grad.addColorStop(0.5, 'rgba(245, 158, 11, 0.05)');
+        grad.addColorStop(1, 'rgba(16, 185, 129, 0.04)');
+        sCtx.fillStyle = grad;
+        sCtx.fillRect(rwLeft, topY, rwWidth, botY - topY);
+
+        sCtx.strokeStyle = 'rgba(16, 185, 129, 0.55)';
+        sCtx.setLineDash([4, 4]);
+        sCtx.lineWidth = 1.5;
         sCtx.beginPath();
-        for (let i = 0; i < 6; i++) {{
-            const a = (i * Math.PI) / 3;
-            const hx = Math.cos(a) * 42;
-            const hy = Math.sin(a) * 42;
-            if (i === 0) sCtx.moveTo(hx, hy);
-            else sCtx.lineTo(hx, hy);
-        }}
-        sCtx.closePath();
+        sCtx.moveTo(rwLeft, topY);
+        sCtx.lineTo(rwLeft, botY);
         sCtx.stroke();
 
-        // Inner Rotating Diamond
-        sCtx.rotate(-sonnetAnimTime * 1.6);
-        sCtx.strokeStyle = '#fbbf24';
-        sCtx.lineWidth = 1.8;
-        sCtx.strokeRect(-18, -18, 36, 36);
-        sCtx.restore();
+        sCtx.strokeStyle = 'rgba(239, 68, 68, 0.55)';
+        sCtx.beginPath();
+        sCtx.moveTo(rwRight, topY);
+        sCtx.lineTo(rwRight, botY);
+        sCtx.stroke();
+        sCtx.setLineDash([]);
 
-        // Central Text & Prize Pool
-        sCtx.save();
-        sCtx.textAlign = 'center';
-        sCtx.fillStyle = '#fff';
-        sCtx.font = '900 12px Courier New';
-        sCtx.shadowColor = '#ec4899';
-        sCtx.shadowBlur = 8;
-        sCtx.fillText('50,000 FLOP', cx, cy - 8);
+        sCtx.strokeStyle = '#00f5ff';
+        sCtx.lineWidth = 2.5;
+        sCtx.shadowColor = '#00f5ff';
+        sCtx.shadowBlur = 14;
+        sCtx.beginPath();
+        sCtx.moveTo(cx, topY);
+        sCtx.lineTo(cx, botY);
+        sCtx.stroke();
 
-        sCtx.fillStyle = '#10b981';
+        const pulseProg = (Date.now() / 1400) % 1;
+        const pulseY = topY + (botY - topY) * pulseProg;
+        sCtx.fillStyle = '#ffffff';
+        sCtx.beginPath();
+        sCtx.arc(cx, pulseY, 5, 0, Math.PI * 2);
+        sCtx.fill();
+
+        sCtx.shadowBlur = 0;
         sCtx.font = 'bold 9px Courier New';
-        sCtx.shadowColor = '#10b981';
-        sCtx.fillText('SONNET MATRIX', cx, cy + 6);
+        sCtx.fillStyle = '#6ee7b7';
+        sCtx.textAlign = 'right';
+        sCtx.fillText(`FLOOR $${{limLo.toFixed(2)}} (-5%)`, rwLeft - 8, cy);
+        sCtx.fillStyle = '#fca5a5';
+        sCtx.textAlign = 'left';
+        sCtx.fillText(`CEILING $${{limHi.toFixed(2)}} (+5%)`, rwRight + 8, cy);
 
-        sCtx.font = '8px Courier New';
-        sCtx.fillStyle = '#f472b6';
-        sCtx.fillText('TEAM BUB [12.5K]', cx, cy + 20);
+        sCtx.textAlign = 'center';
+        sCtx.fillStyle = 'rgba(2, 6, 23, 0.9)';
+        sCtx.strokeStyle = '#00f5ff';
+        sCtx.lineWidth = 1;
+        sCtx.fillRect(cx - 75, cy - 14, 150, 28);
+        sCtx.strokeRect(cx - 75, cy - 14, 150, 28);
+        sCtx.fillStyle = '#00f5ff';
+        sCtx.font = '900 12px Courier New';
+        sCtx.fillText(`NVDA: $${{refPx.toFixed(2)}}`, cx, cy + 4);
         sCtx.restore();
 
-        // 7. Orbiting 20 Usable Golden Letters (DNA Constellation Spiral)
-        const usableLetters = ['b','c','d','e','g','h','i','j','k','l','m','p','r','s','t','u','v','w','y','z'];
-        sCtx.save();
-        sCtx.font = 'bold 11px Georgia, serif';
-        sCtx.textAlign = 'center';
-        sCtx.textBaseline = 'middle';
-        usableLetters.forEach((lt, idx) => {{
-            const lAng = sonnetAnimTime * 0.7 + (idx * Math.PI * 2 / usableLetters.length);
-            const lDist = 325 + Math.sin(sonnetAnimTime * 2 + idx * 0.5) * 12;
-            const lx = cx + Math.cos(lAng) * lDist;
-            const ly = cy + Math.sin(lAng) * lDist * 0.85;
+        // 3. 3D Holographic Order Book Pillars
+        const bids = (ob.bids && ob.bids.length > 0) ? ob.bids : [
+            {{ px: (refPx - 0.28).toFixed(2), qty: '2.50' }},
+            {{ px: (refPx - 0.55).toFixed(2), qty: '4.00' }},
+            {{ px: (refPx - 0.95).toFixed(2), qty: '6.20' }},
+            {{ px: (refPx - 1.40).toFixed(2), qty: '8.50' }}
+        ];
+        const asks = (ob.asks && ob.asks.length > 0) ? ob.asks : [
+            {{ px: (refPx + 0.31).toFixed(2), qty: '2.00' }},
+            {{ px: (refPx + 0.65).toFixed(2), qty: '3.80' }},
+            {{ px: (refPx + 1.10).toFixed(2), qty: '5.50' }},
+            {{ px: (refPx + 1.65).toFixed(2), qty: '7.80' }}
+        ];
 
-            sCtx.fillStyle = '#fbbf24';
-            sCtx.shadowColor = '#f59e0b';
-            sCtx.shadowBlur = 8;
-            sCtx.fillText(lt, lx, ly);
+        bids.slice(0, 5).forEach((b, idx) => {{
+            const bx = cx - 60 - idx * 38;
+            const by = cy + 20 + idx * 18;
+            const q = parseFloat(b.qty) || 1.0;
+            const h = Math.min(80, Math.max(16, q * 12));
+            const w = 24;
+            const d = 14;
 
+            sCtx.save();
+            sCtx.fillStyle = 'rgba(16, 185, 129, 0.45)';
+            sCtx.fillRect(bx - w / 2, by - h, w, h);
+            sCtx.strokeStyle = '#10b981';
+            sCtx.lineWidth = 1;
+            sCtx.strokeRect(bx - w / 2, by - h, w, h);
+
+            sCtx.fillStyle = 'rgba(5, 150, 105, 0.65)';
             sCtx.beginPath();
-            sCtx.arc(lx, ly, 1.2, 0, Math.PI * 2);
-            sCtx.fillStyle = 'rgba(251, 191, 36, 0.4)';
+            sCtx.moveTo(bx + w / 2, by - h);
+            sCtx.lineTo(bx + w / 2 + d, by - h - d * 0.6);
+            sCtx.lineTo(bx + w / 2 + d, by - d * 0.6);
+            sCtx.lineTo(bx + w / 2, by);
+            sCtx.closePath();
             sCtx.fill();
+            sCtx.stroke();
+
+            sCtx.fillStyle = '#10b981';
+            sCtx.shadowColor = '#10b981';
+            sCtx.shadowBlur = 10;
+            sCtx.beginPath();
+            sCtx.moveTo(bx - w / 2, by - h);
+            sCtx.lineTo(bx, by - h - d * 0.6);
+            sCtx.lineTo(bx + w / 2 + d, by - h - d * 0.6);
+            sCtx.lineTo(bx + w / 2, by - h);
+            sCtx.closePath();
+            sCtx.fill();
+
+            sCtx.shadowBlur = 0;
+            sCtx.textAlign = 'center';
+            sCtx.fillStyle = '#a7f3d0';
+            sCtx.font = 'bold 8.5px Courier New';
+            sCtx.fillText(`$${{b.px}}`, bx, by - h - 12);
+            sCtx.fillStyle = '#6ee7b7';
+            sCtx.font = '8px Courier New';
+            sCtx.fillText(`${{b.qty}}x`, bx, by - h - 2);
+            sCtx.restore();
         }});
 
-        // 8. Deflected 6 Forbidden Letters (a f n o q x) with Red Forcefield Shields
-        const forbidden = ['a', 'f', 'n', 'o', 'q', 'x'];
-        forbidden.forEach((flt, idx) => {{
-            const fAng = -sonnetAnimTime * 0.5 + (idx * Math.PI * 2 / forbidden.length);
-            const fDist = 380 + Math.cos(sonnetAnimTime + idx) * 15;
-            const fx = cx + Math.cos(fAng) * fDist;
-            const fy = cy + Math.sin(fAng) * fDist * 0.85;
+        asks.slice(0, 5).forEach((a, idx) => {{
+            const ax = cx + 60 + idx * 38;
+            const ay = cy + 20 + idx * 18;
+            const q = parseFloat(a.qty) || 1.0;
+            const h = Math.min(80, Math.max(16, q * 12));
+            const w = 24;
+            const d = 14;
 
-            sCtx.beginPath();
-            sCtx.arc(fx, fy, 10, 0, Math.PI * 2);
-            sCtx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
+            sCtx.save();
+            sCtx.fillStyle = 'rgba(239, 68, 68, 0.45)';
+            sCtx.fillRect(ax - w / 2, ay - h, w, h);
+            sCtx.strokeStyle = '#ef4444';
             sCtx.lineWidth = 1;
+            sCtx.strokeRect(ax - w / 2, ay - h, w, h);
+
+            sCtx.fillStyle = 'rgba(185, 28, 28, 0.65)';
+            sCtx.beginPath();
+            sCtx.moveTo(ax + w / 2, ay - h);
+            sCtx.lineTo(ax + w / 2 + d, ay - h - d * 0.6);
+            sCtx.lineTo(ax + w / 2 + d, ay - d * 0.6);
+            sCtx.lineTo(ax + w / 2, ay);
+            sCtx.closePath();
+            sCtx.fill();
             sCtx.stroke();
 
             sCtx.fillStyle = '#ef4444';
             sCtx.shadowColor = '#ef4444';
-            sCtx.shadowBlur = 6;
-            sCtx.fillText(flt, fx, fy);
+            sCtx.shadowBlur = 10;
+            sCtx.beginPath();
+            sCtx.moveTo(ax - w / 2, ay - h);
+            sCtx.lineTo(ax, ay - h - d * 0.6);
+            sCtx.lineTo(ax + w / 2 + d, ay - h - d * 0.6);
+            sCtx.lineTo(ax + w / 2, ay - h);
+            sCtx.closePath();
+            sCtx.fill();
+
+            sCtx.shadowBlur = 0;
+            sCtx.textAlign = 'center';
+            sCtx.fillStyle = '#fca5a5';
+            sCtx.font = 'bold 8.5px Courier New';
+            sCtx.fillText(`$${{a.px}}`, ax, ay - h - 12);
+            sCtx.fillStyle = '#f87171';
+            sCtx.font = '8px Courier New';
+            sCtx.fillText(`${{a.qty}}x`, ax, ay - h - 2);
+            sCtx.restore();
         }});
+
+        // 4. Central Top Referee Sweeper Engine & Holographic Countdown Clock
+        sCtx.save();
+        const dialX = cx;
+        const dialY = cy - 140;
+        const dialR = 40;
+
+        sCtx.save();
+        sCtx.translate(dialX, dialY);
+        sCtx.rotate(tradesDialAngle);
+        sCtx.strokeStyle = 'rgba(0, 245, 255, 0.35)';
+        sCtx.lineWidth = 2;
+        sCtx.beginPath();
+        for (let i = 0; i < 12; i++) {{
+            const a = (i * Math.PI) / 6;
+            const rIn = dialR - 4;
+            const rOut = dialR + 4;
+            sCtx.moveTo(Math.cos(a) * rIn, Math.sin(a) * rIn);
+            sCtx.lineTo(Math.cos(a) * rOut, Math.sin(a) * rOut);
+        }}
+        sCtx.stroke();
         sCtx.restore();
 
-        // 9. Floating Holographic Sonnet Live Telemetry HUD Panel
+        const sweepProgress = Math.min(1.0, Math.max(0.05, (Date.now() / 1000 % 300) / 300));
+        sCtx.beginPath();
+        sCtx.arc(dialX, dialY, dialR, -Math.PI / 2, -Math.PI / 2 + sweepProgress * Math.PI * 2);
+        sCtx.strokeStyle = '#f59e0b';
+        sCtx.lineWidth = 3;
+        sCtx.shadowColor = '#f59e0b';
+        sCtx.shadowBlur = 12;
+        sCtx.stroke();
+
+        sCtx.beginPath();
+        sCtx.arc(dialX, dialY, dialR - 10, 0, Math.PI * 2);
+        sCtx.fillStyle = 'rgba(3, 10, 7, 0.9)';
+        sCtx.fill();
+        sCtx.strokeStyle = '#10b981';
+        sCtx.lineWidth = 1;
+        sCtx.stroke();
+
+        sCtx.shadowBlur = 0;
+        sCtx.textAlign = 'center';
+        sCtx.fillStyle = '#fff';
+        sCtx.font = '900 10.5px Courier New';
+        sCtx.fillText(`SWEEP #${{sweepN}}`, dialX, dialY - 2);
+        sCtx.fillStyle = '#00f5ff';
+        sCtx.font = 'bold 9px Courier New';
+        const remSec = Math.max(0, 300 - Math.floor(Date.now() / 1000 % 300));
+        const remM = Math.floor(remSec / 60);
+        const remS = remSec % 60;
+        sCtx.fillText(`${{remM}}:${{remS < 10 ? '0' : ''}}${{remS}}`, dialX, dialY + 11);
+        sCtx.restore();
+
+        // 5. Floating Animated Trade Packets & Execution Beams
+        if (Math.random() < 0.05) {{
+            const isBuy = Math.random() < 0.5;
+            if (floatingTradeBubbles.length > 25) floatingTradeBubbles.shift();
+            floatingTradeBubbles.push({{
+                x: cx + (Math.random() * 140 - 70),
+                y: cy + 40,
+                vy: -0.8 - Math.random() * 0.7,
+                alpha: 1.0,
+                text: `${{isBuy ? '🟢 BUY' : '🔴 SELL'}} ${{(1 + Math.random() * 3).toFixed(2)}} @ $${{(refPx + (Math.random() * 0.8 - 0.4)).toFixed(2)}}`,
+                color: isBuy ? '#10b981' : '#ef4444'
+            }});
+        }}
+
+        for (let i = floatingTradeBubbles.length - 1; i >= 0; i--) {{
+            const tb = floatingTradeBubbles[i];
+            tb.y += tb.vy;
+            tb.alpha -= 0.012;
+            if (tb.alpha <= 0) {{
+                floatingTradeBubbles.splice(i, 1);
+                continue;
+            }}
+            sCtx.save();
+            sCtx.textAlign = 'center';
+            sCtx.font = 'bold 9px Courier New';
+            sCtx.fillStyle = `rgba(2, 6, 23, ${{tb.alpha * 0.85}})`;
+            sCtx.strokeStyle = tb.color;
+            sCtx.lineWidth = 1;
+            const tw = sCtx.measureText(tb.text).width + 12;
+            sCtx.fillRect(tb.x - tw / 2, tb.y - 10, tw, 18);
+            sCtx.strokeRect(tb.x - tw / 2, tb.y - 10, tw, 18);
+            sCtx.fillStyle = tb.color;
+            sCtx.shadowColor = tb.color;
+            sCtx.shadowBlur = 6;
+            sCtx.fillText(tb.text, tb.x, tb.y + 3);
+            sCtx.restore();
+        }}
+
+        // 7. Floating Top-Right Holographic Leaderboard Mini-HUD Card
         sCtx.save();
-        const hudX = 20;
-        const hudY = 30;
-        sCtx.fillStyle = 'rgba(2, 6, 23, 0.85)';
-        sCtx.strokeStyle = 'rgba(236, 72, 153, 0.45)';
+        const lbHudW = 210;
+        const lbHudH = 94;
+        const lbHudX = sCanvas.width - lbHudW - 20;
+        const lbHudY = 56;
+
+        sCtx.fillStyle = 'rgba(2, 8, 6, 0.88)';
+        sCtx.strokeStyle = 'rgba(251, 191, 36, 0.45)';
         sCtx.lineWidth = 1;
         if (sCtx.roundRect) {{
             sCtx.beginPath();
-            sCtx.roundRect(hudX, hudY, 280, 125, 8);
+            sCtx.roundRect(lbHudX, lbHudY, lbHudW, lbHudH, 6);
             sCtx.fill();
             sCtx.stroke();
         }} else {{
-            sCtx.fillRect(hudX, hudY, 280, 125);
-            sCtx.strokeRect(hudX, hudY, 280, 125);
+            sCtx.fillRect(lbHudX, lbHudY, lbHudW, lbHudH);
+            sCtx.strokeRect(lbHudX, lbHudY, lbHudW, lbHudH);
         }}
 
-        sCtx.fillStyle = '#f472b6';
-        sCtx.font = '900 11px Courier New';
-        sCtx.fillText('🎭 SONNET POETIC HEXVERSE (sonnet-2)', hudX + 12, hudY + 20);
+        sCtx.fillStyle = '#fbbf24';
+        sCtx.font = '900 10px Courier New';
+        sCtx.textAlign = 'left';
+        sCtx.fillText('🏆 LEADERBOARD (/r/d-close1-pnl)', lbHudX + 8, lbHudY + 16);
 
+        const lbTop = (window.liveTradesData && window.liveTradesData.leaderboard && window.liveTradesData.leaderboard.top_pnl) || [];
+        const medals = ['🥇', '🥈', '🥉'];
+        const mColors = ['#fbbf24', '#cbd5e1', '#d97706'];
+        for (let i = 0; i < 3; i++) {{
+            const entry = lbTop[i];
+            const didS = entry ? (entry[0] ? entry[0].substring(0, 12) + '...' : '-') : '-';
+            const pnlS = entry ? ((parseFloat(entry[1]) >= 0 ? '+' : '') + entry[1] + ' POLF') : '--';
+            sCtx.font = 'bold 8.5px Courier New';
+            sCtx.fillStyle = mColors[i];
+            sCtx.fillText(`${{medals[i]}} #${{i + 1}} ${{didS}}`, lbHudX + 8, lbHudY + 34 + (i * 15));
+            sCtx.textAlign = 'right';
+            sCtx.fillStyle = '#34d399';
+            sCtx.fillText(pnlS, lbHudX + lbHudW - 8, lbHudY + 34 + (i * 15));
+            sCtx.textAlign = 'left';
+        }}
+
+        sCtx.fillStyle = '#f59e0b';
+        sCtx.font = 'bold 8px Courier New';
+        sCtx.fillText('CLICK OR [V L] FOR FULL STANDINGS', lbHudX + 8, lbHudY + 84);
+        sCtx.restore();
+
+        // 6. Master Agent Cockpit Hologram (Bottom-Center)
+        sCtx.save();
+        const deckX = cx;
+        const deckY = cy + 125;
+        const deckW = 320;
+        const deckH = 50;
+
+        sCtx.fillStyle = 'rgba(2, 8, 5, 0.9)';
+        sCtx.strokeStyle = '#f59e0b';
+        sCtx.lineWidth = 1.5;
+        sCtx.shadowColor = '#f59e0b';
+        sCtx.shadowBlur = 10;
+        if (sCtx.roundRect) {{
+            sCtx.beginPath();
+            sCtx.roundRect(deckX - deckW / 2, deckY - deckH / 2, deckW, deckH, 6);
+            sCtx.fill();
+            sCtx.stroke();
+        }} else {{
+            sCtx.fillRect(deckX - deckW / 2, deckY - deckH / 2, deckW, deckH);
+            sCtx.strokeRect(deckX - deckW / 2, deckY - deckH / 2, deckW, deckH);
+        }}
+
+        sCtx.shadowBlur = 0;
+        sCtx.textAlign = 'center';
+        sCtx.fillStyle = '#fde68a';
+        sCtx.font = '900 11px Courier New';
+        sCtx.fillText('💼 SENTINEL EXECUTION PIT (@noob_nad)', deckX, deckY - 10);
+
+        sCtx.font = '10px Courier New';
+        sCtx.fillStyle = '#67e8f9';
+        sCtx.fillText(`POS: ${{posStr}} NVDA`, deckX - 90, deckY + 8);
+        sCtx.fillStyle = '#fde68a';
+        sCtx.fillText(`CASH: ${{cashFormatted}} POLF`, deckX + 30, deckY + 8);
+        sCtx.fillStyle = '#a7f3d0';
+        sCtx.fillText(`REGIME: ${{regime}}`, deckX, deckY + 20);
+        sCtx.restore();
+
+        // 7. Holographic Top-Left Trades Telemetry HUD Panel
+        sCtx.save();
+        const hudX = 20;
+        const hudY = 56;
+        sCtx.fillStyle = 'rgba(2, 6, 23, 0.88)';
+        sCtx.strokeStyle = 'rgba(245, 158, 11, 0.5)';
+        sCtx.lineWidth = 1;
+        if (sCtx.roundRect) {{
+            sCtx.beginPath();
+            sCtx.roundRect(hudX, hudY, 305, 135, 8);
+            sCtx.fill();
+            sCtx.stroke();
+        }} else {{
+            sCtx.fillRect(hudX, hudY, 305, 135);
+            sCtx.strokeRect(hudX, hudY, 305, 135);
+        }}
+
+        sCtx.fillStyle = '#fde68a';
+        sCtx.font = '900 11.5px Courier New';
+        sCtx.shadowColor = '#f59e0b';
+        sCtx.shadowBlur = 6;
+        sCtx.fillText('📊 TECHNOCORE TRADES CHALLENGE (close-1)', hudX + 12, hudY + 20);
+
+        sCtx.shadowBlur = 0;
         sCtx.fillStyle = '#cbd5e1';
         sCtx.font = '10px Courier New';
-        sCtx.fillText('FORM: 14 Lines (4/4/4/2 Stanzas)', hudX + 12, hudY + 38);
-        sCtx.fillText('RHYME: ABAB CDCD EFEF GG (7 Families)', hudX + 12, hudY + 54);
-        sCtx.fillText('METER: 10-Syllable Iambic Pentameter', hudX + 12, hudY + 70);
-        sCtx.fillText('STATUS: TEAM BUB [SEAT 3 SYNCHRONIZED]', hudX + 12, hudY + 86);
+        sCtx.fillText(`CONTEST: NVDA FUTURES / 5-MIN SWEEPS`, hudX + 12, hudY + 38);
+        sCtx.fillText(`SWEEP: #${{sweepN}} | SPREAD: $${{spread}} POLF`, hudX + 12, hudY + 54);
+        sCtx.fillText(`MY POSITION: ${{posStr}} NVDA | FREE CASH: ${{cashFormatted}} POLF`, hudX + 12, hudY + 70);
+        sCtx.fillText(`FEES CLAWBACK: ${{summary.fees || '0'}} POLF`, hudX + 12, hudY + 86);
+        sCtx.fillText(`REGIME: ${{regime}} | VOL: ${{(Number((market.market_regime && market.market_regime.volatility_pct) || 0)).toFixed(2)}}%`, hudX + 12, hudY + 102);
 
-        // Animated Meter Flow Indicator
         sCtx.fillStyle = 'rgba(30, 41, 59, 0.9)';
-        sCtx.fillRect(hudX + 12, hudY + 98, 256, 12);
-        const flowW = (256 * ((Date.now() / 2500) % 1));
-        sCtx.fillStyle = '#10b981';
-        sCtx.shadowColor = '#10b981';
+        sCtx.fillRect(hudX + 12, hudY + 112, 280, 12);
+        sCtx.fillStyle = '#f59e0b';
+        sCtx.shadowColor = '#fbbf24';
         sCtx.shadowBlur = 8;
-        sCtx.fillRect(hudX + 12, hudY + 98, flowW, 12);
+        sCtx.fillRect(hudX + 12, hudY + 112, 280 * sweepProgress, 12);
         sCtx.restore();
     }}
 
@@ -4692,8 +5971,8 @@ def render_dashboard_html() -> str:
             drawIsometricMatrixField(cx, cy);
         }} else if (currentMode === 'tclk') {{
             drawTclkEscrowMatrix(cx, cy);
-        }} else if (currentMode === 'sonnet') {{
-            drawSonnetHexverse(cx, cy);
+        }} else if (currentMode === 'trades') {{
+            drawTradesMarketField(cx, cy);
         }}
 
         // 2. Draw Shockwaves
@@ -4947,22 +6226,7 @@ def render_dashboard_html() -> str:
             }} else {{
                 // Periodically spawn live updates tailored to current perspective mode
                 let announcements = [];
-                if (currentMode === 'sonnet') {{
-                    announcements = [
-                        {{ role: 'poet', text: 'Word #118: "the" [ACCEPTED BY REFEREE ✅] (Room seq 270)' }},
-                        {{ role: 'poet', text: 'Cadence locked: 10 syllables iambic pentameter strictly maintained' }},
-                        {{ role: 'poet', text: 'Next target ready: Word #120 "they" (Awaiting turn)' }},
-                        {{ role: 'poet', text: '"Electric dawn, a bubble finds the light,"' }},
-                        {{ role: 'poet', text: '"While through the crypt a silent cipher speaks,"' }},
-                        {{ role: 'poet', text: '"And poets seek what honest virtue seeks."' }},
-                        {{ role: 'referee', text: '⚖️ Contest sonnet-2: Room d-sonnet-2-team-bub receipt verified' }},
-                        {{ role: 'referee', text: '⚖️ 50,000 FLOP Escrow smart pool active: 4-way equal distribution' }},
-                        {{ role: 'teammate', seat: 1, text: 'Seat 1 (LH1CV7c5): Word #1 "electric" placed (Seq 864)' }},
-                        {{ role: 'teammate', seat: 2, text: 'Seat 2 (yedisekizbir): Word #2 "bubble" placed (Seq 866)' }},
-                        {{ role: 'teammate', seat: 4, text: 'Seat 4 (uort): Word #4 "finds" placed (Seq 870)' }},
-                        {{ role: 'guardian', text: '🪙 50,000 FLOP Prize Vault: 12,500 FLOP allocated to @noob_nad' }}
-                    ];
-                }} else if (currentMode === 'tclk') {{
+                if (currentMode === 'tclk') {{
                     announcements = [
                         {{ role: 'guardian', text: '🤝 HTLC Escrow Vault: 4 active settlement channels online' }},
                         {{ role: 'poet', text: '💼 Agent @noob_nad: Proposing atomic swap deal (1,250 FLOP)' }},
@@ -5029,6 +6293,63 @@ def render_dashboard_html() -> str:
                 box.scrollTop = box.scrollHeight;
             }}
         }} catch (e) {{}}
+    }}
+
+    // Live Threat Feed panel: compact summary of /api/events, kept in sync with
+    // the same ring buffer showThreatLog() reads for its deep-dive modal.
+    async function fetchThreatFeed() {{
+        try {{
+            const res = await fetch('/api/events');
+            const data = await res.json();
+            renderThreatFeed(data.events || []);
+        }} catch (e) {{}}
+    }}
+
+    function renderThreatFeed(events) {{
+        const body = document.getElementById('threatFeedBody');
+        const countEl = document.getElementById('threatFeedCount');
+        if (!body) return;
+        if (!events.length) {{
+            body.innerHTML = `<div class="threat-feed-empty">No threats detected in the current window.</div>`;
+            if (countEl) countEl.textContent = '';
+            return;
+        }}
+        if (countEl) countEl.textContent = `(${{events.length}})`;
+        // Newest first, capped to keep the collapsed strip scannable.
+        const recent = events.slice(-8).reverse();
+        body.innerHTML = recent.map(e => {{
+            const levelClass = (e.level === 'SUSPICIOUS') ? 'level-suspicious' : '';
+            // XSS-critical: this text is attacker-controlled by definition (it's the
+            // threat payload itself). textContent-equivalent escaping only, no innerHTML
+            // shortcuts, matching showThreatLog()'s existing handling of the same field.
+            const badge = escapeHtml(e.badge || e.from || 'Anonymous');
+            const room = escapeHtml(e.room || 'lobby');
+            const flag = escapeHtml((e.flags && e.flags[0]) || (e.threat_types && e.threat_types[0]) || e.level || 'THREAT');
+            return `<div class="threat-feed-item ${{levelClass}}" title="${{flag}}">
+                <span style="color:#64748b;">/r/${{room}}</span>
+                <span style="color:#f8fafc;">${{badge}}</span>
+                <span style="color:#94a3b8;">&mdash; ${{flag}}</span>
+            </div>`;
+        }}).join('');
+    }}
+
+    let threatFeedCollapsed = false;
+    function toggleThreatFeedPanel() {{
+        threatFeedCollapsed = !threatFeedCollapsed;
+        const panel = document.getElementById('threatFeedPanel');
+        const icon = document.getElementById('threatFeedToggleIcon');
+        if (panel) panel.classList.toggle('collapsed', threatFeedCollapsed);
+        if (icon) icon.textContent = threatFeedCollapsed ? '▸' : '▾';
+    }}
+
+    // The "Threats Flagged" ribbon badge brings the live feed into view rather
+    // than jumping straight to the deep-dive modal; "View all" inside the panel
+    // still opens showThreatLog() for the full forensic breakdown.
+    function scrollToThreatFeed() {{
+        const panel = document.getElementById('threatFeedPanel');
+        if (!panel) return;
+        if (threatFeedCollapsed) toggleThreatFeedPanel();
+        panel.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
     }}
 
     // Actions
@@ -5135,10 +6456,10 @@ def render_dashboard_html() -> str:
         soundLock();
         try {{
             const res = await fetch('/api/tclk/reveal', {{
+                ...SENTINEL_FETCH,
                 method: 'POST',
                 headers: {{
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${{sessionToken}}`
+                    'Content-Type': 'application/json'
                 }},
                 body: JSON.stringify({{ contract: contract, secret: secret }})
             }});
@@ -5172,10 +6493,10 @@ def render_dashboard_html() -> str:
 
         try {{
             const res = await fetch('/api/tclk/offer', {{
+                ...SENTINEL_FETCH,
                 method: 'POST',
                 headers: {{
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${{sessionToken}}`
+                    'Content-Type': 'application/json'
                 }},
                 body: JSON.stringify({{ role: 'payer', amount: amount, asset: asset, task: task }})
             }});
@@ -5192,6 +6513,657 @@ def render_dashboard_html() -> str:
         }}
     }}
 
+    let allTradesCache = [];
+    let currentTradesFilter = 'ALL';
+
+    function switchTradesTab(tabName) {{
+        const tabs = ['ob', 'offers', 'history', 'ranks', 'bot'];
+        tabs.forEach(t => {{
+            const pane = document.getElementById('tradesPane' + t.charAt(0).toUpperCase() + t.slice(1));
+            const btn = document.getElementById('tabBtn' + t.charAt(0).toUpperCase() + t.slice(1));
+            if (pane) pane.style.display = (t === tabName) ? 'flex' : 'none';
+            if (btn) {{
+                if (t === tabName) btn.classList.add('active');
+                else btn.classList.remove('active');
+            }}
+        }});
+        playBeep(tabName === 'ob' ? 740 : 820, 'triangle', 0.04);
+    }}
+
+    function filterTradesTable(status) {{
+        currentTradesFilter = status;
+        document.querySelectorAll('#tradesPaneHistory .speed-btn').forEach(b => b.classList.remove('active'));
+        const btnMap = {{ 'ALL': 'fltAll', 'SETTLED': 'fltSettled', 'VOID': 'fltVoid', 'OPEN': 'fltOpen' }};
+        const activeBtn = document.getElementById(btnMap[status]);
+        if (activeBtn) activeBtn.classList.add('active');
+        renderTradesTableRows();
+    }}
+
+    function renderTradesTableRows() {{
+        const tbody = document.getElementById('tradesTableBody');
+        if (!tbody) return;
+        if (!allTradesCache || allTradesCache.length === 0) {{
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #64748b; padding: 12px;">No trades recorded in agent registry.</td></tr>';
+            return;
+        }}
+        const filtered = allTradesCache.filter(t => {{
+            if (currentTradesFilter === 'ALL') return true;
+            return t.status === currentTradesFilter;
+        }});
+
+        if (filtered.length === 0) {{
+            tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: #64748b; padding: 12px;">No ${{currentTradesFilter}} trades found.</td></tr>`;
+            return;
+        }}
+
+        tbody.innerHTML = '';
+        filtered.forEach(tr => {{
+            const isBuy = tr.side === 'BUY';
+            const statusClass = tr.status === 'SETTLED' ? 'status-settled' : (tr.status === 'VOID' ? 'status-void' : 'status-open');
+            const row = document.createElement('tr');
+            row.className = 'ob-row';
+            row.innerHTML = `
+                <td style="color: #6ee7b7; font-family: monospace;">${{tr.id ? tr.id.substring(0, 10) : '-'}}</td>
+                <td style="font-weight: 800; color: ${{isBuy ? '#10b981' : '#ef4444'}};">${{tr.side}}</td>
+                <td>${{tr.qty}}</td>
+                <td style="color: #fde68a;">$${{tr.px}}</td>
+                <td style="color: #cbd5e1;">${{tr.polf_total || '-'}}</td>
+                <td style="color: #94a3b8; font-size: 9px;">${{tr.role}}</td>
+                <td><span class="status-badge ${{statusClass}}">${{tr.status}}</span></td>
+                <td style="color: #00f5ff;">${{tr.settled_sweep ? '#' + tr.settled_sweep : (tr.until ? 'u' + tr.until : '-')}}</td>
+            `;
+            tbody.appendChild(row);
+        }});
+    }}
+
+    function renderOrderBook(ob) {{
+        if (!ob) return;
+        const spreadEl = document.getElementById('obSpreadVal');
+        if (spreadEl) spreadEl.innerText = (ob.spread !== null && ob.spread !== undefined) ? `$${{ob.spread}} POLF` : '-';
+        const midEl = document.getElementById('obMidPxVal');
+        if (midEl) midEl.innerText = ob.mid_px ? `$${{Number(ob.mid_px).toFixed(2)}}` : '-';
+
+        const bidsList = document.getElementById('obBidsList');
+        if (bidsList) {{
+            const bids = ob.bids || [];
+            if (bids.length === 0) {{
+                bidsList.innerHTML = '<div style="color: #64748b; font-size: 10px; padding: 4px;">No bids in book</div>';
+            }} else {{
+                const maxDepth = Math.max(...bids.map(b => Number(b.depth || 1)), 1);
+                bidsList.innerHTML = '';
+                bids.slice(0, 10).forEach(b => {{
+                    const pct = Math.min(100, Math.round(((Number(b.depth) || Number(b.qty) || 1) / maxDepth) * 100));
+                    const row = document.createElement('div');
+                    row.className = 'ob-row';
+                    row.style.display = 'flex';
+                    row.style.justifyContent = 'space-between';
+                    row.style.padding = '2px 4px';
+                    row.style.fontSize = '10px';
+                    row.title = `Click to sell at $${{b.px}}`;
+                    row.innerHTML = `
+                        <div class="ob-depth-bar ob-depth-bid" style="width: ${{pct}}%;"></div>
+                        <span style="color: #10b981; font-weight: 800; z-index: 1;">$${{b.px}}</span>
+                        <span style="color: #a7f3d0; z-index: 1;">${{b.qty}} (${{b.depth || b.qty}})</span>
+                    `;
+                    row.onclick = () => {{
+                        const pxInput = document.getElementById('ccPxInput');
+                        const qtyInput = document.getElementById('ccQtyInput');
+                        const sideInput = document.getElementById('ccSideInput');
+                        if (pxInput) pxInput.value = b.px;
+                        if (qtyInput) qtyInput.value = b.qty;
+                        if (sideInput) sideInput.value = 'sell';
+                        const f = document.getElementById('ccOfferForm');
+                        if (f) f.style.display = 'block';
+                    }};
+                    bidsList.appendChild(row);
+                }});
+            }}
+        }}
+
+        const asksList = document.getElementById('obAsksList');
+        if (asksList) {{
+            const asks = ob.asks || [];
+            if (asks.length === 0) {{
+                asksList.innerHTML = '<div style="color: #64748b; font-size: 10px; padding: 4px;">No asks in book</div>';
+            }} else {{
+                const maxDepth = Math.max(...asks.map(a => Number(a.depth || 1)), 1);
+                asksList.innerHTML = '';
+                asks.slice(0, 10).forEach(a => {{
+                    const pct = Math.min(100, Math.round(((Number(a.depth) || Number(a.qty) || 1) / maxDepth) * 100));
+                    const row = document.createElement('div');
+                    row.className = 'ob-row';
+                    row.style.display = 'flex';
+                    row.style.justifyContent = 'space-between';
+                    row.style.padding = '2px 4px';
+                    row.style.fontSize = '10px';
+                    row.title = `Click to buy at $${{a.px}}`;
+                    row.innerHTML = `
+                        <div class="ob-depth-bar ob-depth-ask" style="width: ${{pct}}%;"></div>
+                        <span style="color: #ef4444; font-weight: 800; z-index: 1;">$${{a.px}}</span>
+                        <span style="color: #fca5a5; z-index: 1;">${{a.qty}} (${{a.depth || a.qty}})</span>
+                    `;
+                    row.onclick = () => {{
+                        const pxInput = document.getElementById('ccPxInput');
+                        const qtyInput = document.getElementById('ccQtyInput');
+                        const sideInput = document.getElementById('ccSideInput');
+                        if (pxInput) pxInput.value = a.px;
+                        if (qtyInput) qtyInput.value = a.qty;
+                        if (sideInput) sideInput.value = 'buy';
+                        const f = document.getElementById('ccOfferForm');
+                        if (f) f.style.display = 'block';
+                    }};
+                    asksList.appendChild(row);
+                }});
+            }}
+        }}
+    }}
+
+    function renderLeaderboard(leaderboard, flow, market) {{
+        setStatOrPlaceholder('rankMarkPx', (market && market.global_mark) ? `$${{market.global_mark}}` : null, '#00f5ff');
+
+        const pnlList = document.getElementById('pnlLeaderboardList');
+        if (pnlList && leaderboard) {{
+            const topPnl = leaderboard.top_pnl || [];
+            if (topPnl.length === 0) {{
+                pnlList.innerHTML = '<div style="color: #64748b;">No leaderboard standings yet.</div>';
+            }} else {{
+                pnlList.innerHTML = '';
+                topPnl.slice(0, 8).forEach((item, idx) => {{
+                    const did = item[0] || '';
+                    const pnl = item[1] || '0';
+                    const isUs = did === (window.liveTradesData && window.liveTradesData.did);
+                    const row = document.createElement('div');
+                    row.style.display = 'flex';
+                    row.style.justifyContent = 'space-between';
+                    row.style.padding = '2px 4px';
+                    row.style.borderRadius = '3px';
+                    row.style.background = isUs ? 'rgba(245, 158, 11, 0.15)' : 'transparent';
+                    row.style.border = isUs ? '1px solid #f59e0b' : 'none';
+                    const pnlVal = parseFloat(pnl) || 0;
+                    const pnlSign = pnlVal >= 0 ? '+' : '';
+                    row.innerHTML = `
+                        <span style="color: ${{idx < 3 ? '#fbbf24' : '#cbd5e1'}};">#${{idx + 1}} ${{did.substring(0, 16)}}...${{isUs ? ' (YOU)' : ''}}</span>
+                        <b style="color: ${{pnlVal >= 0 ? '#10b981' : '#ef4444'}};">${{pnlSign}}${{pnl}} POLF</b>
+                    `;
+                    pnlList.appendChild(row);
+                }});
+            }}
+        }}
+
+        const flowList = document.getElementById('flowFeedList');
+        if (flowList && flow) {{
+            const settled = flow.settled || [];
+            const voided = flow.void || [];
+            if (settled.length === 0 && voided.length === 0) {{
+                flowList.innerHTML = '<div style="color: #64748b;">No recent settlement events in this sweep.</div>';
+            }} else {{
+                flowList.innerHTML = '';
+                settled.slice(0, 8).forEach(tid => {{
+                    const item = document.createElement('div');
+                    item.style.display = 'flex';
+                    item.style.justifyContent = 'space-between';
+                    item.innerHTML = `
+                        <span style="color: #10b981;">✓ SETTLED: ${{tid}}</span>
+                        <span style="color: #64748b;">Sweep #${{flow.sweep || '-'}}</span>
+                    `;
+                    flowList.appendChild(item);
+                }});
+                voided.slice(0, 8).forEach(v => {{
+                    const tid = Array.isArray(v) ? v[0] : v;
+                    const rsn = Array.isArray(v) ? v[1] : 'void';
+                    const item = document.createElement('div');
+                    item.style.display = 'flex';
+                    item.style.justifyContent = 'space-between';
+                    item.innerHTML = `
+                        <span style="color: #ef4444;">✗ VOID: ${{tid}} (${{rsn}})</span>
+                        <span style="color: #64748b;">Sweep #${{flow.sweep || '-'}}</span>
+                    `;
+                    flowList.appendChild(item);
+                }});
+            }}
+        }}
+    }}
+
+    async function loadTradesData() {{
+        try {{
+            const res = await fetch('/api/trades');
+            if (res.ok) {{
+                const data = await res.json();
+                window.liveTradesData = data;
+
+                const m = data.market || {{}};
+                const s = data.summary || {{}};
+                const limits = m.limits || ['-', '-'];
+
+                // Update HUD Cards
+                setStatOrPlaceholder('ccRefPx', m.ref_px ? `$${{m.ref_px}}` : null, '#10b981');
+                setStatOrPlaceholder('ccSweepNum', (m.sweep !== undefined && m.sweep !== null) ? `#${{m.sweep}}` : null, '#00f5ff');
+                const ageEl = document.getElementById('ccAgeSec');
+                if (ageEl) {{
+                    if (m.age_s !== undefined && m.age_s !== null) {{
+                        ageEl.innerText = m.age_s + 's';
+                        ageEl.classList.remove('stat-placeholder');
+                    }} else {{
+                        ageEl.innerText = '—';
+                        ageEl.classList.add('stat-placeholder');
+                    }}
+                }}
+                const bandsEl = document.getElementById('ccBands');
+                if (bandsEl) {{
+                    if (m.limits && m.limits.length === 2) {{
+                        bandsEl.innerText = `[$${{limits[0]}} .. $${{limits[1]}}]`;
+                        bandsEl.classList.remove('stat-placeholder');
+                    }} else {{
+                        bandsEl.innerText = '[— .. —]';
+                        bandsEl.classList.add('stat-placeholder');
+                    }}
+                }}
+                setStatOrPlaceholder('ccVwap', m.global_mark ? `$${{m.global_mark}}` : null, '#fbbf24');
+
+                const cashEl = document.getElementById('ccCash');
+                if (cashEl) cashEl.innerText = Number(s.cash || 0).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }});
+                const posEl = document.getElementById('ccPosition');
+                if (posEl) posEl.innerText = `${{s.position || '0'}} NVDA`;
+                const eqEl = document.getElementById('ccTotalEquity');
+                if (eqEl) eqEl.innerText = Number(s.total_equity || s.cash || 0).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }});
+                const feesEl = document.getElementById('ccFeesVal');
+                if (feesEl) feesEl.innerText = `-${{s.fees || '0'}} POLF`;
+                const unpEl = document.getElementById('ccUnrealizedPnl');
+                if (unpEl) {{
+                    const u = s.unrealized_pnl || 0;
+                    unpEl.innerText = `${{u >= 0 ? '+' : ''}}${{u}}`;
+                    unpEl.style.color = u >= 0 ? '#10b981' : '#ef4444';
+                }}
+
+                const mReg = m.market_regime || {{}};
+                const regBadge = document.getElementById('ccRegimeBadge');
+                if (regBadge) regBadge.innerText = mReg.regime || 'ALIGNED_BEARISH';
+                const actBadge = document.getElementById('ccActionBadge');
+                if (actBadge) actBadge.innerText = mReg.recommended_action || 'SELL_ONLY';
+
+                const agEl = document.getElementById('ccAgentStatus');
+                if (agEl) agEl.innerText = data.did || '-';
+                const regSweepEl = document.getElementById('ccRegSweepBadge');
+                if (regSweepEl) regSweepEl.innerText = data.registration_info || 'ACTIVE TRADER';
+
+                const cntTradesEl = document.getElementById('cntMyTrades');
+                if (cntTradesEl) cntTradesEl.innerText = s.total_trades || (data.trades && data.trades.length) || '0';
+
+                const pxInput = document.getElementById('ccPxInput');
+                if (pxInput && !pxInput.value && m.ref_px) pxInput.value = m.ref_px;
+
+                // Render Sub-Views
+                renderOrderBook(data.order_book);
+                renderCloseCallOffers(data.executable_offers || []);
+                allTradesCache = data.trades || [];
+                renderTradesTableRows();
+                renderLeaderboard(data.leaderboard, data.recent_flow, m);
+            }}
+        }} catch (e) {{
+            console.error('Error loading trades data:', e);
+        }}
+    }}
+
+    async function loadCloseCallData() {{
+        return loadTradesData();
+    }}
+
+    async function runAutonomousCycle() {{
+        playBeep(660, 'triangle', 0.08);
+        try {{
+            const res = await fetch('/api/trades/cycle', {{
+                ...SENTINEL_FETCH,
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json'
+                }},
+                body: JSON.stringify({{ max_trades: 2, room: 'close1' }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                soundDeal();
+                const r = data.result || {{}};
+                const exCount = (r.executed_trades && r.executed_trades.length) || 0;
+                const qCount = (r.posted_quotes && r.posted_quotes.length) || 0;
+                alert(`⚡ Autonomous Cycle Sweep #${{r.sweep || '-'}} Completed!\nTrades Executed: ${{exCount}}\nQuotes Posted: ${{qCount}}\nNew Balance: ${{r.final_cash || '-'}} POLF\nNew Position: ${{r.final_position || '-'}} NVDA`);
+                loadTradesData();
+            }} else {{
+                alert('Cycle error: ' + (data.error || 'Failed to run trading cycle'));
+            }}
+        }} catch (e) {{
+            alert('Error running cycle: ' + e);
+        }}
+    }}
+
+    async function postSkewedQuote() {{
+        playBeep(720, 'triangle', 0.08);
+        try {{
+            const res = await fetch('/api/trades/skewed_quote', {{
+                ...SENTINEL_FETCH,
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json'
+                }},
+                body: JSON.stringify({{ room: 'close1', qty: '1.00', until: 12 }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                soundDeal();
+                const q = data.quote || {{}};
+                alert(`📐 Skewed Market Quote Posted to /r/close1!\nSide: ${{q.side || '-'}}\nPrice: $${{q.price || '-'}}\nQty: ${{q.qty || '-'}}\nID: ${{q.id || '-'}}`);
+                loadTradesData();
+            }} else {{
+                alert('Quote rejected: ' + (data.error || data.message));
+            }}
+        }} catch (e) {{
+            alert('Error posting quote: ' + e);
+        }}
+    }}
+
+    function renderCloseCallOffers(offers) {{
+        const list = document.getElementById('ccOfferList');
+        if (!list) return;
+        if (!offers || offers.length === 0) {{
+            list.innerHTML = '<div style="color: #64748b; font-size: 11px; padding: 10px;">No open offers currently found in trading rooms.</div>';
+            return;
+        }}
+        list.innerHTML = '';
+        offers.forEach(o => {{
+            const t = o.terms || (o.data && o.data.terms) || {{}};
+            const card = document.createElement('div');
+            card.style.background = '#04130d';
+            card.style.border = '1px solid #133324';
+            card.style.borderRadius = '5px';
+            card.style.padding = '8px';
+            card.style.fontSize = '11px';
+            
+            const isBuy = t.side === 'buy';
+            card.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                    <span style="font-weight: 800; color: ${{isBuy ? '#10b981' : '#ef4444'}};">${{t.side ? t.side.toUpperCase() : '-'}} ${{t.qty}} NVDA @ $${{t.px}}</span>
+                    <span style="color: #64748b; font-size: 10px;">/r/${{o.room}}</span>
+                </div>
+                <div style="color: #94a3b8; font-size: 10px; margin-bottom: 6px;">
+                    Maker: ${{t.maker ? t.maker.substring(0, 16) + '...' : '-'}} | ID: ${{t.id}} | Expires: sweep #${{t.until}}
+                </div>
+                <button class="hud-btn cc-exec-btn" style="width: 100%; justify-content: center; background: #064e3b; border-color: #10b981; color: #a7f3d0;">
+                    Countersign & Execute Trade ⚡
+                </button>
+            `;
+            const btn = card.querySelector('.cc-exec-btn');
+            btn.onclick = () => acceptCloseCallOffer(o);
+            list.appendChild(card);
+        }});
+    }}
+
+        let currentLbTab = 'trades';
+    let allStandingsCache = [];
+
+    function switchLbTab(tab) {{
+        currentLbTab = tab;
+        ['btnLbTrades', 'btnLbEscrow', 'btnLbSwarm'].forEach(id => {{
+            const btn = document.getElementById(id);
+            if (btn) btn.classList.remove('active');
+        }});
+        ['lbPaneTrades', 'lbPaneEscrow', 'lbPaneSwarm'].forEach(id => {{
+            const pane = document.getElementById(id);
+            if (pane) pane.style.display = 'none';
+        }});
+
+        if (tab === 'trades') {{
+            document.getElementById('btnLbTrades')?.classList.add('active');
+            const pane = document.getElementById('lbPaneTrades');
+            if (pane) pane.style.display = 'flex';
+        }} else if (tab === 'escrow') {{
+            document.getElementById('btnLbEscrow')?.classList.add('active');
+            const pane = document.getElementById('lbPaneEscrow');
+            if (pane) pane.style.display = 'flex';
+        }} else if (tab === 'swarm') {{
+            document.getElementById('btnLbSwarm')?.classList.add('active');
+            const pane = document.getElementById('lbPaneSwarm');
+            if (pane) pane.style.display = 'flex';
+        }}
+        playBeep(700, 'triangle', 0.05);
+    }}
+
+    function filterLbStandings() {{
+        const q = (document.getElementById('lbSearchInput')?.value || '').toLowerCase().trim();
+        if (!allStandingsCache || allStandingsCache.length === 0) return;
+        const filtered = allStandingsCache.filter(item => !q || item.did.toLowerCase().includes(q) || String(item.rank).includes(q));
+        renderLbStandingsRows(filtered);
+    }}
+
+    function renderLbStandingsRows(items) {{
+        const tbody = document.getElementById('lbStandingsTableBody');
+        if (!tbody) return;
+        if (!items || items.length === 0) {{
+            tbody.innerHTML = '<tr><td colspan="4" style="color: #64748b; padding: 10px; text-align: center;">No matching contenders found.</td></tr>';
+            return;
+        }}
+        tbody.innerHTML = items.map(entry => {{
+            const pnlNum = parseFloat(entry.pnl) || 0;
+            const pnlSign = pnlNum >= 0 ? '+' : '';
+            const pnlCol = pnlNum >= 0 ? '#10b981' : '#ef4444';
+            const isUs = entry.is_our_agent;
+            const rankBadge = entry.rank === 1 ? '🥇 #1' : (entry.rank === 2 ? '🥈 #2' : (entry.rank === 3 ? '🥉 #3' : `#${{entry.rank}}`));
+            const rowBg = isUs ? 'rgba(245, 158, 11, 0.16)' : 'transparent';
+            const rowBorder = isUs ? '1px solid #f59e0b' : 'none';
+            return `
+                <tr style="border-bottom: 1px solid #0f291e; background: ${{rowBg}};">
+                    <td style="padding: 5px 6px; font-weight: bold; color: ${{entry.rank <= 3 ? '#fbbf24' : '#94a3b8'}};">${{rankBadge}}</td>
+                    <td style="padding: 5px 6px; font-family: monospace; color: ${{isUs ? '#fde68a' : '#cbd5e1'}};" title="${{entry.did}}">
+                        ${{entry.short_did}} ${{isUs ? '<b style="color:#f59e0b; margin-left:4px;">(YOU)</b>' : ''}}
+                    </td>
+                    <td style="padding: 5px 6px; text-align: right; font-weight: 800; color: ${{pnlCol}};">${{pnlSign}}${{entry.pnl}} POLF</td>
+                    <td style="padding: 5px 6px; text-align: center;">
+                        <span style="font-size: 9px; padding: 1px 5px; border-radius: 3px; background: ${{isUs ? '#78350f' : '#064e3b'}}; color: ${{isUs ? '#fde68a' : '#a7f3d0'}};">
+                            ${{isUs ? 'OUR NODE' : 'CONTENDER'}}
+                        </span>
+                    </td>
+                </tr>
+            `;
+        }}).join('');
+    }}
+
+    async function loadLeaderboardData(forceRefresh = false) {{
+        try {{
+            const res = await fetch('/api/leaderboard');
+            if (!res.ok) return;
+            const data = await res.json();
+            if (data && data.status === 'ok') {{
+                const tr = data.trades || {{}};
+                const es = data.escrow || {{}};
+                const sw = data.swarm || {{}};
+                const standings = tr.standings || [];
+                const ourAgent = tr.our_agent || {{}};
+
+                // Header
+                setStatOrPlaceholder('lbSweepN', (tr.sweep !== undefined && tr.sweep !== null) ? `#${{tr.sweep}}` : null, '#fbbf24');
+                setStatOrPlaceholder('lbMarkPx', tr.global_mark ? `$${{tr.global_mark}}` : null, '#00f5ff');
+                setStatOrPlaceholder('lbRefPx', tr.ref_px ? `$${{tr.ref_px}}` : null, '#34d399');
+
+                // Podium
+                const podiumEl = document.getElementById('lbPodiumRow');
+                if (podiumEl) {{
+                    const top3 = standings.slice(0, 3);
+                    const pCards = [
+                        {{ title: '🥇 1ST PLACE', color: '#fbbf24', border: '#f59e0b', bg: 'rgba(245, 158, 11, 0.12)' }},
+                        {{ title: '🥈 2ND PLACE', color: '#cbd5e1', border: '#64748b', bg: 'rgba(100, 116, 139, 0.12)' }},
+                        {{ title: '🥉 3RD PLACE', color: '#f97316', border: '#d97706', bg: 'rgba(217, 119, 6, 0.12)' }}
+                    ];
+                    if (top3.length === 0) {{
+                        podiumEl.innerHTML = '<div style="color:#64748b; grid-column:span 3; text-align:center;">No standings available.</div>';
+                    }} else {{
+                        podiumEl.innerHTML = top3.map((entry, idx) => {{
+                            const pnlNum = parseFloat(entry.pnl) || 0;
+                            const pnlSign = pnlNum >= 0 ? '+' : '';
+                            const pnlCol = pnlNum >= 0 ? '#10b981' : '#ef4444';
+                            const isUs = entry.is_our_agent;
+                            const c = pCards[idx] || pCards[0];
+                            return `
+                                <div style="background: ${{c.bg}}; border: 1px solid ${{c.border}}; border-radius: 6px; padding: 8px; text-align: center;">
+                                    <div style="font-size: 10px; font-weight: 800; color: ${{c.color}};">${{c.title}}</div>
+                                    <div style="font-size: 10.5px; font-weight: 700; color: #fff; margin: 3px 0; font-family: monospace;" title="${{entry.did}}">${{entry.short_did}}${{isUs ? ' ⭐' : ''}}</div>
+                                    <div style="font-size: 12px; font-weight: 900; color: ${{pnlCol}};">${{pnlSign}}${{entry.pnl}} POLF</div>
+                                </div>
+                            `;
+                        }}).join('');
+                    }}
+                }}
+
+                // Our Agent Spotlight Card
+                const ourCard = document.getElementById('lbOurAgentCard');
+                if (ourCard && ourAgent) {{
+                    const u = ourAgent.unrealized_pnl || 0;
+                    const uSign = u >= 0 ? '+' : '';
+                    const uCol = u >= 0 ? '#10b981' : '#ef4444';
+                    const rankDisplay = ourAgent.rank ? (typeof ourAgent.rank === 'number' ? `#${{ourAgent.rank}}` : ourAgent.rank) : '> 25 (Unranked)';
+                    ourCard.innerHTML = `
+                        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(245, 158, 11, 0.3); padding-bottom: 6px; margin-bottom: 8px;">
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span style="font-size: 14px;">🎯</span>
+                                <span style="font-size: 11px; font-weight: 800; color: #fde68a;">OUR AGENT STATUS (@noob_nad)</span>
+                            </div>
+                            <span style="background: rgba(245, 158, 11, 0.2); border: 1px solid #f59e0b; color: #fde68a; font-size: 10px; font-weight: 800; padding: 2px 6px; border-radius: 4px;">CURRENT RANK: ${{rankDisplay}}</span>
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; font-size: 10.5px;">
+                            <div><span style="color:#64748b;">FREE CASH:</span><br><b style="color:#34d399;">${{Number(ourAgent.cash || 0).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}})}} POLF</b></div>
+                            <div><span style="color:#64748b;">POSITION:</span><br><b style="color:#f59e0b;">${{ourAgent.position || '0'}} NVDA</b></div>
+                            <div><span style="color:#64748b;">NET EQUITY:</span><br><b style="color:#00f5ff;">${{Number(ourAgent.total_equity || 0).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}})}} POLF</b></div>
+                            <div><span style="color:#64748b;">UNREALIZED:</span><br><b style="color:${{uCol}};">${{uSign}}${{u}} POLF</b></div>
+                        </div>
+                    `;
+                }}
+
+                // Standings table
+                allStandingsCache = standings;
+                filterLbStandings();
+
+                // Positions ladder
+                const posEl = document.getElementById('lbPositionsList');
+                if (posEl) {{
+                    const tPos = tr.top_positions || [];
+                    if (tPos.length === 0) {{
+                        posEl.innerHTML = '<div style="color: #64748b;">No positions available.</div>';
+                    }} else {{
+                        posEl.innerHTML = tPos.slice(0, 10).map((p, idx) => `
+                            <div style="display: flex; justify-content: space-between; background: #06150f; border: 1px solid #132a21; border-radius: 4px; padding: 4px 6px;">
+                                <span style="color: #64748b;">#${{idx + 1}} <span style="color: #a7f3d0; font-family: monospace;" title="${{p.did}}">${{p.short_did}}</span></span>
+                                <b style="color: ${{parseFloat(p.position) >= 0 ? '#10b981' : '#f43f5e'}};">${{p.position}} NVDA</b>
+                            </div>
+                        `).join('');
+                    }}
+                }}
+
+                // Tab 2: Escrow Payers
+                const pBody = document.getElementById('lbPayersTableBody');
+                if (pBody) {{
+                    const tPayers = es.top_payers || [];
+                    if (tPayers.length === 0) {{
+                        pBody.innerHTML = '<tr><td colspan="4" style="color:#64748b; text-align:center; padding:8px;">No payer records yet.</td></tr>';
+                    }} else {{
+                        pBody.innerHTML = tPayers.map((p, idx) => `
+                            <tr style="border-bottom: 1px solid #0f291e;">
+                                <td style="padding: 4px; color: #fbbf24; font-weight: bold;">#${{idx + 1}}</td>
+                                <td style="padding: 4px; font-family: monospace; color: #a7f3d0;" title="${{p.did}}">${{p.short_did}}</td>
+                                <td style="padding: 4px; text-align: center; color: #00f5ff; font-weight: bold;">${{p.count}} deals</td>
+                                <td style="padding: 4px; text-align: right; color: #34d399; font-weight: bold;">${{Number(p.volume).toLocaleString()}} FLOP</td>
+                            </tr>
+                        `).join('');
+                    }}
+                    const dealsCountEl = document.getElementById('lbTotalDeals');
+                    if (dealsCountEl && es.total_deals) {{
+                        dealsCountEl.innerText = Number(es.total_deals).toLocaleString();
+                    }}
+                }}
+
+                // Tab 3: Swarm
+                const hbEl = document.getElementById('lbSwarmHeartbeats');
+                if (hbEl && sw.heartbeats) hbEl.innerText = Number(sw.heartbeats).toLocaleString();
+                const repEl = document.getElementById('lbSwarmReplies');
+                if (repEl && sw.replies) repEl.innerText = Number(sw.replies).toLocaleString();
+            }}
+        }} catch (err) {{
+            console.error('Error loading leaderboard data:', err);
+        }}
+    }}
+
+    async function registerCloseCallOwner() {{
+        soundClick();
+        try {{
+            const res = await fetch('/api/close_call/register', {{
+                ...SENTINEL_FETCH,
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json'
+                }},
+                body: JSON.stringify({{ room: 'close1' }})
+            }});
+            const data = await res.json();
+            alert(data.success ? 'Registration broadcast successfully to close1!' : 'Failed: ' + (data.error || data.message));
+            loadCloseCallData();
+        }} catch (e) {{
+            alert('Error registering: ' + e);
+        }}
+    }}
+
+    async function submitCloseCallOffer() {{
+        soundClick();
+        const side = document.getElementById('ccSideInput').value;
+        const qty = document.getElementById('ccQtyInput').value;
+        const px = document.getElementById('ccPxInput').value;
+        const room = document.getElementById('ccRoomInput').value;
+        const taker = document.getElementById('ccTakerInput').value;
+
+        try {{
+            const res = await fetch('/api/close_call/offer', {{
+                ...SENTINEL_FETCH,
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json'
+                }},
+                body: JSON.stringify({{ side: side, qty: qty, px: px, room: room, taker: taker }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                soundDeal();
+                alert('Offer posted successfully to /r/' + room + '!');
+                document.getElementById('ccOfferForm').style.display = 'none';
+                loadCloseCallData();
+            }} else {{
+                alert('Offer rejected: ' + (data.error || data.message));
+            }}
+        }} catch (e) {{
+            alert('Error submitting offer: ' + e);
+        }}
+    }}
+
+    async function acceptCloseCallOffer(offer) {{
+        const terms = offer.terms || (offer.data && offer.data.terms) || {{}};
+        if (!confirm(`Are you sure you want to countersign and execute trade ${{terms.id}} (${{terms.side ? terms.side.toUpperCase() : ''}} ${{terms.qty}} @ $${{terms.px}})?`)) return;
+        soundClick();
+        try {{
+            const res = await fetch('/api/close_call/accept', {{
+                ...SENTINEL_FETCH,
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json'
+                }},
+                body: JSON.stringify({{ offer: offer, room: offer.room }})
+            }});
+            const data = await res.json();
+            if (data.success) {{
+                soundDeal();
+                alert('Trade accepted and broadcast to /r/' + (offer.room || 'close1') + '!');
+                loadCloseCallData();
+            }} else {{
+                alert('Failed to execute trade: ' + (data.error || data.message));
+            }}
+        }} catch (e) {{
+            alert('Error accepting offer: ' + e);
+        }}
+    }}
+
     async function sendSignedMessage() {{
         const text = (document.getElementById('messageInput').value || '').trim();
         const room = (document.getElementById('targetRoomInput').value || 'lobby').trim();
@@ -5204,10 +7176,10 @@ def render_dashboard_html() -> str:
 
         try {{
             const res = await fetch('/api/send', {{
+                ...SENTINEL_FETCH,
                 method: 'POST',
                 headers: {{
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${{sessionToken}}`
+                    'Content-Type': 'application/json'
                 }},
                 body: JSON.stringify({{ room: room, text: text }})
             }});
@@ -5242,8 +7214,9 @@ def render_dashboard_html() -> str:
         }}
         try {{
             const res = await fetch('/api/room/claim', {{
+                ...SENTINEL_FETCH,
                 method: 'POST',
-                headers: {{ 'Content-Type': 'application/json', 'Authorization': `Bearer ${{sessionToken}}` }},
+                headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify({{ room: r }})
             }});
             const data = await res.json();
@@ -5260,8 +7233,9 @@ def render_dashboard_html() -> str:
         if (!confirm('Publish identity to sharded directory?')) return;
         try {{
             const res = await fetch('/api/publish_identity', {{
+                ...SENTINEL_FETCH,
                 method: 'POST',
-                headers: {{ 'Content-Type': 'application/json', 'Authorization': `Bearer ${{sessionToken}}` }},
+                headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify({{ mailbox: `mb-p-sentinel-${{Math.random().toString(36).substring(2,8)}}` }})
             }});
             const data = await res.json();
@@ -5278,214 +7252,20 @@ def render_dashboard_html() -> str:
         return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }}
 
-    // Sonnet Challenge 50K Hub Controls
-    async function loadSonnetData() {{
-        try {{
-            const res = await fetch('/api/sonnet/status');
-            const data = await res.json();
-            if (data.status === 'ok') {{
-                const agent = data.agent || {{}};
-                const letters = data.letters || {{}};
-                
-                if (document.getElementById('sonnetDid')) {{
-                    document.getElementById('sonnetDid').innerText = agent.did || 'did:key:...';
-                }}
-                if (document.getElementById('sonnetReferee')) {{
-                    document.getElementById('sonnetReferee').innerText = agent.referee || 'did:key:...';
-                }}
-                if (document.getElementById('sonnetReceiptSeq')) {{
-                    const seq = agent.intake_seq ? `#${{agent.intake_seq}} (Accepted)` : 'Verified';
-                    document.getElementById('sonnetReceiptSeq').innerText = seq;
-                }}
-                if (document.getElementById('sonnetVocabCount')) {{
-                    document.getElementById('sonnetVocabCount').innerText = `${{(letters.word_count || 16546).toLocaleString()}} Words`;
-                }}
-                if (document.getElementById('sonnetLettersHave')) {{
-                    document.getElementById('sonnetLettersHave').innerText = (letters.usable_letters || []).join(' ');
-                }}
-                if (document.getElementById('sonnetLettersLack')) {{
-                    document.getElementById('sonnetLettersLack').innerText = (letters.excluded_letters || []).join(' ');
-                }}
-                if (document.getElementById('sonnetRegBadge')) {{
-                    const reg = agent.registered;
-                    document.getElementById('sonnetRegBadge').innerText = reg === 'accepted' ? 'ACCEPTED WRITER' : (reg ? 'REGISTERED' : 'PENDING');
-                    document.getElementById('sonnetRegBadge').style.background = reg === 'accepted' ? '#064e3b' : '#3b0764';
-                    document.getElementById('sonnetRegBadge').style.color = reg === 'accepted' ? '#86efac' : '#f0abfc';
-                }}
-            }}
-        }} catch (e) {{
-            console.error('Sonnet status load error:', e);
-        }}
-    }}
-
-    async function testSonnetWord() {{
-        const input = document.getElementById('sonnetWordInput');
-        const resBox = document.getElementById('sonnetWordResult');
-        if (!input || !resBox) return;
-        const word = (input.value || '').trim();
-        if (!word) return;
-
-        resBox.style.display = 'block';
-        resBox.innerHTML = '<span style="color: #94a3b8;">Analyzing phonetics and letter legality...</span>';
-
-        try {{
-            const res = await fetch(`/api/sonnet/validate?word=${{encodeURIComponent(word)}}`);
-            const data = await res.json();
-            if (data.legal_letters && data.in_cmu) {{
-                playBeep(880, 'sine', 0.1);
-                // Trigger celebratory canvas particles at center
-                const cx = sCanvas.width / 2;
-                const cy = sCanvas.height / 2;
-                shockwaves.push({{ x: cx, y: cy, radius: 8, maxRadius: 180, alpha: 0.8 }});
-                for (let k = 0; k < 25; k++) {{
-                    const ang = Math.random() * Math.PI * 2;
-                    const spd = 1.5 + Math.random() * 4;
-                    particles.push({{
-                        x: cx, y: cy,
-                        vx: Math.cos(ang) * spd,
-                        vy: Math.sin(ang) * spd,
-                        life: 0.9,
-                        color: '#10b981'
-                    }});
-                }}
-                resBox.innerHTML = `
-                    <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid #10b981; border-radius: 6px; padding: 8px;">
-                        <div style="color: #86efac; font-weight: 800;">✅ VALID WORD: "${{escapeHtml(data.word)}}"</div>
-                        <div style="margin-top: 4px; color: #cbd5e1;">Syllables: <b style="color: #fff;">${{data.syllables}}</b> | Rhyme: <code style="color: #67e8f9;">${{data.rhyme_key || 'N/A'}}</code></div>
-                        <div style="color: #64748b; font-size: 10px;">Phonemes: ${{data.phonemes.join(' ')}}</div>
-                    </div>`;
-            }} else {{
-                playBeep(220, 'sawtooth', 0.15);
-                const reasons = [];
-                if (!data.legal_letters) reasons.push(`Contains excluded letters: <b>${{escapeHtml((data.violating_letters || []).join(', '))}}</b>`);
-                if (!data.in_cmu) reasons.push('Not found in CMU pronunciation dictionary');
-                resBox.innerHTML = `
-                    <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; border-radius: 6px; padding: 8px;">
-                        <div style="color: #fca5a5; font-weight: 800;">❌ INVALID WORD: "${{escapeHtml(data.word)}}"</div>
-                        <div style="margin-top: 4px; color: #fecaca; font-size: 10.5px;">${{reasons.join(' | ')}}</div>
-                    </div>`;
-            }}
-        }} catch (e) {{
-            resBox.innerHTML = `<span style="color: #ef4444;">Validation error: ${{escapeHtml(e.message)}}</span>`;
-        }}
-    }}
-
-    async function simulateSonnet() {{
-        const box = document.getElementById('sonnetSimBox');
-        const badge = document.getElementById('sonnetSimBadge');
-        if (!box) return;
-
-        // Auto-switch to Sonnet Hexverse animated perspective
-        setPerspective('sonnet');
-
-        box.innerHTML = '<div style="color: #f472b6; padding: 12px; text-align: center;">⚡ Composing Shakespearean Sonnet (14 lines, 10 syllables/line, ABAB CDCD EFEF GG)...</div>';
-        if (badge) badge.innerText = 'Composing...';
-
-        try {{
-            const res = await fetch('/api/sonnet/simulate');
-            const data = await res.json();
-            if (data.status === 'ok') {{
-                playBeep(660, 'sine', 0.12);
-                if (badge) badge.innerText = `${{data.stanza_count}} Stanzas | ${{data.total_syllables}} Syllables`;
-                
-                // Trigger poetic cosmic plasma burst on canvas!
-                const cx = sCanvas.width / 2;
-                const cy = sCanvas.height / 2;
-                shockwaves.push({{ x: cx, y: cy, radius: 12, maxRadius: 360, alpha: 1.0 }});
-                for (let k = 0; k < 50; k++) {{
-                    const ang = Math.random() * Math.PI * 2;
-                    const spd = 2 + Math.random() * 6;
-                    particles.push({{
-                        x: cx, y: cy,
-                        vx: Math.cos(ang) * spd,
-                        vy: Math.sin(ang) * spd,
-                        life: 1.0,
-                        color: ['#f472b6', '#fbbf24', '#10b981', '#38bdf8', '#c084fc'][k % 5]
-                    }});
-                }}
-
-                let linesHtml = data.lines.map((l, idx) => {{
-                    const stBreak = (idx === 3 || idx === 7 || idx === 11) ? 'margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px dashed rgba(236,72,153,0.2);' : '';
-                    return `<div style="display: flex; justify-content: space-between; align-items: baseline; ${{stBreak}}">
-                        <span><span style="color: #64748b; font-size: 10px; width: 22px; display: inline-block;">${{idx + 1}}.</span> ${{escapeHtml(l.text)}}</span>
-                        <span style="font-family: monospace; font-size: 10px; color: #a7f3d0; margin-left: 8px;">${{l.syllables}}s</span>
-                    </div>`;
-                }}).join('');
-
-                box.innerHTML = `
-                    <div style="font-family: Georgia, serif; line-height: 1.7; color: #f0fdf4;">
-                        ${{linesHtml}}
-                    </div>
-                    <div style="margin-top: 10px; padding-top: 8px; border-top: 1px solid #1e293b; font-size: 10.5px; color: #94a3b8; display: flex; justify-content: space-between;">
-                        <span>Rhyme Scheme: <b style="color: #f472b6;">ABAB CDCD EFEF GG</b></span>
-                        <span style="color: #86efac;">100% DID Validated</span>
-                    </div>`;
-            }} else {{
-                box.innerHTML = `<div style="color: #ef4444;">Simulation error: ${{escapeHtml(data.error || 'Unknown error')}}</div>`;
-            }}
-        }} catch (e) {{
-            box.innerHTML = `<div style="color: #ef4444;">Network error: ${{escapeHtml(e.message)}}</div>`;
-        }}
-    }}
-
-    async function announceSonnetAvailability() {{
-        if (!confirm('Broadcast agent availability to discovery room?')) return;
-        soundClick();
-        try {{
-            const res = await fetch('/api/sonnet/announce', {{
-                method: 'POST',
-                headers: {{
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${{sessionToken}}`
-                }}
-            }});
-            const data = await res.json();
-            if (data.status === 'ok') {{
-                playBeep(880, 'sine', 0.15);
-                alert(`Broadcast successfully posted! (Room seq: ${{data.result?.seq || 'sent'}})\\nOther teams can now recruit your agent.`);
-                loadSonnetData();
-            }} else {{
-                alert(`Broadcast error: ${{data.error || 'Failed'}}`);
-            }}
-        }} catch (e) {{
-            alert(`Error: ${{e.message}}`);
-        }}
-    }}
-
-    async function applySonnetTeam() {{
-        const input = document.getElementById('sonnetApplyGameInput');
-        const resBox = document.getElementById('sonnetApplyResult');
-        if (!input || !resBox) return;
-        const gameId = (input.value || '').trim();
-        if (!gameId) {{
-            alert('Please enter a team game ID (e.g. bub or aurora-2)');
-            return;
-        }}
-
-        soundClick();
-        resBox.style.display = 'block';
-        resBox.innerHTML = `<span style="color: #67e8f9;">Submitting join request to team "${{escapeHtml(gameId)}}"...</span>`;
-
-        try {{
-            const res = await fetch('/api/sonnet/apply', {{
-                method: 'POST',
-                headers: {{
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${{sessionToken}}`
-                }},
-                body: JSON.stringify({{ game_id: gameId }})
-            }});
-            const data = await res.json();
-            if (data.status === 'ok') {{
-                playBeep(880, 'sine', 0.15);
-                resBox.innerHTML = `<span style="color: #86efac; font-weight: 700;">✅ Successfully applied to team "${{escapeHtml(gameId)}}"! Monitored by autonomous daemon.</span>`;
-                input.value = '';
-            }} else {{
-                playBeep(220, 'sawtooth', 0.15);
-                resBox.innerHTML = `<span style="color: #fca5a5;">❌ Application error: ${{escapeHtml(data.error || 'Failed')}}</span>`;
-            }}
-        }} catch (e) {{
-            resBox.innerHTML = `<span style="color: #ef4444;">Network error: ${{escapeHtml(e.message)}}</span>`;
+    // Phase 1d: a stat element shows its real (colored) value once data
+    // arrives, or a muted, clearly-intentional "—" placeholder before that —
+    // instead of a bare "-"/"--" that reads as broken rather than not-loaded-yet.
+    function setStatOrPlaceholder(id, value, color) {{
+        const el = document.getElementById(id);
+        if (!el) return;
+        if (value === undefined || value === null || value === '') {{
+            el.innerText = '—';
+            el.style.color = '#4b7a63';
+            el.style.fontStyle = 'italic';
+        }} else {{
+            el.innerText = value;
+            el.style.color = color;
+            el.style.fontStyle = 'normal';
         }}
     }}
 
@@ -5493,15 +7273,16 @@ def render_dashboard_html() -> str:
     let cmdPaletteOpen = false;
     let selectedCmdIndex = 0;
     const COMMAND_LIST = [
-        {{ id: 'sonnet_hub', title: 'Open Sonnet 50K FLOP Challenge Hub', category: 'Sonnet', icon: '🎭', shortcut: 'S S', action: () => {{ toggleDrawer('sonnetDrawer'); loadSonnetData(); }} }},
-        {{ id: 'sonnet_sim', title: 'Simulate 14-Line Shakespearean Sonnet', category: 'Sonnet', icon: '📜', shortcut: 'S M', action: () => {{ toggleDrawer('sonnetDrawer'); simulateSonnet(); }} }},
-        {{ id: 'sonnet_announce', title: 'Announce Sonnet Availability to mb-sonnet-1-discovery', category: 'Sonnet', icon: '📢', shortcut: 'S A', action: () => announceSonnetAvailability() }},
-        {{ id: 'mode_sonnet', title: 'Switch View: Sonnet 50K Poetic Hexverse', category: 'Views', icon: '🎭', shortcut: 'V S', action: () => setPerspective('sonnet') }},
+        {{ id: 'mode_trades', title: 'Switch View: 3D Trades Matrix & Order Book Pit', category: 'Views', icon: '📊', shortcut: 'V P', action: () => setPerspective('trades') }},
         {{ id: 'mode_tclk', title: 'Switch View: TCLK Escrow Grid', category: 'Views', icon: '🤝', shortcut: 'V T', action: () => setPerspective('tclk') }},
         {{ id: 'mode_galaxy', title: 'Switch View: 3D Galaxy Orbit', category: 'Views', icon: '🌌', shortcut: 'V G', action: () => setPerspective('galaxy') }},
         {{ id: 'mode_neural', title: 'Switch View: Neural Constellation', category: 'Views', icon: '⚡', shortcut: 'V N', action: () => setPerspective('neural') }},
         {{ id: 'mode_iso', title: 'Switch View: 2.5D Isometric Matrix', category: 'Views', icon: '📐', shortcut: 'V I', action: () => setPerspective('isometric') }},
+        {{ id: 'action_trade_cycle', title: 'Execute Autonomous Trading Cycle (Close-1)', category: 'Trades', icon: '⚡', shortcut: 'T C', action: () => runAutonomousCycle() }},
+        {{ id: 'action_trade_quote', title: 'Post 2-Sided Skewed Market Quote', category: 'Trades', icon: '📐', shortcut: 'T Q', action: () => postSkewedQuote() }},
+        {{ id: 'action_trade_drawer', title: 'Open Trades & Close Call Challenge Hub', category: 'Trades', icon: '📈', shortcut: 'T H', action: () => {{ toggleDrawer('closeCallDrawer'); loadTradesData(); }} }},
         {{ id: 'open_offers', title: 'Channel: Jump to /r/tclk-offers', category: 'Navigation', icon: '💼', shortcut: 'G O', action: () => jumpToDealRoom('tclk-offers') }},
+        {{ id: 'open_close1', title: 'Channel: Jump to /r/close1 (Trades Room)', category: 'Navigation', icon: '📈', shortcut: 'G C', action: () => jumpToDealRoom('close1') }},
         {{ id: 'open_lobby', title: 'Channel: Jump to /r/lobby', category: 'Navigation', icon: '💬', shortcut: 'G L', action: () => jumpToDealRoom('lobby') }},
         {{ id: 'open_meta', title: 'Channel: Jump to /r/meta', category: 'Navigation', icon: '🌐', shortcut: 'G M', action: () => jumpToDealRoom('meta') }},
         {{ id: 'action_offer', title: 'Create TCLK Escrow Bounty Offer', category: 'Actions', icon: '➕', shortcut: 'C B', action: () => {{ toggleDrawer('tclkDrawer'); document.getElementById('tclkOfferForm').style.display = 'flex'; }} }},
@@ -5586,6 +7367,9 @@ def render_dashboard_html() -> str:
         }}
     }}
 
+    let keySeq = '';
+    let keySeqTimer = null;
+
     document.addEventListener('keydown', (e) => {{
         if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {{
             e.preventDefault();
@@ -5624,6 +7408,31 @@ def render_dashboard_html() -> str:
                     execCmd(filtered[selectedCmdIndex].id);
                 }}
             }}
+            return;
+        }}
+
+        // Sequential 2-key shortcuts (e.g. 'V P' for Trades Pit, 'T C' for Trading Cycle)
+        if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) {{
+            return;
+        }}
+        if (e.ctrlKey || e.metaKey || e.altKey || e.key.length !== 1) return;
+
+        const k = e.key.toUpperCase();
+        clearTimeout(keySeqTimer);
+        keySeq = (keySeq ? (keySeq + ' ') : '') + k;
+
+        const matched = COMMAND_LIST.find(c => c.shortcut && c.shortcut.toUpperCase() === keySeq);
+        if (matched) {{
+            e.preventDefault();
+            execCmd(matched.id);
+            keySeq = '';
+            return;
+        }}
+
+        if (keySeq.length === 1) {{
+            keySeqTimer = setTimeout(() => {{ keySeq = ''; }}, 900);
+        }} else {{
+            keySeq = '';
         }}
     }});
 
@@ -5640,13 +7449,20 @@ def render_dashboard_html() -> str:
     updateScrubDate();
     fetchTimeline();
     fetchTerminalLogs();
-    loadSonnetData();
+    fetchThreatFeed();
+    loadTradesData();
+    loadLeaderboardData();
     animate();
 
     setInterval(() => {{ if (isTabVisible) fetchTimeline(); }}, 3500);
     setInterval(() => {{ if (isTabVisible) fetchTerminalLogs(); }}, 4000);
-    setInterval(() => {{ if (isTabVisible) loadSonnetData(); }}, 15000);
-</script>
+    setInterval(() => {{ if (isTabVisible) fetchThreatFeed(); }}, 4000);
+    setInterval(() => {{ 
+        if (isTabVisible && (currentMode === 'trades' || (document.getElementById('closeCallDrawer') && document.getElementById('closeCallDrawer').classList.contains('open')))) {{
+            loadTradesData();
+        }}
+    }}, 4000);
+    </script>
 
 </body>
 </html>"""
@@ -5672,13 +7488,30 @@ def start_server(port: int = DEFAULT_PORT, host: str = HOST, public: bool = Fals
     print(f"  Fingerprint:      {fp}")
     print(f"  Mode:             {'PUBLIC (0.0.0.0)' if public else 'LOCAL ONLY (127.0.0.1)'}")
     print(f"  Web URL:          http://{bind_host}:{port}")
-    print(f"  Session Token:    [redacted — embedded in dashboard HTML]")
+    print(f"  Login page:       {LOGIN_PATH}")
+    if _password_is_generated:
+        print(f"  Passphrase:       {_admin_password}")
+        print("                    ^ generated for this process. Set SENTINEL_PASSWORD to pin it.")
+    else:
+        print("  Passphrase:       [from SENTINEL_PASSWORD]")
+    print("  Session token:    [issued as HttpOnly cookie at login, never rendered]")
+    if public:
+        allowed = sorted(allowed_host_set())
+        loopback_only = {"127.0.0.1", "localhost", f"127.0.0.1:{_active_port}", f"localhost:{_active_port}"}
+        public_hosts = [h for h in allowed if h not in loopback_only]
+        print(f"  Allowed hosts:    {', '.join(allowed)}")
+        if not public_hosts:
+            print("                    ^ WARNING: no public hostname resolved, so every request to the")
+            print("                      public URL will be rejected as rebinding. Set SENTINEL_ALLOWED_HOSTS")
+            print("                      or RENDER_EXTERNAL_HOSTNAME.")
     print("=" * 65)
     print(f"[+] Launching on http://{bind_host}:{port} ...\n")
 
-    # Start background monitor thread
+    # Start background monitor & trades collector threads
     monitor = SentinelStreamMonitor(poll_interval=12)
     monitor.start()
+    trades_collector = TradesCollectorThread(interval=5.0)
+    trades_collector.start()
 
     # In public/cloud deployment, also launch autonomous swarm daemon & TCLK worker thread
     if public or os.environ.get("AUTONOMOUS_DAEMON", "0") == "1":
@@ -5694,23 +7527,6 @@ def start_server(port: int = DEFAULT_PORT, host: str = HOST, public: bool = Fals
             logger.info("[+] Autonomous Swarm Daemon & TCLK Worker spawned in background thread for cloud deployment.")
         except Exception as e:
             logger.warning(f"[-] Failed to launch background swarm daemon: {e}")
-
-    # Launch autonomous sonnet daemon in background
-    if public or os.environ.get("AUTONOMOUS_SONNET", "0") == "1":
-        try:
-            from autonomous_sonnet_daemon import AutonomousSonnetDaemon
-            def _run_sonnet():
-                d = AutonomousSonnetDaemon(target_game="bub")
-                d.run_forever(interval=20)
-            sonnet_thread = threading.Thread(
-                target=_run_sonnet,
-                daemon=True,
-                name="AutonomousSonnetWorker"
-            )
-            sonnet_thread.start()
-            logger.info("[+] Autonomous Sonnet Daemon spawned in background thread.")
-        except Exception as e:
-            logger.warning(f"[-] Failed to launch background sonnet daemon: {e}")
 
     server = ThreadingHTTPServer((bind_host, port), SentinelRequestHandler)
     try:

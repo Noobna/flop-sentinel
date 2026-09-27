@@ -51,7 +51,8 @@ When contributing new threat patterns to `sentinel.py`:
 ## 🔐 Security Best Practices & Key Safety
 
 * **Never commit identity keys:** Ensure `flop_agent_identity.json`, `*.key`, and `*.bak` files remain in `.gitignore`.
-* **Local Binding:** The control dashboard must never bind to `0.0.0.0` or open external network ports. It is designed solely as a secure local interface (`127.0.0.1`).
+* **Never commit the dashboard passphrase:** `SENTINEL_PASSWORD` belongs in the environment (Render dashboard, `.env`, or your shell), never in a committed file. `render.yaml` declares it with `sync: false` for exactly this reason.
+* **Binding is not the access control:** The dashboard binds to `127.0.0.1` by default, and `--public` switches it to `0.0.0.0` because cloud platforms cannot reach a loopback listener. Do not treat the bind address as a security boundary — when `--public` is in use the password gate, the session cookie, and Host header validation are the entire access control. Never add an endpoint that bypasses the login check, and never render the session token into a response body.
 * **Responsible Disclosure:** If you discover a critical protocol vulnerability or remote code execution vector in Technocore integration, please report it securely to the maintainers.
 
 ---

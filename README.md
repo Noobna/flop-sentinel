@@ -71,8 +71,11 @@ graph TD
 * **Swarm Health & Risk Scoring:** Computes real-time room health scores (0–100%), threat velocity, and peer diversity ratios.
 
 ### 3. 🎛️ Hardened Control Hub & Web Dashboard (`dashboard.py`)
-* **Localhost Security Lockdown:** Binds exclusively to `127.0.0.1` with strict cross-origin refusal (`Access-Control-Allow-Origin: null`).
-* **Cryptographic Session Authentication:** Employs 256-bit dynamic tokens and `secrets.compare_digest` constant-time verification on all mutating endpoints.
+* **Password-Gated Access:** Every endpoint — telemetry reads included — sits behind a passphrase login. A successful login issues an `HttpOnly`, `SameSite=Strict` session cookie; the session token is never rendered into the dashboard HTML.
+* **Loopback by Default, Public by Request:** Binds to `127.0.0.1` unless launched with `--public`, which selects the `0.0.0.0` bind and `$PORT` that Render requires for a public URL.
+* **Host Header Validation:** Active in *every* mode, so `--public` does not disable the DNS-rebinding defence. Accepted public hostnames come from `RENDER_EXTERNAL_HOSTNAME`, or from an explicit `SENTINEL_ALLOWED_HOSTS` for a custom domain.
+* **Cross-Origin Refusal:** No `Access-Control-Allow-Origin` is emitted, and CORS pre-flights get a bare 204.
+* **Brute-Force Throttling:** Repeated failed logins from one address trigger a temporary lockout.
 * **1-Click Signed Broadcaster:** Interactive message composer with real-time canonical sweep previews, automatic nonces, and instant Ed25519 signing.
 * **Live Multi-Room Explorer:** Real-time stream monitor displaying active messages, threat badges, and swarm health metrics.
 
@@ -98,7 +101,30 @@ Double-click `run_sentinel.bat` or run:
 ```powershell
 python dashboard.py 5050
 ```
-Open **`http://127.0.0.1:5050`** in your browser to access the control panel.
+Open **`http://127.0.0.1:5050`** in your browser, where you will be redirected to `/login`.
+
+The dashboard is always password-gated. Set `SENTINEL_PASSWORD` to choose the
+passphrase; if you leave it unset, the server generates a random one for that
+process and prints it in the startup banner:
+
+```
+  Passphrase:       k3Jd9xQm2vLp7RtZaYbC
+                    ^ generated for this process. Set SENTINEL_PASSWORD to pin it.
+```
+
+### Option A2. Public / Cloud Deployment (Render)
+Render can only reach a process bound to `0.0.0.0` on the port it assigns, so the
+public deployment is launched with `--public`:
+
+```powershell
+python dashboard.py $PORT --public
+```
+
+`--public` changes the bind address only. It does **not** relax authentication —
+the password gate applies identically. Because the instance is now
+internet-facing, `SENTINEL_PASSWORD` must be set in the Render dashboard's
+environment; `render.yaml` declares it with `sync: false` so the secret stays out
+of git. If no passphrase is configured, the server generates one and logs it.
 
 ### Option B: Run the Autonomous Agent Daemon
 Double-click `run_daemon.bat` or run:

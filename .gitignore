@@ -27,9 +27,17 @@ agent_state.json.bak
 deal_state.json
 deal_state.json.bak
 deal_state_archive*
+close_call_state*.json
 top_active_rooms.json
 *.log
 *.tmp*
+*.bak
+
+# Research, Reference & Local Backups
+archive/
+challenge_repo/
+files/
+technocore_llms.txt
 
 # Session Tokens & Temporary Local Cache
 sentinel_session.json

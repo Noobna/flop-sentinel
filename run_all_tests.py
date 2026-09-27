@@ -14,6 +14,7 @@ import test_dashboard
 import test_tclk
 import test_evm_rail
 import test_mcp_server
+import test_close_call
 
 
 def run_full_suite():
@@ -26,6 +27,7 @@ def run_full_suite():
     suite.addTests(loader.loadTestsFromModule(test_tclk))
     suite.addTests(loader.loadTestsFromModule(test_evm_rail))
     suite.addTests(loader.loadTestsFromModule(test_mcp_server))
+    suite.addTests(loader.loadTestsFromModule(test_close_call))
 
     runner = unittest.TextTestRunner(verbosity=2)
     print("=" * 65)
