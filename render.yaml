@@ -10,10 +10,6 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      # Set this in the Render dashboard (Environment). `sync: false` keeps the secret
-      # out of git; the value is never written to disk or logged once configured.
-      - key: SENTINEL_PASSWORD
-        sync: false
       # Optional. Falls back to RENDER_EXTERNAL_HOSTNAME, which Render sets
       # automatically. Only needed for a custom domain or a tunnel in front.
       # - key: SENTINEL_ALLOWED_HOSTS

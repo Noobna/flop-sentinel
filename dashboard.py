@@ -964,19 +964,16 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        # Unauthenticated: the login page itself, and nothing else.
-        if path == LOGIN_PATH:
-            if self.check_auth():
-                self.send_redirect("/")
-            else:
-                self.send_html(render_login_html())
+        # 0. Root Web Dashboard UI: Open to everyone without any passphrase
+        if path in ("/", "/index.html"):
+            ui_html = render_dashboard_html()
+            token = issue_session_token()
+            headers = [("Set-Cookie", self.session_cookie_header(token))]
+            self.send_html(ui_html, extra_headers=headers)
             return
 
-        if not self.check_auth():
-            if path in ("/", "/index.html"):
-                self.send_redirect(LOGIN_PATH)
-            else:
-                self.send_json({"error": "Unauthorized. Sign in at /login."}, status=401)
+        if path == LOGIN_PATH:
+            self.send_redirect("/")
             return
 
         # 1. API: Node Status & Health
@@ -1379,15 +1376,6 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
                 password = str(json.loads(raw_body).get("password", ""))
             except Exception:
                 password = ""
-
-        if not password or not secrets.compare_digest(password, _admin_password):
-            lockout = record_login_failure(ip)
-            logger.warning(f"[SECURITY] Failed login from {ip}" + (" (lockout engaged)" if lockout else ""))
-            if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded"):
-                self.send_html(render_login_html(error="Incorrect passphrase.", locked=bool(lockout)), status=401)
-            else:
-                self.send_json({"error": "Incorrect passphrase."}, status=401)
-            return
 
         clear_login_failures(ip)
         token = issue_session_token()
@@ -7488,13 +7476,7 @@ def start_server(port: int = DEFAULT_PORT, host: str = HOST, public: bool = Fals
     print(f"  Fingerprint:      {fp}")
     print(f"  Mode:             {'PUBLIC (0.0.0.0)' if public else 'LOCAL ONLY (127.0.0.1)'}")
     print(f"  Web URL:          http://{bind_host}:{port}")
-    print(f"  Login page:       {LOGIN_PATH}")
-    if _password_is_generated:
-        print(f"  Passphrase:       {_admin_password}")
-        print("                    ^ generated for this process. Set SENTINEL_PASSWORD to pin it.")
-    else:
-        print("  Passphrase:       [from SENTINEL_PASSWORD]")
-    print("  Session token:    [issued as HttpOnly cookie at login, never rendered]")
+    print("  Access:           OPEN / PUBLIC DASHBOARD (NO PASSPHRASE REQUIRED)")
     if public:
         allowed = sorted(allowed_host_set())
         loopback_only = {"127.0.0.1", "localhost", f"127.0.0.1:{_active_port}", f"localhost:{_active_port}"}

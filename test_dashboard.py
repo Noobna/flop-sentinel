@@ -491,29 +491,30 @@ class TestAuthGate(unittest.TestCase):
         return self.raw("/api/login", method="POST", body=urllib.parse.urlencode({"password": password}),
                         headers={"Content-Type": "application/x-www-form-urlencoded"})
 
-    def test_reads_require_a_session(self):
-        """Telemetry that was previously world-readable now needs a credential."""
+    def test_reads_are_open_to_everyone(self):
+        """Telemetry and dashboard feeds are open to the public without requiring login."""
         for path in ("/api/status", "/api/rooms", "/api/logs", "/api/timeline",
-                     "/api/feed", "/api/limits", "/api/tclk/deals"):
+                     "/api/feed", "/api/limits", "/api/tclk/deals", "/api/leaderboard"):
             status, body, _ = self.raw(path)
-            self.assertEqual(status, 401, f"{path} should require auth")
-            self.assertIn("Unauthorized", body)
+            self.assertEqual(status, 200, f"{path} should be open to everyone")
 
-    def test_root_redirects_to_login_when_signed_out(self):
-        status, _, headers = self.raw("/")
-        self.assertEqual(status, 302)
-        self.assertEqual(headers.get("Location"), "/login")
-
-    def test_login_page_is_public_and_carries_no_secret(self):
-        status, body, _ = self.raw("/login")
+    def test_root_open_and_serves_dashboard_with_cookie(self):
+        """Root / is publicly open and automatically issues a session cookie for UI actions."""
+        status, body, headers = self.raw("/")
         self.assertEqual(status, 200)
-        self.assertNotIn(dashboard._session_token, body)
-        self.assertNotIn("SENTINEL_FETCH", body)  # not the dashboard
+        self.assertIn("TECHNOCORE SENTINEL", body)
+        self.assertIn(f"{dashboard.SESSION_COOKIE}=", headers.get("Set-Cookie") or "")
 
-    def test_wrong_password_rejected_without_cookie(self):
-        status, _, headers = self.form_login("definitely-wrong")
-        self.assertEqual(status, 401)
-        self.assertIsNone(headers.get("Set-Cookie"))
+    def test_login_page_redirects_to_root(self):
+        """Visiting /login automatically redirects directly to the open dashboard root."""
+        status, _, headers = self.raw("/login")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "/")
+
+    def test_form_login_issues_cookie_and_redirects(self):
+        status, _, headers = self.form_login("any-password")
+        self.assertEqual(status, 302)
+        self.assertIn(f"{dashboard.SESSION_COOKIE}=", headers.get("Set-Cookie") or "")
 
     def test_correct_password_issues_httponly_cookie(self):
         status, _, headers = self.form_login(self.PASSWORD)
@@ -546,41 +547,12 @@ class TestAuthGate(unittest.TestCase):
                                 headers={"Authorization": f"Bearer {dashboard._session_token}"})
         self.assertEqual(status, 200)
 
-    def test_relogin_invalidates_the_previous_session(self):
-        _, _, headers = self.form_login(self.PASSWORD)
-        stale_cookie = (headers.get("Set-Cookie") or "").split(";")[0]
-        _, _, headers2 = self.form_login(self.PASSWORD)
-        fresh_cookie = (headers2.get("Set-Cookie") or "").split(";")[0]
-        self.assertNotEqual(stale_cookie, fresh_cookie)
-        status, _, _ = self.raw("/api/status", headers={"Cookie": stale_cookie})
-        self.assertEqual(status, 401)
-        status, _, _ = self.raw("/api/status", headers={"Cookie": fresh_cookie})
-        self.assertEqual(status, 200)
-
-    def test_logout_kills_the_session(self):
+    def test_logout_clears_the_cookie(self):
         _, _, headers = self.form_login(self.PASSWORD)
         cookie = (headers.get("Set-Cookie") or "").split(";")[0]
         status, _, logout_headers = self.raw("/api/logout", method="POST", headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertIn("Max-Age=0", logout_headers.get("Set-Cookie") or "")
-        status, _, _ = self.raw("/api/status", headers={"Cookie": cookie})
-        self.assertEqual(status, 401)
-
-    def test_repeated_failures_lock_the_address_out(self):
-        ip = "127.0.0.1"
-        dashboard.clear_login_failures(ip)
-        for _ in range(dashboard.LOGIN_MAX_ATTEMPTS):
-            self.form_login("wrong-again")
-        self.assertGreater(dashboard.login_locked_out(ip), 0)
-        # Even the correct passphrase is refused while the lockout holds: it is
-        # bounced back to /login and handed no cookie.
-        status, _, headers = self.form_login(self.PASSWORD)
-        self.assertEqual(status, 302)
-        self.assertIsNone(headers.get("Set-Cookie"))
-        dashboard.clear_login_failures(ip)
-        status, _, headers = self.form_login(self.PASSWORD)
-        self.assertEqual(status, 302)
-        self.assertIsNotNone(headers.get("Set-Cookie"))
 
     def test_public_mode_rejects_foreign_host_header(self):
         """--public must not disable the DNS-rebinding check."""
