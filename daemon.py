@@ -756,7 +756,8 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
                     f"Execs: {len(res.get('executed_trades', []))} | Quotes: {len(res.get('posted_quotes', []))}"
                 )
                 for ex in res.get("executed_trades", []):
-                    logger.info(f"[Close-1] Trade Filled: {ex['side'].upper()} {ex['qty']} @ ${ex['px']} (ID: {ex['id']})")
+                    net_p = ex.get("expected_net_profit", "0.00")
+                    logger.info(f"[Close-1] Trade Filled: {ex['side'].upper()} {ex['qty']} @ ${ex['px']} (ID: {ex['id']}) [Net: ${net_p}]")
             except Exception as cc_err:
                 logger.debug(f"[Close-1] Background sweep error: {cc_err}")
 

@@ -31,6 +31,7 @@ import urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal
 
 from sentinel_core import (
     KEY_FILE,
@@ -1738,19 +1739,32 @@ class SentinelRequestHandler(BaseHTTPRequestHandler):
         # 10. API: Trades Intelligent Skewed Maker Quote
         elif path in ("/api/trades/skewed_quote", "/api/close_call/skewed_quote"):
             room = str(body.get("room") or PUBLIC_TRADING_ROOM).strip()
-            base_qty_str = str(body.get("qty") or "1.00").strip()
+            qty_raw = body.get("qty")
+            base_qty = None
+            if qty_raw is not None and str(qty_raw).strip().lower() not in ("", "auto", "dynamic", "none"):
+                try:
+                    base_qty = Decimal(str(qty_raw).strip())
+                except Exception:
+                    base_qty = Decimal("3.00")
             try:
                 until = int(body.get("until") or 12)
             except (ValueError, TypeError):
                 until = 12
             try:
-                from decimal import Decimal
                 cc_client = CloseCallClient()
-                ok, msg, quote_res = cc_client.post_skewed_quote(
+                res = cc_client.post_skewed_quote(
                     room=room,
-                    base_qty=Decimal(str(base_qty_str)),
+                    qty=base_qty,
                     until_sweeps_ahead=until,
                 )
+                if isinstance(res, tuple) and len(res) == 3:
+                    ok, msg, quote_res = res
+                elif isinstance(res, dict):
+                    ok = bool(res.get("success", False))
+                    msg = "Skewed quote posted" if ok else (res.get("bid", {}).get("message") or res.get("ask", {}).get("message") or "Rejected")
+                    quote_res = res
+                else:
+                    ok, msg, quote_res = False, "Unknown response", {}
                 with _lock:
                     _trades_cache_time = 0.0
                 self.send_json({"success": ok, "message": msg, "quote": quote_res})
@@ -3072,7 +3086,7 @@ def render_dashboard_html() -> str:
             </div>
             <div style="flex: 1;">
                 <div style="font-size: 10px; color: #86efac;">Qty (>= 0.1):</div>
-                <input type="text" id="ccQtyInput" value="1.00" class="composer-input" style="min-height: auto; padding: 5px;">
+                <input type="text" id="ccQtyInput" value="3.00" class="composer-input" style="min-height: auto; padding: 5px;">
             </div>
             <div style="flex: 1;">
                 <div style="font-size: 10px; color: #86efac;">Price (POLF):</div>
@@ -6832,7 +6846,7 @@ def render_dashboard_html() -> str:
                 headers: {{
                     'Content-Type': 'application/json'
                 }},
-                body: JSON.stringify({{ room: 'close1', qty: '1.00', until: 12 }})
+                body: JSON.stringify({{ room: 'close1', qty: '3.00', until: 12 }})
             }});
             const data = await res.json();
             if (data.success) {{

@@ -1273,6 +1273,219 @@ class TestCloseCallEngine(unittest.TestCase):
         self.assertEqual(replay_analysis.current_px, Decimal("224.00"))
 
 
+    def test_35_dynamic_sizing_and_fee_clearing_filters(self):
+        """Test scaled dynamic order sizing (3.00-5.00 lots), fee-clearing maker spread, and clawback gate."""
+        from close_call import (
+            CloseCallClient,
+            DEFAULT_ORDER_SIZE,
+            MAX_DYNAMIC_ORDER_SIZE,
+            MAX_INVENTORY,
+            MIN_PROFIT_MARGIN,
+            FEE_RATE,
+        )
+        cc = CloseCallClient()
+        ref_px = Decimal("225.00")
+
+        # 1. Dynamic sizing based on cash and headroom
+        # Rich cash (5000) & full headroom (15) -> 5.00
+        sz_max = cc.compute_dynamic_order_size(
+            side="buy",
+            pos=Decimal("0.0"),
+            cash=Decimal("5000.0"),
+            ref_px=ref_px,
+            volatility_regime="LOW",
+            max_inventory=MAX_INVENTORY,
+        )
+        self.assertEqual(sz_max, Decimal("5.00"))
+
+        # Intermediate cash (3000) & headroom 4 -> 4.00
+        sz_mid = cc.compute_dynamic_order_size(
+            side="buy",
+            pos=Decimal("11.0"),
+            cash=Decimal("3000.0"),
+            ref_px=ref_px,
+            volatility_regime="NORMAL",
+            max_inventory=MAX_INVENTORY,
+        )
+        self.assertEqual(sz_mid, Decimal("4.00"))
+
+        # Constrained inventory headroom (e.g. pos=13, max=15 -> headroom=2) -> clamped to 2.00
+        sz_headroom = cc.compute_dynamic_order_size(
+            side="buy",
+            pos=Decimal("13.0"),
+            cash=Decimal("5000.0"),
+            ref_px=ref_px,
+            volatility_regime="NORMAL",
+            max_inventory=MAX_INVENTORY,
+        )
+        self.assertEqual(sz_headroom, Decimal("2.00"))
+
+        # Extreme volatility dampens order size to minimal 1.00
+        sz_extreme = cc.compute_dynamic_order_size(
+            side="buy",
+            pos=Decimal("0.0"),
+            cash=Decimal("5000.0"),
+            ref_px=ref_px,
+            volatility_regime="EXTREME",
+            max_inventory=MAX_INVENTORY,
+        )
+        self.assertEqual(sz_extreme, Decimal("1.00"))
+
+        # 2. Maker quoting default spread clears roundtrip fee: 2 * 0.01 * 225 = $4.50 + $0.60 = $5.10
+        cc.get_latest_price_state = lambda: {"for": 25, "ref": {"px": "225.00"}}
+        cc.broadcast_message = lambda room, text: (True, "OK")
+        q_res = cc.post_skewed_quote(pos=Decimal("0.0"), spread=None, qty=None)
+        self.assertTrue(q_res["bid"]["success"])
+        self.assertTrue(q_res["ask"]["success"])
+        self.assertGreaterEqual(Decimal(q_res["bid"]["qty"]), Decimal("3.00"))
+        self.assertGreaterEqual(Decimal(q_res["ask"]["qty"]), Decimal("3.00"))
+        expected_min_spread = (Decimal("2") * FEE_RATE * ref_px) + MIN_PROFIT_MARGIN
+        actual_spread = Decimal(q_res["ask"]["px"]) - Decimal(q_res["bid"]["px"])
+        self.assertGreaterEqual(actual_spread, expected_min_spread)
+
+        # 3. Taker entry fee clearance gate
+        flat_history = {i: Decimal("225.00") for i in range(1, 16)}
+        neutral_analysis = cc.analyze_market_trend(
+            price_history=flat_history,
+            latest_price=ref_px,
+            current_sweep=15,
+        )
+
+        # Low-edge offer that does not clear roundtrip fee ($4.50)
+        low_edge_offer = {
+            "room": "kc-c1-desk",
+            "terms": {
+                "id": "t_low_edge",
+                "maker": "did:key:z6MkhSomeMaker1",
+                "px": "224.50",  # Only $0.50 discount
+                "qty": "3.00",
+                "side": "sell",  # We would BUY at 224.50 vs ref 225.00 (gross edge $0.50)
+                "until": 30,
+                "taker": "any",
+            },
+            "sig": "valid_sig",
+        }
+        ok, reason, meta = cc.evaluate_trade_entry(
+            offer=low_edge_offer,
+            pos=Decimal("0.0"),
+            cash=Decimal("10000.0"),
+            ref_px=ref_px,
+            analysis=neutral_analysis,
+        )
+        self.assertFalse(ok)
+        self.assertIn("expected profit", reason)
+        self.assertIn("fails to clear roundtrip clawback fees", reason)
+
+        # High-edge offer clearing roundtrip fee + margin ($6.00 discount > $4.50 fee)
+        high_edge_offer = {
+            "room": "kc-c1-desk",
+            "terms": {
+                "id": "t_high_edge",
+                "maker": "did:key:z6MkhSomeMaker2",
+                "px": "219.00",  # $6.00 discount
+                "qty": "3.00",
+                "side": "sell",  # We BUY at 219.00 vs ref 225.00
+                "until": 30,
+                "taker": "any",
+            },
+            "sig": "valid_sig",
+        }
+        ok_hi, reason_hi, meta_hi = cc.evaluate_trade_entry(
+            offer=high_edge_offer,
+            pos=Decimal("0.0"),
+            cash=Decimal("10000.0"),
+            ref_px=ref_px,
+            analysis=neutral_analysis,
+        )
+        self.assertTrue(ok_hi, f"High edge offer should pass, failed with: {reason_hi}")
+        self.assertGreater(Decimal(meta_hi["expected_net_profit"]), Decimal("0.00"))
+
+    def test_36_inventory_skew_fee_clearing_and_closing_liquidity(self):
+        """Test that inventory-skew quoting preserves fee clearance, closing trades bypass min cash reserve, and target_room works."""
+        from close_call import CloseCallClient, FEE_RATE, MIN_PROFIT_MARGIN, MAX_INVENTORY
+        cc = CloseCallClient()
+        ref_px = Decimal("225.00")
+        min_fee_spread = (Decimal("2") * FEE_RATE * ref_px) + MIN_PROFIT_MARGIN
+
+        cc.get_latest_price_state = lambda: {"for": 25, "ref": {"px": "225.00"}}
+        cc.broadcast_message = lambda room, text: (True, "OK")
+
+        # 1. Inventory skew quoting must strictly preserve fee clearance even when pos != 0
+        q_long = cc.post_skewed_quote(pos=Decimal("5.0"), spread=None, qty=None)
+        self.assertTrue(q_long["bid"]["success"])
+        self.assertTrue(q_long["ask"]["success"])
+        spread_long = Decimal(q_long["ask"]["px"]) - Decimal(q_long["bid"]["px"])
+        self.assertGreaterEqual(spread_long, min_fee_spread, f"Long-skew spread {spread_long} must clear min fee spread {min_fee_spread}")
+
+        q_short = cc.post_skewed_quote(pos=Decimal("-5.0"), spread=None, qty=None)
+        self.assertTrue(q_short["bid"]["success"])
+        self.assertTrue(q_short["ask"]["success"])
+        spread_short = Decimal(q_short["ask"]["px"]) - Decimal(q_short["bid"]["px"])
+        self.assertGreaterEqual(spread_short, min_fee_spread, f"Short-skew spread {spread_short} must clear min fee spread {min_fee_spread}")
+
+        # 2. Pure closing trades must be permitted even when cash < min_cash_reserve
+        flat_history = {i: Decimal("225.00") for i in range(1, 16)}
+        neutral_analysis = cc.analyze_market_trend(
+            price_history=flat_history,
+            latest_price=ref_px,
+            current_sweep=15,
+        )
+        closing_offer = {
+            "room": "kc-c1-desk",
+            "terms": {
+                "id": "t_close_reserve",
+                "maker": "did:key:z6MkhSomeBuyer",
+                "px": "225.00",
+                "qty": "3.00",
+                "side": "buy",  # Maker buys -> our agent SELLS to close long
+                "until": 30,
+                "taker": "any",
+            },
+            "sig": "valid_sig",
+        }
+        ok_close, reason_close, meta_close = cc.evaluate_trade_entry(
+            offer=closing_offer,
+            pos=Decimal("5.0"),
+            cash=Decimal("4000.0"),  # Below min_cash_reserve (5000.0)
+            ref_px=ref_px,
+            analysis=neutral_analysis,
+            min_cash_reserve=Decimal("5000.0"),
+        )
+        self.assertTrue(ok_close, f"Pure closing trade must be approved even if cash < reserve: {reason_close}")
+        self.assertTrue(meta_close["is_closing"])
+
+        # 3. Dynamic sizing scales to full 5.00 lots when closing an existing 5-lot position even under reserve cash
+        sz_close = cc.compute_dynamic_order_size(
+            side="sell",
+            pos=Decimal("5.0"),
+            cash=Decimal("4000.0"),
+            ref_px=ref_px,
+            min_cash_reserve=Decimal("5000.0"),
+            max_inventory=MAX_INVENTORY,
+        )
+        self.assertEqual(sz_close, Decimal("5.00"))
+
+        # 4. Opening quotes are suppressed when cash < min_cash_reserve but closing quotes are permitted
+        q_under_cash = cc.post_skewed_quote(
+            pos=Decimal("5.0"),
+            spread=None,
+            qty=None,
+            cash=Decimal("4000.0"),
+            min_cash_reserve=Decimal("5000.0"),
+        )
+        self.assertFalse(q_under_cash["bid"]["success"])  # Bid would open more long -> suppressed
+        self.assertTrue(q_under_cash["ask"]["success"])   # Ask closes long -> permitted
+        self.assertEqual(Decimal(q_under_cash["ask"]["qty"]), Decimal("5.00"))
+
+        # 5. run_trading_cycle accepts target_room argument without error
+        cc.sync_referee_state = lambda: None
+        cc.reconcile_with_referee = lambda: {}
+        cc.get_price_export = lambda: flat_history
+        cc.get_all_registered_rooms = lambda: ["close1"]
+        res_cycle = cc.run_trading_cycle(target_room="close1")
+        self.assertTrue(res_cycle["success"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

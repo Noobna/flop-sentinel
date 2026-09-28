@@ -64,6 +64,10 @@ LOCK_SWEEP = 2556
 SWEEP_SECONDS = 300
 PRIZE_POOL = "1000000"
 PRIZE_PLACES = 3
+DEFAULT_ORDER_SIZE = Decimal("3.00")
+MAX_DYNAMIC_ORDER_SIZE = Decimal("5.00")
+MAX_INVENTORY = Decimal("15.0")
+MIN_PROFIT_MARGIN = Decimal("0.60")
 
 PUBLIC_TRADING_ROOM = "close1"
 REFEREE_ROOMS = [
@@ -265,6 +269,7 @@ class MarketAnalysis:
     vol_buffer: Decimal         # dynamic entry buffer in POLF
     dynamic_spread: Decimal     # volatility-adjusted quoting spread
     recommended_action: str     # "BUY_ONLY", "SELL_ONLY", "FAVOR_BUY", "FAVOR_SELL", "BOTH", "REDUCE_ONLY"
+    has_history: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -286,6 +291,7 @@ class MarketAnalysis:
             "vol_buffer": str(self.vol_buffer),
             "dynamic_spread": str(self.dynamic_spread),
             "recommended_action": self.recommended_action,
+            "has_history": self.has_history,
         }
 
 
@@ -1330,27 +1336,101 @@ class CloseCallClient:
             save_close_call_state(st)
         return ok, resp
 
+    def compute_dynamic_order_size(
+        self,
+        side: int | str,  # +1 / 'buy' for buy, -1 / 'sell' for sell
+        pos: Decimal,
+        cash: Decimal,
+        ref_px: Decimal,
+        base_size: Decimal = DEFAULT_ORDER_SIZE,
+        max_size: Decimal = MAX_DYNAMIC_ORDER_SIZE,
+        max_inventory: Decimal = MAX_INVENTORY,
+        min_cash_reserve: Decimal = Decimal("0.0"),
+        volatility_regime: str = "NORMAL",
+    ) -> Decimal:
+        """Dynamically scale order size between 3.00 and 5.00 lots based on available cash,
+        volatility regime, and position headroom up to max_inventory (15 lots).
+        """
+        # Normalize side to numeric +1 (buy) or -1 (sell)
+        if isinstance(side, str):
+            side_num = 1 if side.lower() in ("buy", "bid", "+1", "1") else -1
+        else:
+            side_num = 1 if side > 0 else -1
+
+        # Inventory headroom
+        headroom = (max_inventory - pos) if side_num > 0 else (max_inventory + pos)
+        headroom = max(Decimal("0"), headroom)
+        if headroom <= Decimal("0"):
+            return Decimal("0.00")
+
+        # Cash capacity for opening contracts
+        avail_cash = max(Decimal("0"), cash - min_cash_reserve)
+        contract_cost = ref_px * (Decimal("1") + FEE_RATE)
+        cash_opening_lots = (avail_cash / contract_cost) if contract_cost > 0 else Decimal("0")
+        closing_capacity = max(Decimal("0"), -pos if side_num > 0 else pos)
+        total_cash_allowed = closing_capacity + cash_opening_lots
+        if total_cash_allowed <= Decimal("0"):
+            return Decimal("0.00")
+
+        # Scale target size between 3.00 and 5.00 lots based on available cash, closing capacity & headroom
+        if (closing_capacity >= Decimal("5.0") or (avail_cash >= Decimal("4000.0") and headroom >= Decimal("5.0"))) and volatility_regime in ("LOW", "NORMAL"):
+            target = max_size  # 5.00 lots
+        elif (closing_capacity >= Decimal("4.0") or (avail_cash >= Decimal("2000.0") and headroom >= Decimal("4.0"))) and volatility_regime in ("LOW", "NORMAL"):
+            target = Decimal("4.00")  # 4.00 lots
+        else:
+            target = base_size  # 3.00 lots
+
+        # Volatility adjustments to preserve risk in volatile conditions
+        if volatility_regime == "HIGH":
+            target = max(Decimal("1.00"), (target * Decimal("0.60")).quantize(CENT))
+        elif volatility_regime == "EXTREME":
+            target = Decimal("1.00")
+
+        clamped = min(target, headroom, total_cash_allowed).quantize(CENT)
+        return clamped if clamped >= MIN_QTY else Decimal("0.00")
+
     def post_skewed_quote(
         self,
-        pos: Decimal,
-        spread: Decimal | str = Decimal("0.80"),
-        qty: Decimal | str = Decimal("1.00"),
+        pos: Optional[Decimal] = None,
+        spread: Optional[Decimal | str] = None,
+        qty: Optional[Decimal | str] = None,
         room: str = "kc-c1-desk",
         until_sweeps_ahead: int = 12,
         analysis: Optional[MarketAnalysis] = None,
-        max_inventory: Decimal = Decimal("15.0"),
+        max_inventory: Decimal = MAX_INVENTORY,
+        base_qty: Optional[Decimal | str] = None,
+        min_cash_reserve: Decimal = Decimal("5000.0"),
+        cash: Optional[Decimal] = None,
     ) -> Dict[str, Any]:
         """Post market-making quotes skewed according to current inventory, trend, and volatility."""
         price_state = self.get_latest_price_state()
         if not price_state:
             return {"success": False, "error": "Cannot read referee price state"}
         ref_px = Decimal(price_state["ref"]["px"])
-        quote_qty = Decimal(str(qty)).quantize(CENT)
+
+        # Resolve position and account cash
+        my_acct = self.get_my_account()
+        if pos is None:
+            pos = my_acct.position
+        if cash is None:
+            cash = my_acct.cash
+
+        # Support base_qty alias from dashboard API
+        if qty is None and base_qty is not None:
+            qty = base_qty
+
         results: Dict[str, Any] = {}
 
-        # Effective spread: adapt dynamically if market analysis is provided
+        # Roundtrip clawback fee clearance (2% of current price + net profit margin)
+        min_fee_clearing_spread = (Decimal("2") * FEE_RATE * ref_px + MIN_PROFIT_MARGIN).quantize(CENT)
+
+        # Effective spread: adapt dynamically to strictly clear roundtrip protocol clawback fees
         if analysis is not None:
-            effective_spread = max(Decimal(str(spread)), analysis.dynamic_spread)
+            if spread is not None:
+                effective_spread = max(Decimal(str(spread)), analysis.dynamic_spread)
+            else:
+                effective_spread = max(min_fee_clearing_spread, analysis.dynamic_spread)
+
             if analysis.htf_trend == "BULLISH" or analysis.regime in ("ALIGNED_BULLISH", "HTF_BULLISH_CONSOLIDATION"):
                 trend_skew = Decimal("0.10")
             elif analysis.htf_trend == "BEARISH" or analysis.regime in ("ALIGNED_BEARISH", "HTF_BEARISH_CONSOLIDATION"):
@@ -1358,7 +1438,10 @@ class CloseCallClient:
             else:
                 trend_skew = Decimal("0.00")
         else:
-            effective_spread = Decimal(str(spread))
+            if spread is not None:
+                effective_spread = Decimal(str(spread))
+            else:
+                effective_spread = min_fee_clearing_spread
             trend_skew = Decimal("0.00")
 
         half_spread = (effective_spread / Decimal("2")).quantize(CENT)
@@ -1366,12 +1449,16 @@ class CloseCallClient:
         # Inventory-based pricing skew combined with trend skew
         # pos < 0 -> short inventory: quote aggressive bid to buy back, passive ask
         # pos > 0 -> long inventory: quote aggressive ask to sell off, passive bid
+        # Note: skew_agg scales with half_spread so that total spread (skew_agg + skew_pass) strictly
+        # clears roundtrip fee-clearing requirements rather than collapsing under inventory.
+        skew_agg = max(CENT, half_spread - Decimal("0.25"))
+        skew_pass = half_spread + Decimal("0.60")
         if pos < Decimal("-2.0"):
-            bid_px = (ref_px - Decimal("0.15") + trend_skew).quantize(CENT)
-            ask_px = (ref_px + half_spread + Decimal("0.60") + trend_skew).quantize(CENT)
+            bid_px = (ref_px - skew_agg + trend_skew).quantize(CENT)
+            ask_px = (ref_px + skew_pass + trend_skew).quantize(CENT)
         elif pos > Decimal("2.0"):
-            bid_px = (ref_px - half_spread - Decimal("0.60") + trend_skew).quantize(CENT)
-            ask_px = (ref_px + Decimal("0.15") + trend_skew).quantize(CENT)
+            bid_px = (ref_px - skew_pass + trend_skew).quantize(CENT)
+            ask_px = (ref_px + skew_agg + trend_skew).quantize(CENT)
         else:
             bid_px = (ref_px - half_spread + trend_skew).quantize(CENT)
             ask_px = (ref_px + half_spread + trend_skew).quantize(CENT)
@@ -1392,8 +1479,29 @@ class CloseCallClient:
                 dyn_max_inv = max_inventory * Decimal("0.3")
             else:
                 dyn_max_inv = max_inventory
+            vol_reg = analysis.volatility_regime
         else:
             dyn_max_inv = max_inventory
+            vol_reg = "NORMAL"
+
+        # Determine bid and ask order sizing:
+        # Scale standard order size to 3.00-5.00 lots with dynamic sizing scaled to available cash
+        # and position limits up to 15 lots.
+        if qty is None:
+            bid_qty = self.compute_dynamic_order_size(
+                side=1, pos=pos, cash=cash, ref_px=ref_px,
+                max_inventory=dyn_max_inv, min_cash_reserve=min_cash_reserve, volatility_regime=vol_reg,
+            )
+            ask_qty = self.compute_dynamic_order_size(
+                side=-1, pos=pos, cash=cash, ref_px=ref_px,
+                max_inventory=dyn_max_inv, min_cash_reserve=min_cash_reserve, volatility_regime=vol_reg,
+            )
+        else:
+            req_qty = Decimal(str(qty)).quantize(CENT)
+            headroom_bid = max(Decimal("0"), dyn_max_inv - pos)
+            headroom_ask = max(Decimal("0"), dyn_max_inv + pos)
+            bid_qty = min(req_qty, headroom_bid).quantize(CENT)
+            ask_qty = min(req_qty, headroom_ask).quantize(CENT)
 
         allow_bid = True
         bid_reject_reason = ""
@@ -1426,10 +1534,20 @@ class CloseCallClient:
             allow_ask = False
             ask_reject_reason = f"Inventory at or below max short ({pos} <= -{dyn_max_inv})"
 
+        if bid_qty < MIN_QTY:
+            allow_bid = False
+            if not bid_reject_reason:
+                bid_reject_reason = f"Bid quantity ({bid_qty}) below min qty {MIN_QTY}"
+
+        if ask_qty < MIN_QTY:
+            allow_ask = False
+            if not ask_reject_reason:
+                ask_reject_reason = f"Ask quantity ({ask_qty}) below min qty {MIN_QTY}"
+
         if allow_bid:
             ok_bid, msg_bid, env_bid = self.post_maker_offer(
                 side="buy",
-                qty=quote_qty,
+                qty=bid_qty,
                 px=bid_px,
                 room=room,
                 until_sweeps_ahead=until_sweeps_ahead,
@@ -1439,7 +1557,7 @@ class CloseCallClient:
                 "success": ok_bid,
                 "message": msg_bid,
                 "px": str(bid_px),
-                "qty": str(quote_qty),
+                "qty": str(bid_qty),
                 "id": bid_id,
             }
         else:
@@ -1447,14 +1565,14 @@ class CloseCallClient:
                 "success": False,
                 "message": bid_reject_reason,
                 "px": str(bid_px),
-                "qty": str(quote_qty),
+                "qty": str(bid_qty),
                 "id": None,
             }
 
         if allow_ask:
             ok_ask, msg_ask, env_ask = self.post_maker_offer(
                 side="sell",
-                qty=quote_qty,
+                qty=ask_qty,
                 px=ask_px,
                 room=room,
                 until_sweeps_ahead=until_sweeps_ahead,
@@ -1464,7 +1582,7 @@ class CloseCallClient:
                 "success": ok_ask,
                 "message": msg_ask,
                 "px": str(ask_px),
-                "qty": str(quote_qty),
+                "qty": str(ask_qty),
                 "id": ask_id,
             }
         else:
@@ -1472,7 +1590,7 @@ class CloseCallClient:
                 "success": False,
                 "message": ask_reject_reason,
                 "px": str(ask_px),
-                "qty": str(quote_qty),
+                "qty": str(ask_qty),
                 "id": None,
             }
 
@@ -1481,8 +1599,8 @@ class CloseCallClient:
 
     def post_two_sided_quote(
         self,
-        spread: Decimal | str = Decimal("0.80"),
-        qty: Decimal | str = Decimal("1.00"),
+        spread: Optional[Decimal | str] = None,
+        qty: Optional[Decimal | str] = None,
         room: str = "kc-c1-desk",
         until_sweeps_ahead: int = 12,
     ) -> Dict[str, Any]:
@@ -1630,7 +1748,7 @@ class CloseCallClient:
         price_history: Optional[Dict[int, Decimal]] = None,
         latest_price: Optional[Decimal] = None,
         current_sweep: Optional[int] = None,
-        target_spread: Decimal = Decimal("0.80"),
+        target_spread: Optional[Decimal | str] = None,
     ) -> MarketAnalysis:
         """Perform comprehensive multi-timeframe trend and volatility analysis on NVDA.
         - Higher Timeframe (HTF): macro trend & regime determination (default 12 sweeps = 1 hr).
@@ -1669,6 +1787,8 @@ class CloseCallClient:
 
         # 4. Handle insufficient history (cold start, unit test mocks, or offline)
         if len(prices) < 2:
+            min_fee_clearing_spread = (Decimal("2") * FEE_RATE * curr_px + MIN_PROFIT_MARGIN).quantize(CENT)
+            eff_spread = Decimal(str(target_spread)).quantize(CENT) if target_spread is not None else min_fee_clearing_spread
             return MarketAnalysis(
                 current_px=curr_px,
                 sweep_n=curr_sw,
@@ -1686,8 +1806,9 @@ class CloseCallClient:
                 volatility_usd=0.45,
                 volatility_regime="NORMAL",
                 vol_buffer=Decimal("0.00"),
-                dynamic_spread=Decimal(str(target_spread)).quantize(CENT),
+                dynamic_spread=eff_spread,
                 recommended_action="BOTH",
+                has_history=False,
             )
 
         # Helper: calculate linear regression slope across window
@@ -1808,8 +1929,13 @@ class CloseCallClient:
             clamped_buf = min(0.50, max(0.00, raw_buf))
             vol_buffer = Decimal(f"{clamped_buf:.2f}").quantize(CENT)
 
-        # Dynamic Quoting Spread
-        base_spr = Decimal(str(target_spread)).quantize(CENT)
+        # Dynamic Quoting Spread: strictly clear roundtrip protocol clawback fees (2% + net profit margin)
+        min_fee_clearing_spread = (Decimal("2") * FEE_RATE * curr_px + MIN_PROFIT_MARGIN).quantize(CENT)
+        if target_spread is not None:
+            base_spr = Decimal(str(target_spread)).quantize(CENT)
+        else:
+            base_spr = min_fee_clearing_spread
+
         raw_vol_spr = float(curr_px) * (volatility_pct / 100.0) * 2.0
         vol_spr = Decimal(f"{raw_vol_spr:.2f}").quantize(CENT)
         dynamic_spread = max(base_spr, vol_spr)
@@ -1833,6 +1959,7 @@ class CloseCallClient:
             vol_buffer=vol_buffer,
             dynamic_spread=dynamic_spread,
             recommended_action=recommended_action,
+            has_history=True,
         )
 
     def evaluate_trade_entry(
@@ -1887,8 +2014,12 @@ class CloseCallClient:
         # 4. Cash reserve and collateral check
         est_fee = o_qty * o_px * FEE_RATE
         needed_collateral = opening_qty * o_px + est_fee
-        if (cash - needed_collateral) < min_cash_reserve:
-            return False, f"Insufficient cash reserve ({cash - needed_collateral} < {min_cash_reserve})", {}
+        if is_pure_closing:
+            if cash < est_fee:
+                return False, f"Insufficient cash to cover closing fee ({cash} < {est_fee})", {}
+        else:
+            if (cash - needed_collateral) < min_cash_reserve:
+                return False, f"Insufficient cash reserve ({cash - needed_collateral} < {min_cash_reserve})", {}
 
         # 5. Dynamic Inventory Limit based on Volatility
         if analysis.volatility_regime == "HIGH":
@@ -1940,11 +2071,28 @@ class CloseCallClient:
             # C. Dynamic Pricing & Volatility Buffer
             req_discount = (base_discount + analysis.vol_buffer).quantize(CENT)
             if taker_side_int > 0:  # Taker BUY: must buy at a discount
+                price_edge = -diff
                 if diff > -req_discount:
                     return False, f"Pricing: BUY requires at least ${req_discount} discount (diff: ${diff})", {}
             else:  # Taker SELL: must sell at a premium
+                price_edge = diff
                 if diff < req_discount:
                     return False, f"Pricing: SELL requires at least ${req_discount} premium (diff: ${diff})", {}
+
+            # D. Expected Profit & Roundtrip Protocol Clawback Fee Clearance Gate
+            # Under Rule 6, roundtrip transaction fee drag is ~2% of notional (1% on entry, 1% on exit).
+            # Opening fills must have expected gross profit that strictly clears the roundtrip fee.
+            rt_fee = (Decimal("2") * FEE_RATE * ref_px).quantize(CENT)
+            directional_slope = Decimal(str(round(analysis.htf_slope, 4))) * Decimal(str(taker_side_int))
+            trend_gain = (max(Decimal("0.00"), directional_slope) * Decimal(str(analysis.htf_window))).quantize(CENT)
+            half_spread = (analysis.dynamic_spread / Decimal("2")).quantize(CENT)
+            expected_gross = (price_edge + trend_gain + half_spread).quantize(CENT)
+            expected_net = (expected_gross - rt_fee).quantize(CENT)
+
+            # Strictly enforce roundtrip clawback fee clearance whenever market price history is available
+            if getattr(analysis, "has_history", False):
+                if expected_net < Decimal("0"):
+                    return False, f"Clawback fee filter: expected profit ${expected_gross} fails to clear roundtrip clawback fees ${rt_fee} (expected net: ${expected_net})", {}
 
         return True, "Trade entry approved", {
             "side": "buy" if taker_side_int > 0 else "sell",
@@ -1955,18 +2103,23 @@ class CloseCallClient:
             "needed_collateral": str(needed_collateral),
             "diff": str(diff),
             "req_discount": str(req_discount) if not is_pure_closing else "0.00",
+            "expected_gross_profit": str(expected_gross) if not is_pure_closing else "0.00",
+            "expected_net_profit": str(expected_net) if not is_pure_closing else "0.00",
+            "roundtrip_fee": str(rt_fee) if not is_pure_closing else "0.00",
         }
 
     def run_trading_cycle(
         self,
-        max_inventory: Decimal = Decimal("15.0"),
+        max_inventory: Decimal = MAX_INVENTORY,
         min_cash_reserve: Decimal = Decimal("5000.0"),
-        target_spread: Decimal = Decimal("0.80"),
-        quote_qty: Decimal = Decimal("1.0"),
+        target_spread: Optional[Decimal | str] = None,
+        quote_qty: Optional[Decimal | str] = None,
         desk_rooms: Optional[List[str]] = None,
         max_trades_per_cycle: int = 2,
         htf_window: int = 12,
         ltf_window: int = 3,
+        target_room: Optional[str] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """Execute one autonomous trading cycle:
         1. Synchronize & reconcile with referee flow.
@@ -1992,13 +2145,18 @@ class CloseCallClient:
         pos = my_acct.position
         cash = my_acct.cash
 
+        # Resolve target spread to strictly clear roundtrip fees if not explicitly set
+        rt_fee = (Decimal("2") * FEE_RATE * ref_px).quantize(CENT)
+        fee_clearing_spread = (rt_fee + MIN_PROFIT_MARGIN).quantize(CENT)
+        effective_spread = Decimal(str(target_spread)).quantize(CENT) if target_spread is not None else fee_clearing_spread
+
         # 2. Multi-Timeframe Trend & Volatility Analysis
         analysis = self.analyze_market_trend(
             htf_window=htf_window,
             ltf_window=ltf_window,
             latest_price=ref_px,
             current_sweep=curr_sweep,
-            target_spread=target_spread,
+            target_spread=effective_spread,
         )
 
         cycle_result: Dict[str, Any] = {
@@ -2014,11 +2172,14 @@ class CloseCallClient:
         }
 
         # Select trading rooms (prioritizing active desks)
-        rooms_to_trade = desk_rooms or ["kc-c1-desk", "close1", "boz-desk", "jh-nvda-desk"]
+        raw_rooms = [target_room] if target_room else []
+        for r in (desk_rooms or ["kc-c1-desk", "close1", "boz-desk", "jh-nvda-desk"]):
+            if r not in raw_rooms:
+                raw_rooms.append(r)
         existing_rooms = set(self.get_all_registered_rooms())
-        scan_rooms = [r for r in rooms_to_trade if r in existing_rooms]
+        scan_rooms = [r for r in raw_rooms if r in existing_rooms]
         if not scan_rooms:
-            scan_rooms = [PUBLIC_TRADING_ROOM]
+            scan_rooms = [target_room] if target_room else [PUBLIC_TRADING_ROOM]
 
         # Scan for open counterparty offers
         open_offers = self.scan_open_offers(scan_rooms)
@@ -2058,7 +2219,12 @@ class CloseCallClient:
                 trend_bonus -= 50.0
 
             price_score = float(ref_px - o_px) if taker_side > 0 else float(o_px - ref_px)
-            return bonus + trend_bonus + (price_score * 10.0)
+            # Roundtrip fee clearance incentive
+            roundtrip_fee_flt = float(ref_px * Decimal("0.02"))
+            expected_gross_flt = price_score + float(analysis.dynamic_spread / Decimal("2"))
+            fee_bonus = 25.0 if (closing or expected_gross_flt >= roundtrip_fee_flt) else -25.0
+
+            return bonus + trend_bonus + (price_score * 10.0) + fee_bonus
 
         open_offers.sort(key=score_offer, reverse=True)
 
@@ -2092,6 +2258,7 @@ class CloseCallClient:
                     "px": str(offer.get("terms", {}).get("px")),
                     "closing": entry_meta.get("is_closing"),
                     "result": exec_msg,
+                    "expected_net_profit": entry_meta.get("expected_net_profit", "0.00"),
                 })
                 # Update running position and cash for subsequent evaluations and quotes in this cycle
                 pos = Decimal(entry_meta["new_pos"])
@@ -2101,15 +2268,17 @@ class CloseCallClient:
 
         # Market-making: post boosted quotes skewed by inventory + trend + volatility
         primary_desk = scan_rooms[0] if scan_rooms else "kc-c1-desk"
-        if cash > min_cash_reserve:
+        if cash > min_cash_reserve or abs(pos) >= MIN_QTY:
             quote_res = self.post_skewed_quote(
                 pos=pos,
-                spread=target_spread,
+                spread=effective_spread,
                 qty=quote_qty,
                 room=primary_desk,
                 until_sweeps_ahead=12,
                 analysis=analysis,
                 max_inventory=max_inventory,
+                min_cash_reserve=min_cash_reserve,
+                cash=cash,
             )
             if quote_res.get("success") or quote_res.get("bid", {}).get("message") or quote_res.get("ask", {}).get("message"):
                 cycle_result["posted_quotes"].append(quote_res)
@@ -2217,8 +2386,8 @@ def main():
 
     # Quote
     quote_parser = subparsers.add_parser("quote", help="Post two-sided maker market around reference")
-    quote_parser.add_argument("--spread", default="0.80", help="Total spread in POLF (default: 0.80)")
-    quote_parser.add_argument("--qty", default="1.00", help="Contracts per side (default: 1.00)")
+    quote_parser.add_argument("--spread", default=None, help="Total spread in POLF (default: auto fee-clearing)")
+    quote_parser.add_argument("--qty", default="3.00", help="Contracts per side (default: 3.00)")
     quote_parser.add_argument("--room", default="kc-c1-desk", help="Trading room")
     quote_parser.add_argument("--until", type=int, default=12, help="Sweeps ahead to expire")
 
@@ -2237,8 +2406,8 @@ def main():
     trade_parser.add_argument("--room", default="kc-c1-desk", help="Primary desk room for maker quotes")
     trade_parser.add_argument("--max-inv", default="15.0", help="Maximum absolute inventory contracts (default: 15.0)")
     trade_parser.add_argument("--min-cash", default="5000.0", help="Minimum cash reserve in POLF (default: 5000.0)")
-    trade_parser.add_argument("--spread", default="0.80", help="Quoting spread in POLF (default: 0.80)")
-    trade_parser.add_argument("--qty", default="1.00", help="Quoting quantity per side (default: 1.00)")
+    trade_parser.add_argument("--spread", default=None, help="Quoting spread in POLF (default: auto fee-clearing)")
+    trade_parser.add_argument("--qty", default="3.00", help="Quoting quantity per side (default: 3.00)")
     trade_parser.add_argument("--htf", type=int, default=12, help="Higher timeframe window sweeps (default: 12)")
     trade_parser.add_argument("--ltf", type=int, default=3, help="Lower timeframe window sweeps (default: 3)")
 
@@ -2295,10 +2464,12 @@ def main():
             print(f"    Maker Sig: {envelope['maker_sig'][:24]}...")
 
     elif args.command == "quote":
-        print(f"[*] Posting two-sided quote in /r/{args.room} (spread: ${args.spread}, qty: {args.qty})...")
+        spread_val = Decimal(args.spread) if args.spread is not None else None
+        qty_val = Decimal(args.qty) if args.qty is not None else None
+        print(f"[*] Posting two-sided quote in /r/{args.room} (spread: ${args.spread or 'auto'}, qty: {args.qty})...")
         res = client.post_two_sided_quote(
-            spread=Decimal(args.spread),
-            qty=Decimal(args.qty),
+            spread=spread_val,
+            qty=qty_val,
             room=args.room,
             until_sweeps_ahead=args.until,
         )
@@ -2329,16 +2500,18 @@ def main():
             print(f"    {idx}. Room: /r/{o['room']} | ID: {t['id']} | {t['side'].upper()} {t['qty']} @ ${t['px']} (by {t['maker'][:16]}...)")
 
     elif args.command == "trade":
+        spread_val = Decimal(args.spread) if args.spread is not None else None
+        qty_val = Decimal(args.qty) if args.qty is not None else None
         print(f"[*] Starting Autonomous Close Call Trading Engine on /r/{args.room}...")
         print(f"    Max Inventory: {args.max_inv} contracts | Min Cash Reserve: {args.min_cash} POLF")
-        print(f"    Quoting Spread: ${args.spread} | Quoting Qty: {args.qty}")
+        print(f"    Quoting Spread: ${args.spread or 'auto'} | Quoting Qty: {args.qty}")
         while True:
             try:
                 res = client.run_trading_cycle(
                     max_inventory=Decimal(args.max_inv),
                     min_cash_reserve=Decimal(args.min_cash),
-                    target_spread=Decimal(args.spread),
-                    quote_qty=Decimal(args.qty),
+                    target_spread=spread_val,
+                    quote_qty=qty_val,
                     desk_rooms=[args.room, "close1", "boz-desk", "jh-nvda-desk"],
                     htf_window=args.htf,
                     ltf_window=args.ltf,
