@@ -439,7 +439,8 @@ def maybe_accept_offer(offer: dict, room: str, priv: ed25519.Ed25519PrivateKey, 
             _last_worker_job_time = now
             cid = accept_frame["contract"]
             deal_room = derive_deal_room(cid)
-            _active_deal_rooms.add(deal_room)
+            with _state_lock:
+                _active_deal_rooms.add(deal_room)
 
             deal_map[oid] = {
                 "id": oid,
@@ -631,142 +632,147 @@ def run_global_daemon(heartbeat_interval_mins: int = 25):
     active_rooms = list(CORE_ROOMS)
 
     while True:
-        now = time.time()
+        try:
+            now = time.time()
 
-        # 1. Periodically refresh discovered active rooms (every 10 minutes)
-        if now - last_discovery_time >= 600:
-            active_rooms = discover_active_rooms()
-            logger.info(f"[*] Active Global Rooms ({len(active_rooms)}): {', '.join(active_rooms)}")
-            last_discovery_time = now
+            # 1. Periodically refresh discovered active rooms (every 10 minutes)
+            if now - last_discovery_time >= 600:
+                active_rooms = discover_active_rooms()
+                logger.info(f"[*] Active Global Rooms ({len(active_rooms)}): {', '.join(active_rooms)}")
+                last_discovery_time = now
 
-        # 2. Main Lobby Heartbeat
-        if now - last_heartbeat_time >= heartbeat_interval_mins * 60:
-            with _state_lock:
-                state["total_heartbeats"] = state.get("total_heartbeats", 0) + 1
-                count = state["total_heartbeats"]
-            hb_text = random.choice(HEARTBEAT_TEMPLATES).format(count=count)
-            logger.info(f"\n--- [Lobby Heartbeat #{count}] ---")
-            if send_signed_message(priv, did, hb_text, room="lobby"):
+            # 2. Main Lobby Heartbeat
+            if now - last_heartbeat_time >= heartbeat_interval_mins * 60:
                 with _state_lock:
-                    state["last_checkin_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    state["last_write_time"] = time.time()
-                    save_state(state)
-                last_heartbeat_time = now
-            time.sleep(5)
+                    state["total_heartbeats"] = state.get("total_heartbeats", 0) + 1
+                    count = state["total_heartbeats"]
+                hb_text = random.choice(HEARTBEAT_TEMPLATES).format(count=count)
+                logger.info(f"\n--- [Lobby Heartbeat #{count}] ---")
+                if send_signed_message(priv, did, hb_text, room="lobby"):
+                    with _state_lock:
+                        state["last_checkin_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        state["last_write_time"] = time.time()
+                        save_state(state)
+                    last_heartbeat_time = now
+                time.sleep(5)
 
-        # 3. Check for and accept available bounties from the board (FLOP prioritized)
-        if (now - _last_worker_job_time) >= 3.0:
+            # 3. Check for and accept available bounties from the board (FLOP prioritized)
+            if (now - _last_worker_job_time) >= 3.0:
+                with _state_lock:
+                    deals = load_json_safe(DEAL_STATE_FILE, {"deals": {}})
+                    deal_map = deals.get("deals", {})
+                    now_ms = int(now * 1000)
+                    candidates = [
+                        v["offer"] for v in deal_map.values()
+                        if v.get("status") == "proposed"
+                        and v.get("offer", {}).get("role") == "payer"
+                        and v.get("offer", {}).get("from") != did
+                        and v.get("offer", {}).get("expiresMs", 0) > (now_ms + 30_000)
+                    ]
+                    def _amount_sort(o):
+                        try:
+                            amt = float(o.get("amount", 0))
+                            payer_did = o.get("from")
+                            rails = set(o.get("rails", []))
+                            
+                            # 1. Check payer track record
+                            payer_jobs = [d for d in deal_map.values() if d.get("offer", {}).get("from") == payer_did and d.get("isOurJob")]
+                            payer_locks = [d for d in payer_jobs if d.get("status") in ("locked", "claimed") or "rail" in d]
+                            
+                            # Proven ghost bot: skip completely
+                            if len(payer_jobs) >= 2 and len(payer_locks) == 0:
+                                return -1.0
+
+                            # Proven legit payer: HUGE boost (10,000x) so large legit bounties take highest priority!
+                            lock_mult = 10000.0 if payer_locks else 1.0
+
+                            # Solvable tasks with context
+                            ctx = o.get("job", {}).get("context", "")
+                            solve_mult = 5.0 if ctx else 1.0
+
+                            # Executable paper rail
+                            paper_mult = 3.0 if ("paper" in rails or "paper-htlc" in rails) else 1.0
+
+                            # Asset multiplier (FLOP prioritized)
+                            asset_mult = 10.0 if o.get("asset") == "FLOP" else 1.0
+
+                            # If unverified payer offering > 10,000 on bare flop-htlc with no context -> Ghost bot!
+                            if not payer_locks and amt > 10000 and not ("paper" in rails or "paper-htlc" in rails) and not ctx:
+                                return -1.0
+
+                            # If proven legit payer: uncapped amount!
+                            # If new testable payer: capped at 50,000 for safety
+                            effective_amt = amt if payer_locks else min(amt, 50000.0)
+                            return effective_amt * asset_mult * lock_mult * solve_mult * paper_mult
+                        except Exception:
+                            return 0
+                    candidates.sort(key=_amount_sort, reverse=True)
+                    accepted_count = 0
+                    for best_offer in candidates[:15]:
+                        if maybe_accept_offer(best_offer, "tclk-offers", priv, did, deals):
+                            accepted_count += 1
+                            if accepted_count >= 5:
+                                break
+                            time.sleep(2.0)
+
+            # 4. Monitor & Chat across Global Rooms + Active Deal Rooms (Batched to respect Technocore rate limits)
             with _state_lock:
-                deals = load_json_safe(DEAL_STATE_FILE, {"deals": {}})
-                deal_map = deals.get("deals", {})
-                now_ms = int(now * 1000)
-                candidates = [
-                    v["offer"] for v in deal_map.values()
-                    if v.get("status") == "proposed"
-                    and v.get("offer", {}).get("role") == "payer"
-                    and v.get("offer", {}).get("from") != did
-                    and v.get("offer", {}).get("expiresMs", 0) > (now_ms + 30_000)
-                ]
-                def _amount_sort(o):
+                deal_room_list = list(_active_deal_rooms)
+                if deal_room_list:
+                    batch_size = 15
+                    idx = (int(time.time() // 10) * batch_size) % len(deal_room_list)
+                    sampled_deal_rooms = deal_room_list[idx:idx + batch_size]
+                else:
+                    sampled_deal_rooms = []
+                poll_target_rooms = list(set(active_rooms) | set(sampled_deal_rooms))
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(process_room, room, state, priv, did) for room in poll_target_rooms]
+                for future in as_completed(futures):
                     try:
-                        amt = float(o.get("amount", 0))
-                        payer_did = o.get("from")
-                        rails = set(o.get("rails", []))
-                        
-                        # 1. Check payer track record
-                        payer_jobs = [d for d in deal_map.values() if d.get("offer", {}).get("from") == payer_did and d.get("isOurJob")]
-                        payer_locks = [d for d in payer_jobs if d.get("status") in ("locked", "claimed") or "rail" in d]
-                        
-                        # Proven ghost bot: skip completely
-                        if len(payer_jobs) >= 2 and len(payer_locks) == 0:
-                            return -1.0
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"[!] Error processing room: {e}")
 
-                        # Proven legit payer: HUGE boost (10,000x) so large legit bounties take highest priority!
-                        lock_mult = 10000.0 if payer_locks else 1.0
-
-                        # Solvable tasks with context
-                        ctx = o.get("job", {}).get("context", "")
-                        solve_mult = 5.0 if ctx else 1.0
-
-                        # Executable paper rail
-                        paper_mult = 3.0 if ("paper" in rails or "paper-htlc" in rails) else 1.0
-
-                        # Asset multiplier (FLOP prioritized)
-                        asset_mult = 10.0 if o.get("asset") == "FLOP" else 1.0
-
-                        # If unverified payer offering > 10,000 on bare flop-htlc with no context -> Ghost bot!
-                        if not payer_locks and amt > 10000 and not ("paper" in rails or "paper-htlc" in rails) and not ctx:
-                            return -1.0
-
-                        # If proven legit payer: uncapped amount!
-                        # If new testable payer: capped at 50,000 for safety
-                        effective_amt = amt if payer_locks else min(amt, 50000.0)
-                        return effective_amt * asset_mult * lock_mult * solve_mult * paper_mult
-                    except Exception:
-                        return 0
-                candidates.sort(key=_amount_sort, reverse=True)
-                accepted_count = 0
-                for best_offer in candidates[:15]:
-                    if maybe_accept_offer(best_offer, "tclk-offers", priv, did, deals):
-                        accepted_count += 1
-                        if accepted_count >= 5:
-                            break
-                        time.sleep(2.0)
-
-        # 4. Monitor & Chat across Global Rooms + Active Deal Rooms (Batched to respect Technocore rate limits)
-        with _state_lock:
-            deal_room_list = list(_active_deal_rooms)
-            if deal_room_list:
-                batch_size = 15
-                idx = (int(time.time() // 10) * batch_size) % len(deal_room_list)
-                sampled_deal_rooms = deal_room_list[idx:idx + batch_size]
-            else:
-                sampled_deal_rooms = []
-            poll_target_rooms = list(set(active_rooms) | set(sampled_deal_rooms))
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(process_room, room, state, priv, did) for room in poll_target_rooms]
-            for future in as_completed(futures):
+            # 5. Autonomous Close Call Challenge (close-1) Sweep (every 5 minutes)
+            if now - last_close_call_sweep_time >= 300:
+                last_close_call_sweep_time = now
                 try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"[!] Error processing room: {e}")
+                    cc = CloseCallClient()
+                    is_reg, reg_info = cc.check_registration()
+                    if not is_reg and "Registered in room" not in reg_info:
+                        logger.info(f"[Close-1] Auto-registering agent {cc.did} in close1...")
+                        cc.register_owner("close1")
+                    res = cc.run_trading_cycle()
+                    sweep_n = res.get("sweep", "-")
+                    ref_px = res.get("ref_px", "-")
+                    pos = res.get("final_position", "-")
+                    cash = res.get("final_cash", "-")
+                    m_ana = res.get("market_analysis", {})
+                    regime = m_ana.get("regime", "UNKNOWN")
+                    vol_reg = m_ana.get("volatility_regime", "NORMAL")
+                    vol_pct = m_ana.get("volatility_pct", 0.0)
+                    logger.info(
+                        f"[Close-1] Autonomous Sweep #{sweep_n} | NVDA: ${ref_px} | Trend: {regime} | "
+                        f"Vol: {vol_reg} ({vol_pct:.2f}%) | Pos: {pos} | Cash: {cash} POLF | "
+                        f"Execs: {len(res.get('executed_trades', []))} | Quotes: {len(res.get('posted_quotes', []))}"
+                    )
+                    for ex in res.get("executed_trades", []):
+                        net_p = ex.get("expected_net_profit", "0.00")
+                        logger.info(f"[Close-1] Trade Filled: {ex['side'].upper()} {ex['qty']} @ ${ex['px']} (ID: {ex['id']}) [Net: ${net_p}]")
+                    # Auto-broadcast our official rank/pnl periodically
+                except Exception as cc_err:
+                    logger.debug(f"[Close-1] Background sweep error: {cc_err}")
 
-        # 5. Autonomous Close Call Challenge (close-1) Sweep (every 5 minutes)
-        if now - last_close_call_sweep_time >= 300:
-            last_close_call_sweep_time = now
-            try:
-                cc = CloseCallClient()
-                is_reg, reg_info = cc.check_registration()
-                if not is_reg and "Registered in room" not in reg_info:
-                    logger.info(f"[Close-1] Auto-registering agent {cc.did} in close1...")
-                    cc.register_owner("close1")
-                res = cc.run_trading_cycle()
-                sweep_n = res.get("sweep", "-")
-                ref_px = res.get("ref_px", "-")
-                pos = res.get("final_position", "-")
-                cash = res.get("final_cash", "-")
-                m_ana = res.get("market_analysis", {})
-                regime = m_ana.get("regime", "UNKNOWN")
-                vol_reg = m_ana.get("volatility_regime", "NORMAL")
-                vol_pct = m_ana.get("volatility_pct", 0.0)
-                logger.info(
-                    f"[Close-1] Autonomous Sweep #{sweep_n} | NVDA: ${ref_px} | Trend: {regime} | "
-                    f"Vol: {vol_reg} ({vol_pct:.2f}%) | Pos: {pos} | Cash: {cash} POLF | "
-                    f"Execs: {len(res.get('executed_trades', []))} | Quotes: {len(res.get('posted_quotes', []))}"
-                )
-                for ex in res.get("executed_trades", []):
-                    net_p = ex.get("expected_net_profit", "0.00")
-                    logger.info(f"[Close-1] Trade Filled: {ex['side'].upper()} {ex['qty']} @ ${ex['px']} (ID: {ex['id']}) [Net: ${net_p}]")
-            except Exception as cc_err:
-                logger.debug(f"[Close-1] Background sweep error: {cc_err}")
+            with _state_lock:
+                save_state(state)
 
-        with _state_lock:
-            save_state(state)
-
-        # Sleep before next polling sweep (faster cadence)
-        sweep_sleep = random.randint(8, 14)
-        time.sleep(sweep_sleep)
+            # Sleep before next polling sweep (faster cadence)
+            sweep_sleep = random.randint(8, 14)
+            time.sleep(sweep_sleep)
+        except Exception as loop_err:
+            logger.error(f"[!] Daemon loop cycle error: {loop_err}", exc_info=True)
+            time.sleep(10)
 
 
 def main():
